@@ -211,8 +211,17 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	    DRM_FORMAT_XRGB8888,
 	    DRM_FORMAT_ARGB8888,
 	};
-	/*it appears we can only handle linear*/
-	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+	/*
+	 * Advertise implicit modifiers rather than linear.
+	 *
+	 * wld's import path takes no modifier, so a client that picks an explicit
+	 * one would have it silently dropped. Linear is not a safe substitute
+	 * either: on NVIDIA a linear dmabuf cannot be sampled at all, so every
+	 * GPU-rendering client ends up drawing nothing. With INVALID the client
+	 * allocates in whatever layout it prefers and the driver resolves the
+	 * tiling implicitly on import, which is what these backends expect.
+	 */
+	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	struct wl_resource *resource;
 	size_t i;
 
