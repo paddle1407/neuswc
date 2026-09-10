@@ -46,6 +46,7 @@
 #include <wayland-server.h>
 #include <wld/drm.h>
 #include <wld/wld.h>
+#include <drm_fourcc.h>
 #include <xf86drm.h>
 
 struct swc_drm swc_drm;
@@ -500,11 +501,37 @@ drm_get_framebuffer(struct wld_buffer *buffer)
 		return 0;
 	}
 
-	ret = drmModeAddFB2(swc.drm->fd, buffer->width, buffer->height,
-	                    buffer->format, (uint32_t[4]){object.u32},
-	                    (uint32_t[4]){buffer->pitch}, (uint32_t[4]){0},
-	                    &framebuffer->id, 0);
+	{
+		union wld_object mod_object;
+		uint32_t handle = object.u32;
+		uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+
+		if (wld_export(buffer, WLD_DRM_OBJECT_MODIFIER, &mod_object)) {
+			modifier = mod_object.u64;
+		}
+
+		/*
+		 * A tiled buffer must be declared with its modifier. Without
+		 * DRM_MODE_FB_MODIFIERS the kernel treats it as linear and rejects
+		 * it, which is what happens to every buffer the GBM backend
+		 * allocates on hardware that tiles them.
+		 */
+		if (modifier != DRM_FORMAT_MOD_INVALID &&
+		    modifier != DRM_FORMAT_MOD_LINEAR) {
+			ret = drmModeAddFB2WithModifiers(
+			    swc.drm->fd, buffer->width, buffer->height, buffer->format,
+			    (uint32_t[4]){handle}, (uint32_t[4]){buffer->pitch},
+			    (uint32_t[4]){0}, (uint64_t[4]){modifier}, &framebuffer->id,
+			    DRM_MODE_FB_MODIFIERS);
+		} else {
+			ret = drmModeAddFB2(swc.drm->fd, buffer->width, buffer->height,
+			                    buffer->format, (uint32_t[4]){handle},
+			                    (uint32_t[4]){buffer->pitch},
+			                    (uint32_t[4]){0}, &framebuffer->id, 0);
+		}
+	}
 	if (ret < 0) {
+		ERROR("Could not add framebuffer: %s\n", strerror(errno));
 		free(framebuffer);
 		return 0;
 	}
