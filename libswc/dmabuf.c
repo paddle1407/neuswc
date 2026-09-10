@@ -29,6 +29,7 @@
 
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include <drm_fourcc.h>
+#include <xf86drm.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -122,10 +123,30 @@ create_immed(struct wl_client *client, struct wl_resource *resource,
 			                       "too many planes");
 		}
 	}
-	object.i = params->fd[0];
-	buffer =
-	    wld_import_buffer(swc.drm->context, WLD_DRM_OBJECT_PRIME_FD, object,
-	                      width, height, format, params->stride[0]);
+	/*
+	 * Pass the layout through. A tiled buffer imported as a bare PRIME fd is
+	 * assumed linear, which on most hardware means it either fails to import
+	 * or samples as garbage.
+	 */
+	{
+		struct wld_dmabuf_attributes attributes = {
+			.fd = params->fd[0],
+			.offset = params->offset[0],
+			.pitch = params->stride[0],
+			.modifier = params->modifier[0],
+		};
+
+		object.ptr = &attributes;
+		buffer = wld_import_buffer(swc.drm->context, WLD_DRM_OBJECT_DMABUF,
+		                           object, width, height, format,
+		                           params->stride[0]);
+		if (!buffer) {
+			object.i = params->fd[0];
+			buffer = wld_import_buffer(swc.drm->context,
+			                           WLD_DRM_OBJECT_PRIME_FD, object, width,
+			                           height, format, params->stride[0]);
+		}
+	}
 	for (i = 0; i < num_planes; ++i) {
 		close(params->fd[i]);
 		params->fd[i] = -1;
@@ -213,21 +234,72 @@ error0:
  * device, and a single tranche offering every format we support on it.
  */
 
-static const struct {
+struct format_entry {
 	uint32_t format;
 	uint32_t padding; /* the protocol requires this to be zero */
 	uint64_t modifier;
-} format_table[] = {
-	{ DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_INVALID },
-	{ DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_INVALID },
 };
+
+static struct format_entry *format_table;
+static size_t format_table_len;
+
+/*
+ * Advertise the modifiers the GPU actually accepts.
+ *
+ * DRM_FORMAT_MOD_INVALID is not a useful thing to offer here: a client
+ * matches our list against what its own renderer supports, and nothing
+ * matches INVALID, so it finds no usable format and never produces a buffer.
+ */
+static void
+build_format_table(void)
+{
+	static const uint32_t formats[] = {
+	    DRM_FORMAT_XRGB8888,
+	    DRM_FORMAT_ARGB8888,
+	};
+	uint64_t modifiers[64];
+	struct format_entry *entry;
+	size_t i;
+	int count, j;
+
+	if (format_table)
+		return;
+
+	for (i = 0; i < ARRAY_LENGTH(formats); ++i) {
+		count = wld_drm_query_modifiers(swc.drm->context, formats[i], modifiers,
+		                                ARRAY_LENGTH(modifiers));
+
+		/* Fall back to implicit if the backend cannot enumerate. */
+		if (count <= 0) {
+			modifiers[0] = DRM_FORMAT_MOD_INVALID;
+			count = 1;
+		}
+
+		entry = realloc(format_table,
+		                (format_table_len + count) * sizeof(*format_table));
+		if (!entry)
+			return;
+		format_table = entry;
+
+		for (j = 0; j < count; ++j) {
+			format_table[format_table_len++] = (struct format_entry){
+				.format = formats[i],
+				.padding = 0,
+				.modifier = modifiers[j],
+			};
+		}
+	}
+}
 
 static int
 format_table_fd(size_t *size)
 {
 	int fd;
 
-	*size = sizeof(format_table);
+	build_format_table();
+	if (!format_table_len)
+		return -1;
+	*size = format_table_len * sizeof(*format_table);
 
 #ifdef __linux__
 	fd = memfd_create("swc-dmabuf-formats", MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -261,9 +333,23 @@ main_device(struct wl_array *array)
 {
 	struct stat st;
 	dev_t *device;
+	char *node;
 
-	if (fstat(swc.drm->fd, &st) != 0)
+	/*
+	 * Clients open this device to allocate on. Hand them the render node
+	 * where there is one: the primary node needs DRM authentication, which a
+	 * plain client has no way to obtain.
+	 */
+	node = drmGetRenderDeviceNameFromFd(swc.drm->fd);
+	if (node) {
+		int ret = stat(node, &st);
+
+		drmFree(node);
+		if (ret != 0 && fstat(swc.drm->fd, &st) != 0)
+			return false;
+	} else if (fstat(swc.drm->fd, &st) != 0) {
 		return false;
+	}
 
 	wl_array_init(array);
 	if (!(device = wl_array_add(array, sizeof(*device)))) {
@@ -296,7 +382,7 @@ send_feedback(struct wl_resource *resource)
 	zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(resource, &device);
 
 	wl_array_init(&indices);
-	for (i = 0; i < ARRAY_LENGTH(format_table); ++i) {
+	for (i = 0; i < format_table_len; ++i) {
 		if ((index = wl_array_add(&indices, sizeof(*index))))
 			*index = i;
 	}

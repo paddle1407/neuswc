@@ -2038,7 +2038,8 @@ compositor_render_to_shm(struct screen *screen)
 
 	uint32_t width = screen->base.geometry.width;
 	uint32_t height = screen->base.geometry.height;
-	struct wld_buffer *buffer;
+	struct wld_buffer *buffer, *scratch = NULL;
+	struct wld_renderer *renderer = swc.shm->renderer;
 	struct compositor_view *view;
 	pixman_region32_t region;
 	pixman_region32_t damage;
@@ -2051,11 +2052,33 @@ compositor_render_to_shm(struct screen *screen)
 		return NULL;
 	}
 
-	caps = wld_capabilities(swc.shm->renderer, buffer);
-	if (!(caps & WLD_CAPABILITY_WRITE) ||
-	    !wld_set_target_buffer(swc.shm->renderer, buffer)) {
-		wld_buffer_unreference(buffer);
-		return NULL;
+	/*
+	 * Composite with the backend renderer where we can, and read the result
+	 * back afterwards.
+	 *
+	 * The shm renderer can only draw a window whose buffer it can map, and a
+	 * buffer imported from a GPU client is not CPU accessible. Those windows
+	 * are simply skipped, so a screenshot shows the desktop with every
+	 * hardware-accelerated window missing, even though they are on screen.
+	 */
+	if (swc.backend->renderer && swc.backend->context) {
+		scratch = wld_create_buffer(swc.backend->context, width, height,
+		                            WLD_FORMAT_XRGB8888, WLD_DRM_FLAG_SCANOUT);
+		if (scratch && wld_set_target_buffer(swc.backend->renderer, scratch)) {
+			renderer = swc.backend->renderer;
+		} else if (scratch) {
+			wld_buffer_unreference(scratch);
+			scratch = NULL;
+		}
+	}
+
+	if (!scratch) {
+		caps = wld_capabilities(renderer, buffer);
+		if (!(caps & WLD_CAPABILITY_WRITE) ||
+		    !wld_set_target_buffer(renderer, buffer)) {
+			wld_buffer_unreference(buffer);
+			return NULL;
+		}
 	}
 
 	/* set region */
@@ -2064,7 +2087,7 @@ compositor_render_to_shm(struct screen *screen)
 	                          screen->base.geometry.y, width, height);
 
 	/* background */
-	wld_fill_region(swc.shm->renderer, DEFAULT_BG, &region);
+	wld_fill_region(renderer, DEFAULT_BG, &region);
 
 	wl_list_for_each_reverse(view, &compositor.views, link)
 	{
@@ -2075,12 +2098,12 @@ compositor_render_to_shm(struct screen *screen)
 		}
 
 		if (src &&
-		    !(wld_capabilities(swc.shm->renderer, src) & WLD_CAPABILITY_READ)) {
+		    !(wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
 			src = view->base.buffer;
 		}
 
 		if (src &&
-		    (wld_capabilities(swc.shm->renderer, src) & WLD_CAPABILITY_READ)) {
+		    (wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
 			const struct swc_rectangle *geom = &view->base.geometry;
 			int32_t src_x = view->window ? view->buffer_offset_x : 0;
 			int32_t src_y = view->window ? view->buffer_offset_y : 0;
@@ -2093,10 +2116,10 @@ compositor_render_to_shm(struct screen *screen)
 			pixman_region32_intersect_rect(&source_region, &source_region, 0, 0,
 			                               src->width, src->height);
 			if (src->format == WLD_FORMAT_ARGB8888) {
-				wld_blend_region(swc.shm->renderer, src, dst_x, dst_y,
+				wld_blend_region(renderer, src, dst_x, dst_y,
 				                 &source_region);
 			} else {
-				wld_copy_region(swc.shm->renderer, src, dst_x, dst_y,
+				wld_copy_region(renderer, src, dst_x, dst_y,
 				                &source_region);
 			}
 			pixman_region32_fini(&source_region);
@@ -2139,7 +2162,7 @@ compositor_render_to_shm(struct screen *screen)
 			    pixman_region32_not_empty(&out_border)) {
 				pixman_region32_translate(&out_border, -target_geom->x,
 				                          -target_geom->y);
-				wld_fill_region(swc.shm->renderer, view->border.outcolor,
+				wld_fill_region(renderer, view->border.outcolor,
 				                &out_border);
 			}
 
@@ -2147,7 +2170,7 @@ compositor_render_to_shm(struct screen *screen)
 			    pixman_region32_not_empty(&in_border)) {
 				pixman_region32_translate(&in_border, -target_geom->x,
 				                          -target_geom->y);
-				wld_fill_region(swc.shm->renderer, view->border.incolor,
+				wld_fill_region(renderer, view->border.incolor,
 				                &in_border);
 			}
 
@@ -2162,13 +2185,33 @@ compositor_render_to_shm(struct screen *screen)
 		if (view->decor.top || view->decor.right || view->decor.bottom ||
 		    view->decor.left) {
 			const struct swc_rectangle *target_geom = &screen->base.geometry;
-			decor_repaint(swc.shm->renderer, target_geom, view, &damage);
+			decor_repaint(renderer, target_geom, view, &damage);
 		}
 	}
 
-	draw_overlays(swc.shm->renderer, &screen->base.geometry);
+	draw_overlays(renderer, &screen->base.geometry);
 
-	wld_flush(swc.shm->renderer);
+	if (scratch) {
+		bool ok = false;
+
+		if (wld_map(buffer)) {
+			ok = wld_read_pixels(renderer, 0, 0, width, height, buffer->pitch,
+			                     buffer->map);
+			wld_unmap(buffer);
+		}
+		/* wld_flush() drops the target, so this has to come after the read. */
+		wld_flush(renderer);
+		wld_buffer_unreference(scratch);
+
+		if (!ok) {
+			ERROR("Could not read back the composited screen\n");
+			wld_buffer_unreference(buffer);
+			buffer = NULL;
+		}
+	} else {
+		wld_flush(renderer);
+	}
+
 	pixman_region32_fini(&region);
 	pixman_region32_fini(&damage);
 
