@@ -29,8 +29,12 @@
 
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include <drm_fourcc.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <wld/drm.h>
 #include <wld/wld.h>
@@ -199,9 +203,153 @@ error0:
 	wl_resource_post_no_memory(resource);
 }
 
+/*
+ * Version 4 replaces the format/modifier events with feedback objects. A
+ * client that only sees version 3 -- as GTK does, which requires 4 -- falls
+ * back to CPU rendering, so its GL and Vulkan backends never produce a buffer
+ * to attach and its windows stay unmapped.
+ *
+ * The feedback we send is the simplest form the protocol allows: one main
+ * device, and a single tranche offering every format we support on it.
+ */
+
+static const struct {
+	uint32_t format;
+	uint32_t padding; /* the protocol requires this to be zero */
+	uint64_t modifier;
+} format_table[] = {
+	{ DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_INVALID },
+	{ DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_INVALID },
+};
+
+static int
+format_table_fd(size_t *size)
+{
+	int fd;
+
+	*size = sizeof(format_table);
+
+#ifdef __linux__
+	fd = memfd_create("swc-dmabuf-formats", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	if (fd < 0)
+		return -1;
+	if (write(fd, format_table, *size) != (ssize_t)*size)
+		goto error;
+	fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+#else
+	{
+		char path[] = "/tmp/swc-dmabuf-XXXXXX";
+
+		fd = mkostemp(path, O_CLOEXEC);
+		if (fd < 0)
+			return -1;
+		unlink(path);
+		if (write(fd, format_table, *size) != (ssize_t)*size)
+			goto error;
+	}
+#endif
+
+	return fd;
+
+error:
+	close(fd);
+	return -1;
+}
+
+static bool
+main_device(struct wl_array *array)
+{
+	struct stat st;
+	dev_t *device;
+
+	if (fstat(swc.drm->fd, &st) != 0)
+		return false;
+
+	wl_array_init(array);
+	if (!(device = wl_array_add(array, sizeof(*device)))) {
+		wl_array_release(array);
+		return false;
+	}
+	*device = st.st_rdev;
+
+	return true;
+}
+
+static void
+send_feedback(struct wl_resource *resource)
+{
+	struct wl_array device, indices;
+	uint16_t *index;
+	size_t size, i;
+	int fd;
+
+	if ((fd = format_table_fd(&size)) < 0)
+		return;
+	zwp_linux_dmabuf_feedback_v1_send_format_table(resource, fd, size);
+	close(fd);
+
+	if (!main_device(&device))
+		return;
+	zwp_linux_dmabuf_feedback_v1_send_main_device(resource, &device);
+
+	/* A single tranche on the main device, offering every format. */
+	zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(resource, &device);
+
+	wl_array_init(&indices);
+	for (i = 0; i < ARRAY_LENGTH(format_table); ++i) {
+		if ((index = wl_array_add(&indices, sizeof(*index))))
+			*index = i;
+	}
+	zwp_linux_dmabuf_feedback_v1_send_tranche_formats(resource, &indices);
+	wl_array_release(&indices);
+
+	zwp_linux_dmabuf_feedback_v1_send_tranche_flags(resource, 0);
+	zwp_linux_dmabuf_feedback_v1_send_tranche_done(resource);
+	zwp_linux_dmabuf_feedback_v1_send_done(resource);
+
+	wl_array_release(&device);
+}
+
+static const struct zwp_linux_dmabuf_feedback_v1_interface feedback_impl = {
+	.destroy = destroy_resource,
+};
+
+static void
+create_feedback(struct wl_client *client, struct wl_resource *dmabuf_resource,
+                uint32_t id)
+{
+	struct wl_resource *resource;
+
+	resource = wl_resource_create(client, &zwp_linux_dmabuf_feedback_v1_interface,
+	                              wl_resource_get_version(dmabuf_resource), id);
+	if (!resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &feedback_impl, NULL, NULL);
+	send_feedback(resource);
+}
+
+static void
+get_default_feedback(struct wl_client *client, struct wl_resource *resource,
+                     uint32_t id)
+{
+	create_feedback(client, resource, id);
+}
+
+static void
+get_surface_feedback(struct wl_client *client, struct wl_resource *resource,
+                     uint32_t id, struct wl_resource *surface)
+{
+	/* We have nothing surface-specific to say, so this matches the default. */
+	create_feedback(client, resource, id);
+}
+
 static const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
     .destroy = destroy_resource,
     .create_params = create_params,
+    .get_default_feedback = get_default_feedback,
+    .get_surface_feedback = get_surface_feedback,
 };
 
 static void
@@ -232,6 +380,11 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 		return;
 	}
 	wl_resource_set_implementation(resource, &dmabuf_impl, NULL, NULL);
+
+	/* Superseded by feedback from version 4 on. */
+	if (version >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION)
+		return;
+
 	for (i = 0; i < ARRAY_LENGTH(formats); ++i) {
 		if (version >= 3) {
 			zwp_linux_dmabuf_v1_send_modifier(
@@ -245,6 +398,6 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 struct wl_global *
 swc_dmabuf_create(struct wl_display *display)
 {
-	return wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 3, NULL,
+	return wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 4, NULL,
 	                        &bind_dmabuf);
 }
