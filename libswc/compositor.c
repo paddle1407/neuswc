@@ -126,6 +126,13 @@ static struct {
 	/* A mask of screens that are scheduled to be repainted on the next idle. */
 	uint32_t scheduled_updates;
 
+	/*
+	 * Some displays drop the link when they stop receiving page flips, which
+	 * on an idle screen is forever, since we only flip when something
+	 * changes. Repaint occasionally to keep them awake.
+	 */
+	struct wl_event_source *keepalive;
+
 	bool updating;
 	struct wl_global *global;
 	bool initialized;
@@ -1957,6 +1964,19 @@ bind_compositor(struct wl_client *client, void *data, uint32_t version,
 	wl_resource_set_implementation(resource, &compositor_impl, NULL, NULL);
 }
 
+#define KEEPALIVE_INTERVAL_MS 2000
+
+static int
+handle_keepalive(void *data)
+{
+	if (swc.active) {
+		compositor_damage_all();
+	}
+	wl_event_source_timer_update(compositor.keepalive, KEEPALIVE_INTERVAL_MS);
+
+	return 0;
+}
+
 bool
 compositor_initialize(void)
 {
@@ -1999,6 +2019,13 @@ compositor_initialize(void)
 		                NULL);
 	}
 
+	compositor.keepalive =
+	    wl_event_loop_add_timer(swc.event_loop, &handle_keepalive, NULL);
+	if (compositor.keepalive) {
+		wl_event_source_timer_update(compositor.keepalive,
+		                             KEEPALIVE_INTERVAL_MS);
+	}
+
 	compositor.initialized = true;
 
 	return true;
@@ -2007,6 +2034,11 @@ compositor_initialize(void)
 void
 compositor_finalize(void)
 {
+	if (compositor.keepalive) {
+		wl_event_source_remove(compositor.keepalive);
+		compositor.keepalive = NULL;
+	}
+
 	compositor.initialized = false;
 
 	if (compositor.zoom_buffer) {
