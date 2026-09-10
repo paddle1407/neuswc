@@ -43,6 +43,7 @@
 #include "select.h"
 #include "shell.h"
 #include "shm.h"
+#include "screencopy.h"
 #include "snap.h"
 #include "subcompositor.h"
 #include "util.h"
@@ -293,10 +294,18 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
 		goto error17;
 	}
 
+	swc.screencopy_manager = screencopy_manager_create(display);
+	if (!swc.screencopy_manager) {
+		ERROR("Could not initialize screencopy manager\n");
+		goto error18;
+	}
+
 	setup_compositor();
 
 	return true;
 
+error18:
+	wl_global_destroy(swc.xdg_output_manager);
 error17:
 	wl_global_destroy(swc.select_manager);
 #ifdef ENABLE_XWAYLAND
@@ -347,6 +356,7 @@ swc_finalize(void)
 #ifdef ENABLE_XWAYLAND
 	xserver_finalize();
 #endif
+	wl_global_destroy(swc.screencopy_manager);
 	wl_global_destroy(swc.xdg_output_manager);
 	wl_global_destroy(swc.snap_manager);
 	wl_global_destroy(swc.select_manager);

@@ -41,6 +41,7 @@
 #include "pointer.h"
 #include "region.h"
 #include "screen.h"
+#include "screencopy.h"
 #include "seat.h"
 #include "shm.h"
 #include "subsurface.h"
@@ -1826,6 +1827,10 @@ perform_update(void *data)
 	calculate_damage();
 
 	wl_list_for_each(screen, &swc.screens, link) update_screen(screen);
+
+	/* Feed screencopy clients that are waiting on damage, before it is
+	 * dropped below. */
+	screencopy_handle_damage(&compositor.damage);
 
 	/* XXX: Should assert that all damage was covered by some output */
 	pixman_region32_clear(&compositor.damage);

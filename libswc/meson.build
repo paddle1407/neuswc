@@ -20,6 +20,7 @@ libswc_src = files(
   'primary_plane.c',
   'region.c',
   'screen.c',
+  'screencopy.c',
   'select.c',
   'snap.c',
   'shell.c',

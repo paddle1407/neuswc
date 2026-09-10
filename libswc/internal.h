@@ -52,6 +52,7 @@ struct swc {
 	struct wl_global *kde_decoration_manager;
 	struct wl_global *layer_shell;
 	struct wl_global *panel_manager;
+	struct wl_global *screencopy_manager;
 	struct wl_global *shell;
 	struct wl_global *snap_manager;
 	struct wl_global *select_manager;

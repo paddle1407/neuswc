@@ -15,9 +15,9 @@
 #include <wld/wld.h>
 
 /* get cursor */
-static void
-cursor(uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
-       uint32_t dst_pitch, struct screen *screen)
+void
+snap_overlay_cursor(uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
+                    uint32_t dst_pitch, struct screen *screen)
 {
 	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
 	struct wld_buffer *cursor_buf;
@@ -196,7 +196,7 @@ capture(struct wl_client *client, struct wl_resource *resource,
 	src_pixels = shm_buffer->map;
 
 	if (flags & SWC_SNAP_FLAGS_OVERLAY_CURSOR) {
-		cursor(src_pixels, width, height, shm_buffer->pitch, screen);
+		snap_overlay_cursor(src_pixels, width, height, shm_buffer->pitch, screen);
 	}
 
 	dst_pixels = target.data;
