@@ -115,6 +115,7 @@ static void
 handle_page_flip(struct drm_handler *handler, uint32_t time)
 {
 	struct primary_plane *plane = wl_container_of(handler, plane, drm_handler);
+
 	view_frame(&plane->view, time);
 }
 #endif
@@ -206,4 +207,5 @@ primary_plane_finalize(struct primary_plane *plane)
 #else
 	(void)plane;
 #endif
+	view_finalize(&plane->view);
 }

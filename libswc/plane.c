@@ -172,5 +172,7 @@ error0:
 void
 plane_destroy(struct plane *plane)
 {
+	wl_list_remove(&plane->swc_listener.link);
+	view_finalize(&plane->view);
 	free(plane);
 }

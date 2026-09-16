@@ -24,6 +24,7 @@
 #include "pointer.h"
 #include "backend.h"
 #include "compositor.h"
+#include "screencopy.h"
 #include "cursor/cursor_data.h"
 #include "event.h"
 #include "internal.h"
@@ -31,9 +32,13 @@
 #include "plane.h"
 #endif
 #include "screen.h"
+#include "output.h"
+#include "mode.h"
 #include "seat.h"
 #include "shm.h"
 #include "surface.h"
+#include "pointer_constraints.h"
+#include "relative_pointer.h"
 #include "util.h"
 
 #include <assert.h>
@@ -44,8 +49,28 @@
 static enum swc_cursor_kind cursor_override = SWC_CURSOR_DEFAULT;
 static enum swc_cursor_mode cursor_mode = SWC_CURSOR_MODE_CLIENT;
 
+static bool profile_input;
+static struct input_profile {
+	uint64_t total;
+	uint32_t count, worst;
+} motion_profile, cursor_profile;
+
+static void
+record_input_time(struct input_profile *profile, const char *label, uint32_t start)
+{
+	if (!profile_input) return;
+	uint32_t elapsed = get_time() - start;
+	profile->total += elapsed;
+	profile->worst = MAX(profile->worst, elapsed);
+	if (++profile->count == 120) {
+		fprintf(stderr, "input-profile: %s: 120 calls, average %.3f ms, worst %u ms\n",
+		        label, (double)profile->total / profile->count, profile->worst);
+		memset(profile, 0, sizeof(*profile));
+	}
+}
+
 static struct {
-	const uint32_t *data;
+	struct wld_buffer *buffer;
 	uint32_t width, height;
 	int32_t hotspot_x, hotspot_y;
 	bool active;
@@ -140,8 +165,11 @@ enter(struct input_focus_handler *handler, struct wl_list *resources,
 	origin_y = view->base.geometry.y - view->buffer_offset_y;
 	surface_x = pointer->x - wl_fixed_from_int(origin_x);
 	surface_y = pointer->y - wl_fixed_from_int(origin_y);
-	wl_resource_for_each(resource, resources) wl_pointer_send_enter(
-	    resource, serial, view->surface->resource, surface_x, surface_y);
+	wl_resource_for_each(resource, resources) {
+		wl_pointer_send_enter(resource, serial, view->surface->resource, surface_x, surface_y);
+		if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
+			wl_pointer_send_frame(resource);
+	}
 }
 
 static void
@@ -152,8 +180,11 @@ leave(struct input_focus_handler *handler, struct wl_list *resources,
 	uint32_t serial;
 
 	serial = wl_display_next_serial(swc.display);
-	wl_resource_for_each(resource, resources)
-	    wl_pointer_send_leave(resource, serial, view->surface->resource);
+	wl_resource_for_each(resource, resources) {
+		wl_pointer_send_leave(resource, serial, view->surface->resource);
+		if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
+			wl_pointer_send_frame(resource);
+	}
 }
 
 static void
@@ -162,14 +193,55 @@ handle_cursor_surface_destroy(struct wl_listener *listener, void *data)
 	struct pointer *pointer =
 	    wl_container_of(listener, pointer, cursor.destroy_listener);
 
-	view_attach(&pointer->cursor.view, NULL);
+	/* The surface is still alive during this signal. Unhook its view handler
+	 * before attaching a replacement, so it cannot see our desktop pixels. */
+	surface_set_view(pointer->cursor.surface, NULL);
 	pointer->cursor.surface = NULL;
+	wl_list_remove(&pointer->cursor.destroy_listener.link);
+	wl_list_init(&pointer->cursor.destroy_listener.link);
+	pointer_set_cursor(pointer, cursor_left_ptr);
+}
+
+static int
+cursor_frame_ready(void *data)
+{
+	struct pointer *pointer = data;
+	pointer->cursor.frame_pending = false;
+	if (swc.active && pointer->cursor.surface &&
+	    pointer->cursor.view.buffer && pointer->cursor.view.screens)
+		view_frame(&pointer->cursor.view, get_time());
+	return 0;
 }
 
 static bool
 update(struct view *view)
 {
-	view_frame(view, get_time());
+	struct pointer *pointer = wl_container_of(view, pointer, cursor.view);
+	struct surface *surface = pointer->cursor.surface;
+
+	/* Cursor pixels may change in a damage-only commit, without attach. */
+	if (surface && pixman_region32_not_empty(&surface->state.damage))
+		view_attach(view, surface->state.buffer);
+	/* Cursor-only animations don't cause primary-plane page flips. Pace their
+	 * callbacks separately instead of replying inside commit(), which lets a
+	 * client request its next frame in an unbounded round-trip loop. */
+	if (swc.active && surface && view->buffer && view->screens &&
+	    !wl_list_empty(&surface->state.frame_callbacks) &&
+	    !pointer->cursor.frame_pending) {
+		struct screen *screen;
+		struct output *output;
+		uint32_t refresh = 0;
+		wl_list_for_each(screen, &swc.screens, link) {
+			if (!(view->screens & screen_mask(screen))) continue;
+			wl_list_for_each(output, &screen->outputs, link)
+				if (output->preferred_mode)
+					refresh = MAX(refresh, output->preferred_mode->refresh);
+		}
+		if (!refresh) refresh = 60000; /* millihertz */
+		int delay = MAX(1, (int)((1000000ULL + refresh - 1) / refresh));
+		if (wl_event_source_timer_update(pointer->cursor.frame_timer, delay) == 0)
+			pointer->cursor.frame_pending = true;
+	}
 	return true;
 }
 
@@ -177,14 +249,18 @@ static int
 attach(struct view *view, struct wld_buffer *buffer)
 {
 	struct pointer *pointer = wl_container_of(view, pointer, cursor.view);
+	uint32_t old_screens = view->screens;
 	struct surface *surface = pointer->cursor.surface;
 #ifdef ENABLE_DRM
 	struct screen *screen;
 #endif
 
-	if (surface && !pixman_region32_not_empty(&surface->state.damage)) {
+	/* A frame-only commit or a repeated set_cursor needs no pixel upload or
+	 * KMS image update. Damage on a reused buffer still refreshes the pixels. */
+	if (buffer == view->buffer &&
+	    (!surface || !pixman_region32_not_empty(&surface->state.damage)))
 		return 0;
-	}
+	uint32_t started = profile_input ? get_time() : 0;
 
 	wld_set_target_buffer(swc.shm->renderer, pointer->cursor.buffer);
 	wld_fill_rectangle(swc.shm->renderer, 0x00000000, 0, 0,
@@ -210,6 +286,8 @@ attach(struct view *view, struct wld_buffer *buffer)
 
 #ifdef ENABLE_DRM
 	wl_list_for_each(screen, &swc.screens, link) {
+		if (!screen->planes.cursor)
+			continue;
 		view_attach(&screen->planes.cursor->view,
 		            buffer ? pointer->cursor.buffer : NULL);
 		view_update(&screen->planes.cursor->view);
@@ -218,22 +296,29 @@ attach(struct view *view, struct wld_buffer *buffer)
 	compositor_damage_all();
 #endif
 
+	screencopy_cursor_changed(old_screens | view->screens);
+	record_input_time(&cursor_profile, "cursor image upload", started);
 	return 0;
 }
 
 static bool
 move(struct view *view, int32_t x, int32_t y)
 {
+	uint32_t old_screens = view->screens;
 #ifdef ENABLE_DRM
 	struct screen *screen;
 #endif
 
-	if (view_set_position(view, x, y)) {
-		view_update_screens(view);
-	}
+	if (!view_set_position(view, x, y))
+		return true;
+	view_update_screens(view);
 
 #ifdef ENABLE_DRM
 	wl_list_for_each(screen, &swc.screens, link) {
+		if (!screen->planes.cursor)
+			continue;
+		if (!((old_screens | view->screens) & screen_mask(screen)))
+			continue;
 		view_move(&screen->planes.cursor->view, view->geometry.x,
 		          view->geometry.y);
 		view_update(&screen->planes.cursor->view);
@@ -242,6 +327,7 @@ move(struct view *view, int32_t x, int32_t y)
 	compositor_damage_all();
 #endif
 
+	screencopy_cursor_changed(old_screens | view->screens);
 	return true;
 }
 
@@ -305,7 +391,7 @@ swc_set_cursor_mode(enum swc_cursor_mode mode)
 	apply_cursor_override(pointer);
 }
 
-EXPORT void
+EXPORT bool
 swc_set_cursor_image(enum swc_cursor_kind kind, const uint32_t *argb8888,
                      uint32_t width, uint32_t height, int32_t hotspot_x,
                      int32_t hotspot_y)
@@ -313,13 +399,25 @@ swc_set_cursor_image(enum swc_cursor_kind kind, const uint32_t *argb8888,
 	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
 
 	if (kind < 0 || kind >= (int)ARRAY_LENGTH(cursor_images)) {
-		return;
+		return false;
 	}
 	if (!argb8888 || width == 0 || height == 0) {
-		return;
+		return false;
 	}
 
-	cursor_images[kind].data = argb8888;
+	/* Own the pixels, including while a client cursor temporarily hides this
+	 * image. Prepare the replacement before releasing the current one. */
+	if (width > 4096 || height > 4096) return false;
+	struct wld_buffer *next = wld_create_buffer(swc.shm->context, width, height,
+	                                            WLD_FORMAT_ARGB8888, WLD_FLAG_MAP);
+	if (!next) return false;
+	if (!wld_map(next)) { wld_buffer_unreference(next); return false; }
+	for (uint32_t y = 0; y < height; ++y)
+		memcpy((uint8_t *)next->map + (size_t)y * next->pitch,
+		       argb8888 + (size_t)y * width, (size_t)width * 4);
+	wld_unmap(next);
+	if (cursor_images[kind].buffer) wld_buffer_unreference(cursor_images[kind].buffer);
+	cursor_images[kind].buffer = next;
 	cursor_images[kind].width = width;
 	cursor_images[kind].height = height;
 	cursor_images[kind].hotspot_x = hotspot_x;
@@ -330,6 +428,7 @@ swc_set_cursor_image(enum swc_cursor_kind kind, const uint32_t *argb8888,
 		drop_client_cursor_surface(pointer);
 	}
 	apply_cursor_override(pointer);
+	return true;
 }
 
 EXPORT void
@@ -342,16 +441,22 @@ swc_clear_cursor_image(enum swc_cursor_kind kind)
 	}
 
 	cursor_images[kind].active = false;
-	cursor_images[kind].data = NULL;
+	if (cursor_images[kind].buffer) wld_buffer_unreference(cursor_images[kind].buffer);
+	cursor_images[kind].buffer = NULL;
 
 	apply_cursor_override(pointer);
+}
+
+EXPORT bool
+swc_pointer_has_buttons(void)
+{
+	return swc.seat && swc.seat->pointer && swc.seat->pointer->buttons.size != 0;
 }
 
 void
 pointer_set_cursor(struct pointer *pointer, uint32_t id)
 {
 	struct cursor *cursor = &cursor_metadata[id];
-	const uint32_t *data = cursor_data;
 	union wld_object object = {.ptr = &cursor_data[cursor->offset]};
 	struct wld_buffer *buffer;
 
@@ -370,11 +475,20 @@ pointer_set_cursor(struct pointer *pointer, uint32_t id)
 			custom_cursor.offset = 0;
 
 			cursor = &custom_cursor;
-			data = cursor_images[kind].data;
-			object.ptr = (void *)data;
+			buffer = cursor_images[kind].buffer;
+			wld_buffer_reference(buffer);
+			goto attach_buffer;
 		}
 	}
 
+	buffer = wld_import_buffer(swc.shm->context, WLD_OBJECT_DATA, object,
+	                           cursor->width, cursor->height,
+	                           WLD_FORMAT_ARGB8888, cursor->width * 4);
+	if (!buffer) {
+		WARNING("Failed to create cursor buffer\n");
+		return;
+	}
+attach_buffer:
 	if (pointer->cursor.internal_buffer) {
 		wld_buffer_unreference(pointer->cursor.internal_buffer);
 	}
@@ -384,12 +498,7 @@ pointer_set_cursor(struct pointer *pointer, uint32_t id)
 		pointer->cursor.surface = NULL;
 	}
 
-	buffer = wld_import_buffer(swc.shm->context, WLD_OBJECT_DATA, object,
-	                           cursor->width, cursor->height,
-	                           WLD_FORMAT_ARGB8888, cursor->width * 4);
-	if (!buffer) {
-		WARNING("Failed to create cursor buffer\n");
-	}
+
 	pointer->cursor.internal_buffer = buffer;
 	pointer->cursor.hotspot.x = cursor->hotspot_x;
 	pointer->cursor.hotspot.y = cursor->hotspot_y;
@@ -409,6 +518,8 @@ client_handle_motion(struct pointer_handler *handler, uint32_t time,
 	if (wl_list_empty(&pointer->focus.active)) {
 		return false;
 	}
+	if (pointer_constraints_pointer_locked())
+		return true;
 
 	origin_x = pointer->focus.view->base.geometry.x -
 	           pointer->focus.view->buffer_offset_x;
@@ -497,12 +608,38 @@ client_handle_frame(struct pointer_handler *handler)
 	pointer->client_axis_source = -1;
 }
 
+static void
+handle_focus_changed(struct wl_listener *listener, void *data)
+{
+	struct pointer *pointer = wl_container_of(listener, pointer, focus_changed);
+	pointer_constraints_update_focus(pointer);
+	/* Destruction clears input focus without calling enter(NULL). Restore the
+	 * desktop cursor here too, including a client that last hid its cursor. */
+	if (!pointer->focus.view &&
+	    (pointer->cursor.surface || !pointer->cursor.view.buffer))
+		pointer_set_cursor(pointer, cursor_left_ptr);
+}
+
+static void
+handle_activity_changed(struct wl_listener *listener, void *data)
+{
+	struct pointer *pointer = wl_container_of(listener, pointer, activity_changed);
+	pointer_constraints_update_focus(pointer);
+	if (swc.active)
+		update(&pointer->cursor.view);
+}
+
 bool
 pointer_initialize(struct pointer *pointer)
 {
 	struct screen *screen = wl_container_of(swc.screens.next, screen, link);
 	struct swc_rectangle *geom = &screen->base.geometry;
 
+	profile_input = getenv("SWC_INPUT_PROFILE") &&
+	                strcmp(getenv("SWC_INPUT_PROFILE"), "1") == 0;
+	memset(&motion_profile, 0, sizeof(motion_profile));
+	memset(&cursor_profile, 0, sizeof(cursor_profile));
+	wl_signal_init(&pointer->destroy_signal);
 	/* Center cursor in the geometry of the first screen. */
 	pointer->x = wl_fixed_from_int(geom->x + geom->width / 2);
 	pointer->y = wl_fixed_from_int(geom->y + geom->height / 2);
@@ -526,8 +663,16 @@ pointer_initialize(struct pointer *pointer)
 	    swc.backend->cursor_height,
 	    WLD_FORMAT_ARGB8888, WLD_FLAG_MAP | WLD_FLAG_CURSOR);
 	pointer->cursor.internal_buffer = NULL;
+	pointer->cursor.frame_pending = false;
+	pointer->cursor.frame_timer = NULL;
 
 	if (!pointer->cursor.buffer) {
+		return false;
+	}
+	pointer->cursor.frame_timer = wl_event_loop_add_timer(
+	    swc.event_loop, cursor_frame_ready, pointer);
+	if (!pointer->cursor.frame_timer) {
+		wld_buffer_unreference(pointer->cursor.buffer);
 		return false;
 	}
 
@@ -540,6 +685,10 @@ pointer_initialize(struct pointer *pointer)
 #endif
 
 	input_focus_initialize(&pointer->focus, &pointer->focus_handler);
+	pointer->focus_changed.notify = handle_focus_changed;
+	wl_signal_add(&pointer->focus.event_signal, &pointer->focus_changed);
+	pointer->activity_changed.notify = handle_activity_changed;
+	wl_signal_add(&swc.event_signal, &pointer->activity_changed);
 	pixman_region32_init(&pointer->region);
 
 	return true;
@@ -548,7 +697,36 @@ pointer_initialize(struct pointer *pointer)
 void
 pointer_finalize(struct pointer *pointer)
 {
-	input_focus_finalize(&pointer->focus);
+	wl_event_source_remove(pointer->cursor.frame_timer);
+	for (size_t i = 0; i < ARRAY_LENGTH(cursor_images); ++i) {
+		if (cursor_images[i].buffer) wld_buffer_unreference(cursor_images[i].buffer);
+	}
+	memset(cursor_images, 0, sizeof(cursor_images));
+	struct wl_resource *resource, *tmp;
+
+	wl_signal_emit(&pointer->destroy_signal, pointer);
+	wl_list_remove(&pointer->focus_changed.link);
+	wl_list_remove(&pointer->activity_changed.link);
+	if (pointer->focus.view)
+		wl_list_remove(&pointer->focus.view_destroy_listener.link);
+	/* Make surviving wl_pointer resources inert before the seat is freed. */
+	wl_resource_for_each_safe(resource, tmp, &pointer->focus.active) {
+		wl_list_remove(wl_resource_get_link(resource));
+		wl_list_init(wl_resource_get_link(resource));
+		wl_resource_set_user_data(resource, NULL);
+	}
+	wl_resource_for_each_safe(resource, tmp, &pointer->focus.inactive) {
+		wl_list_remove(wl_resource_get_link(resource));
+		wl_list_init(wl_resource_get_link(resource));
+		wl_resource_set_user_data(resource, NULL);
+	}
+	drop_client_cursor_surface(pointer);
+	view_attach(&pointer->cursor.view, NULL);
+	view_finalize(&pointer->cursor.view);
+	if (pointer->cursor.internal_buffer)
+		wld_buffer_unreference(pointer->cursor.internal_buffer);
+	wld_buffer_unreference(pointer->cursor.buffer);
+	wl_array_release(&pointer->buttons);
 	pixman_region32_fini(&pointer->region);
 }
 
@@ -556,6 +734,7 @@ void
 pointer_set_focus(struct pointer *pointer, struct compositor_view *view)
 {
 	input_focus_set(&pointer->focus, view);
+	pointer_constraints_update_focus(pointer);
 }
 
 static void
@@ -587,6 +766,15 @@ clip_position(struct pointer *pointer, wl_fixed_t fx, wl_fixed_t fy)
 	pointer->y = fy;
 }
 
+/* A lock-release hint is a warp, not physical motion. In particular it must
+ * not enter focus/constraint selection again or emit relative motion. */
+void
+pointer_warp(struct pointer *pointer, wl_fixed_t x, wl_fixed_t y)
+{
+	clip_position(pointer, x, y);
+	update_cursor(pointer);
+}
+
 void
 pointer_set_region(struct pointer *pointer, pixman_region32_t *region)
 {
@@ -604,7 +792,7 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 
 	(void)serial;
 
-	if (client != pointer->focus.client) {
+	if (!pointer || client != pointer->focus.client) {
 		return;
 	}
 
@@ -613,6 +801,18 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 	    cursor_override != SWC_CURSOR_DEFAULT) {
 		return;
 	}
+
+	surface = surface_resource ? wl_resource_get_user_data(surface_resource) : NULL;
+	if (surface && surface == pointer->cursor.surface) {
+		/* A client may select the same cursor on every motion event. Its
+		 * pixels change on surface commit, not on set_cursor. */
+		pointer->cursor.hotspot.x = hotspot_x;
+		pointer->cursor.hotspot.y = hotspot_y;
+		update_cursor(pointer);
+		return;
+	}
+	if (!surface && !pointer->cursor.surface && !pointer->cursor.view.buffer)
+		return;
 
 	if (pointer->cursor.surface) {
 		surface_set_view(pointer->cursor.surface, NULL);
@@ -626,10 +826,17 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 	pointer->cursor.hotspot.y = hotspot_y;
 
 	if (surface) {
-		surface_set_view(surface, &pointer->cursor.view);
-		wl_resource_add_destroy_listener(surface->resource,
-		                                 &pointer->cursor.destroy_listener);
+		/* Restore position/hotspot before attaching a visible cursor image. */
 		update_cursor(pointer);
+		surface_set_view(surface, &pointer->cursor.view);
+		wl_signal_add(&surface->signal.destroy, &pointer->cursor.destroy_listener);
+	} else {
+		/*
+		 * A null surface means hide the pointer. Dropping the surface alone
+		 * leaves the compositor's own cursor attached to the view, so the
+		 * client ends up drawing its cursor underneath ours.
+		 */
+		view_attach(&pointer->cursor.view, NULL);
 	}
 }
 
@@ -642,7 +849,8 @@ static void
 unbind(struct wl_resource *resource)
 {
 	struct pointer *pointer = wl_resource_get_user_data(resource);
-	input_focus_remove_resource(&pointer->focus, resource);
+	if (pointer)
+		input_focus_remove_resource(&pointer->focus, resource);
 }
 
 struct wl_resource *
@@ -757,7 +965,17 @@ pointer_handle_absolute_motion(struct pointer *pointer, uint32_t time,
                                wl_fixed_t x, wl_fixed_t y)
 {
 	struct pointer_handler *handler;
+	uint32_t started = profile_input ? get_time() : 0;
 
+	/*
+	 * A locked pointer must not move. Relative motion is still reported, so
+	 * the client can keep driving whatever the pointer was locked for.
+	 */
+	pointer_constraints_update_focus(pointer);
+	if (pointer_constraints_pointer_locked())
+		return;
+
+	pointer_constraints_confine(pointer, &x, &y);
 	clip_position(pointer, x, y);
 
 	wl_list_for_each(handler, &pointer->handlers, link)
@@ -770,6 +988,7 @@ pointer_handle_absolute_motion(struct pointer *pointer, uint32_t time,
 	}
 
 	update_cursor(pointer);
+	record_input_time(&motion_profile, "pointer motion including KMS move", started);
 }
 
 void
@@ -779,8 +998,9 @@ pointer_handle_frame(struct pointer *pointer)
 
 	wl_list_for_each(handler, &pointer->handlers, link)
 	{
-		if (handler->pending && handler->frame) {
-			handler->frame(handler);
+		if (handler->pending) {
+			if (handler->frame)
+				handler->frame(handler);
 			handler->pending = false;
 		}
 	}

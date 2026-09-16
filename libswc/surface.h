@@ -30,13 +30,15 @@
 #include <wayland-server.h>
 
 struct subsurface;
+struct drm_syncobj_surface;
 
 enum {
 	SURFACE_COMMIT_ATTACH = (1 << 0),
 	SURFACE_COMMIT_DAMAGE = (1 << 1),
 	SURFACE_COMMIT_OPAQUE = (1 << 2),
 	SURFACE_COMMIT_INPUT = (1 << 3),
-	SURFACE_COMMIT_FRAME = (1 << 4)
+	SURFACE_COMMIT_FRAME = (1 << 4),
+	SURFACE_COMMIT_GEOMETRY = (1 << 5)
 };
 
 struct surface_state {
@@ -64,6 +66,8 @@ struct surface {
 	struct wl_resource *resource;
 	struct {
 		struct wl_signal commit;
+		/* Emitted while the surface and its state are still alive. */
+		struct wl_signal destroy;
 	} signal;
 
 	struct surface_state state;
@@ -72,6 +76,7 @@ struct surface {
 		struct surface_state state;
 		uint32_t commit;
 		int32_t x, y;
+		struct swc_rectangle window_geometry;
 	} pending;
 
 	struct view *view;
@@ -81,14 +86,27 @@ struct surface {
 
 	struct subsurface *subsurface;
 	struct wl_list subsurfaces;
+
+	/* Explicit synchronization state, when the client asked for it. */
+	struct drm_syncobj_surface *synced;
+
 	bool has_window_geometry;
 	int32_t window_x, window_y;
 	int32_t window_width, window_height;
-	bool window_geometry_applied;
 };
 
 struct surface *
 surface_new(struct wl_client *client, uint32_t version, uint32_t id);
+/**
+ * Returns the surface behind a resource, or NULL if it is not one of ours.
+ *
+ * Needed wherever an object id arrives from outside the Wayland connection it
+ * names -- Xwayland's WL_SURFACE_ID, for one -- because wl_client_get_object()
+ * will happily return a wl_buffer or a wl_output for the wrong id, and its
+ * user data is not a struct surface.
+ */
+struct surface *
+surface_from_resource(struct wl_resource *resource);
 void
 surface_set_view(struct surface *surface, struct view *view);
 bool

@@ -51,8 +51,12 @@ static struct {
 	int display;
 	char display_name[16];
 	int abstract_fd, unix_fd, wm_fd;
-	bool xwm_initialized;
-} xserver;
+	bool display_open, xwm_initialized, initializing, finalizing;
+} xserver = {
+	.abstract_fd = -1,
+	.unix_fd = -1,
+	.wm_fd = -1,
+};
 
 struct swc_xserver swc_xserver;
 
@@ -73,7 +77,7 @@ open_socket(struct sockaddr_un *addr)
 		goto error1;
 	}
 
-	if (listen(fd, 1) < 0) {
+	if (listen(fd, SOMAXCONN) < 0) {
 		goto error2;
 	}
 
@@ -125,23 +129,28 @@ begin:
 		}
 
 		if (read(lock_fd, pid, sizeof(pid) - 1) != sizeof(pid) - 1) {
+			close(lock_fd);
 			goto retry0;
 		}
 
 		owner = strtol(pid, &end, 10);
 
 		if (end != pid + 10) {
+			close(lock_fd);
 			goto retry0;
 		}
 
 		if (kill(owner, 0) == 0 || errno != ESRCH) {
+			close(lock_fd);
 			goto retry0;
 		}
 
 		if (unlink(lock_name) != 0) {
+			close(lock_fd);
 			goto retry0;
 		}
 
+		close(lock_fd);
 		goto begin;
 	}
 
@@ -186,10 +195,16 @@ close_display(void)
 {
 	char path[64];
 
+	if (!xserver.display_open) {
+		return;
+	}
+
 	#ifdef __linux__
 	close(xserver.abstract_fd);
+	xserver.abstract_fd = -1;
 	#endif
 	close(xserver.unix_fd);
+	xserver.unix_fd = -1;
 
 	snprintf(path, sizeof(path), SOCKET_FMT, xserver.display);
 	unlink(path);
@@ -197,19 +212,28 @@ close_display(void)
 	unlink(path);
 
 	unsetenv("DISPLAY");
+	xserver.display_open = false;
 }
 
 static int
 handle_usr1(int signal_number, void *data)
 {
-	if (xwm_initialize(xserver.wm_fd)) {
+	bool initialized = xwm_initialize(xserver.wm_fd);
+
+	if (initialized) {
 		xserver.xwm_initialized = true;
+		MESSAGE("INFO", "Xwayland ready on %s\n", xserver.display_name);
 	} else {
 		ERROR("Failed to initialize X window manager\n");
-		/* XXX: How do we handle this case? */
 	}
+	/* xwm_initialize takes ownership of the XCB socket on both paths. */
+	xserver.wm_fd = -1;
 
 	wl_event_source_remove(xserver.usr1_source);
+	xserver.usr1_source = NULL;
+	if (!initialized && swc_xserver.client) {
+		wl_client_destroy(swc_xserver.client);
+	}
 
 	return 0;
 }
@@ -218,6 +242,23 @@ static void
 handle_client_destroy(struct wl_listener *listener, void *data)
 {
 	swc_xserver.client = NULL;
+	if (xserver.initializing || xserver.finalizing) {
+		return;
+	}
+
+	if (xserver.usr1_source) {
+		wl_event_source_remove(xserver.usr1_source);
+		xserver.usr1_source = NULL;
+	}
+	if (xserver.xwm_initialized) {
+		xwm_finalize();
+		xserver.xwm_initialized = false;
+	} else if (xserver.wm_fd >= 0) {
+		close(xserver.wm_fd);
+		xserver.wm_fd = -1;
+	}
+	close_display();
+	ERROR("Xwayland exited; disabled DISPLAY to prevent blocked X clients\n");
 }
 
 static struct wl_listener client_destroy_listener = {
@@ -228,12 +269,14 @@ bool
 xserver_initialize(void)
 {
 	int wl[2], wm[2];
+	xserver.initializing = true;
 
 	/* Open an X display */
 	if (!open_display()) {
 		ERROR("Failed to get X lockfile and sockets\n");
 		goto error0;
 	}
+	xserver.display_open = true;
 
 	xserver.usr1_source =
 	    wl_event_loop_add_signal(swc.event_loop, SIGUSR1, &handle_usr1, NULL);
@@ -302,11 +345,11 @@ xserver_initialize(void)
 
 		#ifdef __linux__
 		execlp("Xwayland", "Xwayland", xserver.display_name, "-rootless",
-		       "-terminate", "-listen", strings[2], "-listen", strings[3],
+		       "-terminate", "-listenfd", strings[2], "-listenfd", strings[3],
 		       "-wm", strings[1], NULL);
 		#else
 		execlp("Xwayland", "Xwayland", xserver.display_name, "-rootless",
-		       "-terminate", "-listen", strings[3],
+		       "-terminate", "-listenfd", strings[3],
 		       "-wm", strings[1], NULL);
 		#endif
 
@@ -321,33 +364,54 @@ xserver_initialize(void)
 
 	close(wl[1]);
 	close(wm[1]);
+	xserver.initializing = false;
 
 	return true;
 
 error5:
 	wl_client_destroy(swc_xserver.client);
+	swc_xserver.client = NULL;
+	close(wm[1]);
+	close(wm[0]);
+	xserver.wm_fd = -1;
+	close(wl[1]);
+	goto error2;
 error4:
 	close(wm[1]);
 	close(wm[0]);
+	xserver.wm_fd = -1;
 error3:
 	close(wl[1]);
 	close(wl[0]);
 error2:
 	wl_event_source_remove(xserver.usr1_source);
+	xserver.usr1_source = NULL;
 error1:
 	close_display();
 error0:
+	xserver.initializing = false;
 	return false;
 }
 
 void
 xserver_finalize(void)
 {
+	xserver.finalizing = true;
+	if (xserver.usr1_source) {
+		wl_event_source_remove(xserver.usr1_source);
+		xserver.usr1_source = NULL;
+	}
 	if (xserver.xwm_initialized) {
 		xwm_finalize();
+		xserver.xwm_initialized = false;
+		xserver.wm_fd = -1;
+	} else if (xserver.wm_fd >= 0) {
+		close(xserver.wm_fd);
+		xserver.wm_fd = -1;
 	}
 	if (swc_xserver.client) {
 		wl_client_destroy(swc_xserver.client);
+		swc_xserver.client = NULL;
 	}
 	close_display();
 }

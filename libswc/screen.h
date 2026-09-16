@@ -27,6 +27,7 @@
 #include "primary_plane.h"
 #include "swc.h"
 
+#include <stdint.h>
 #include <wayland-util.h>
 
 struct output;
@@ -44,13 +45,26 @@ struct screen_modifier {
 	struct wl_list link;
 };
 
+/*
+ * Screens are addressed by a bit in a uint32_t mask (screen_mask, and
+ * view->base.screens), and screen->id indexes per-screen arrays, so no screen
+ * may be given an id at or above this. drm_create_screens enforces it when
+ * assigning ids from CRTC indices.
+ */
+#define SWC_MAX_SCREENS 32
+
 struct screen {
 	struct swc_screen base;
 	const struct swc_screen_handler *handler;
 	void *handler_data;
+	bool configuring;
+	struct wallpaper_output *wallpaper;
 
 	struct wl_signal destroy_signal;
 	uint8_t id;
+	/* Numbered workspace (1 through 9) currently shown on this screen. Each
+	 * screen has its own set, so switching one monitor leaves the others. */
+	uint32_t active_workspace;
 #ifdef ENABLE_DRM
 	uint32_t crtc;
 #endif
@@ -86,7 +100,8 @@ screen_destroy(struct screen *screen);
 static inline uint32_t
 screen_mask(struct screen *screen)
 {
-	return 1 << screen->id;
+	/* An output can reach here before a screen is attached to it. */
+	return screen ? UINT32_C(1) << screen->id : 0;
 }
 
 void

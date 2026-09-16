@@ -29,6 +29,7 @@
 
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include <drm_fourcc.h>
+#include <errno.h>
 #include <xf86drm.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -60,18 +61,21 @@ add(struct wl_client *client, struct wl_resource *resource, int32_t fd,
 		wl_resource_post_error(resource,
 		                       ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ALREADY_USED,
 		                       "buffer already created");
+		close(fd);
 		return;
 	}
-	if (i > ARRAY_LENGTH(params->fd)) {
+	if (i >= ARRAY_LENGTH(params->fd)) {
 		wl_resource_post_error(resource,
 		                       ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_IDX,
 		                       "plane index too large");
+		close(fd);
 		return;
 	}
 	if (params->fd[i] != -1) {
 		wl_resource_post_error(resource,
 		                       ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_SET,
 		                       "buffer plane already set");
+		close(fd);
 		return;
 	}
 	params->fd[i] = fd;
@@ -98,6 +102,12 @@ create_immed(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 	params->created = true;
+	if (width <= 0 || height <= 0) {
+		wl_resource_post_error(resource,
+		    ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS,
+		    "dmabuf dimensions must be positive");
+		return;
+	}
 	switch (format) {
 	case DRM_FORMAT_XRGB8888:
 	case DRM_FORMAT_ARGB8888:
@@ -114,6 +124,7 @@ create_immed(struct wl_client *client, struct wl_resource *resource,
 			wl_resource_post_error(resource,
 			                       ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INCOMPLETE,
 			                       "missing plane %d", i);
+			return;
 		}
 	}
 	for (; i < ARRAY_LENGTH(params->fd); ++i) {
@@ -121,7 +132,20 @@ create_immed(struct wl_client *client, struct wl_resource *resource,
 			wl_resource_post_error(resource,
 			                       ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INCOMPLETE,
 			                       "too many planes");
+			return;
 		}
+	}
+	if (params->stride[0] < (uint64_t)width * 4 ||
+	    (uint64_t)params->offset[0] + (uint64_t)params->stride[0] * (height - 1)
+	        + (uint64_t)width * 4 > UINT32_MAX) {
+		wl_resource_post_error(resource, ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS,
+		                       "dmabuf stride or plane extent is invalid");
+		return;
+	}
+	/* Y inversion and interlacing are not implemented by this renderer. */
+	if (flags) {
+		buffer = NULL;
+		goto import_done;
 	}
 	/*
 	 * Pass the layout through. A tiled buffer imported as a bare PRIME fd is
@@ -140,30 +164,44 @@ create_immed(struct wl_client *client, struct wl_resource *resource,
 		buffer = wld_import_buffer(swc.drm->context, WLD_DRM_OBJECT_DMABUF,
 		                           object, width, height, format,
 		                           params->stride[0]);
-		if (!buffer) {
+		/* Legacy backends can only represent an implicit layout at offset 0.
+		 * Retrying an explicit layout would silently discard its attributes. */
+		if (!buffer && params->offset[0] == 0 &&
+		    params->modifier[0] == DRM_FORMAT_MOD_INVALID) {
 			object.i = params->fd[0];
 			buffer = wld_import_buffer(swc.drm->context,
 			                           WLD_DRM_OBJECT_PRIME_FD, object, width,
 			                           height, format, params->stride[0]);
 		}
 	}
+import_done:
 	for (i = 0; i < num_planes; ++i) {
 		close(params->fd[i]);
 		params->fd[i] = -1;
 	}
 	if (!buffer) {
-		zwp_linux_buffer_params_v1_send_failed(resource);
+		/*
+		 * create() may report failure and let the client try again;
+		 * create_immed() has already been given an id, so the protocol
+		 * requires a fatal error instead.
+		 */
+		if (id == 0) {
+			zwp_linux_buffer_params_v1_send_failed(resource);
+		} else {
+			wl_resource_post_error(
+			    resource, ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER,
+			    "failed to import dmabuf");
+		}
+		return;
 	}
 
 	buffer_resource = wayland_buffer_create_resource(client, 1, id, buffer);
 	if (!buffer_resource) {
-		if (buffer) {
-			wld_buffer_unreference(buffer);
-		}
+		wld_buffer_unreference(buffer);
 		wl_resource_post_no_memory(resource);
 		return;
 	}
-	if (id == 0 && buffer) {
+	if (id == 0) {
 		zwp_linux_buffer_params_v1_send_created(resource, buffer_resource);
 	}
 }
@@ -189,8 +227,12 @@ params_destroy(struct wl_resource *resource)
 	int i;
 
 	for (i = 0; i < ARRAY_LENGTH(params->fd); ++i) {
-		close(params->fd[i]);
+		if (params->fd[i] != -1) {
+			close(params->fd[i]);
+		}
 	}
+
+	free(params);
 }
 
 static void
@@ -270,7 +312,9 @@ build_format_table(void)
 		                                ARRAY_LENGTH(modifiers));
 
 		/* Fall back to implicit if the backend cannot enumerate. */
-		if (count <= 0) {
+		if (count == 0)
+			continue;
+		if (count < 0) {
 			modifiers[0] = DRM_FORMAT_MOD_INVALID;
 			count = 1;
 		}
@@ -369,8 +413,12 @@ send_feedback(struct wl_resource *resource)
 	size_t size, i;
 	int fd;
 
-	if ((fd = format_table_fd(&size)) < 0)
+	if ((fd = format_table_fd(&size)) < 0) {
+		if (errno == EMFILE || errno == ENFILE) {
+			fd_report("could not build the dmabuf format table");
+		}
 		return;
+	}
 	zwp_linux_dmabuf_feedback_v1_send_format_table(resource, fd, size);
 	close(fd);
 
@@ -445,17 +493,6 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	    DRM_FORMAT_XRGB8888,
 	    DRM_FORMAT_ARGB8888,
 	};
-	/*
-	 * Advertise implicit modifiers rather than linear.
-	 *
-	 * wld's import path takes no modifier, so a client that picks an explicit
-	 * one would have it silently dropped. Linear is not a safe substitute
-	 * either: on NVIDIA a linear dmabuf cannot be sampled at all, so every
-	 * GPU-rendering client ends up drawing nothing. With INVALID the client
-	 * allocates in whatever layout it prefers and the driver resolves the
-	 * tiling implicitly on import, which is what these backends expect.
-	 */
-	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	struct wl_resource *resource;
 	size_t i;
 
@@ -471,13 +508,16 @@ bind_dmabuf(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	if (version >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION)
 		return;
 
-	for (i = 0; i < ARRAY_LENGTH(formats); ++i) {
-		if (version >= 3) {
-			zwp_linux_dmabuf_v1_send_modifier(
-			    resource, formats[i], modifier >> 32, modifier & 0xffffffff);
-		} else {
-			zwp_linux_dmabuf_v1_send_format(resource, formats[i]);
+	if (version >= 3) {
+		build_format_table();
+		for (i = 0; i < format_table_len; ++i) {
+			uint64_t modifier = format_table[i].modifier;
+			zwp_linux_dmabuf_v1_send_modifier(resource, format_table[i].format,
+			    modifier >> 32, modifier & 0xffffffff);
 		}
+	} else {
+		for (i = 0; i < ARRAY_LENGTH(formats); ++i)
+			zwp_linux_dmabuf_v1_send_format(resource, formats[i]);
 	}
 }
 

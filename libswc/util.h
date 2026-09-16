@@ -70,6 +70,34 @@ remove_resource(struct wl_resource *resource);
 void
 destroy_resource(struct wl_client *client, struct wl_resource *resource);
 
+/*
+ * Descriptor accounting. Running out of descriptors does not fail in one
+ * place: client buffers stop arriving, dmabuf feedback stops being sent and
+ * explicit-synchronization fences stop being exported, each reported as its
+ * own unrelated-looking error. These report where the descriptors went.
+ */
+
+/* Live descriptors, and the soft limit. Zero when the platform cannot say. */
+unsigned
+fd_count(void);
+unsigned
+fd_limit(void);
+
+/*
+ * Log a breakdown of the process's descriptors by kind. Rate limited, so it is
+ * safe to call from an error path that can repeat every frame.
+ */
+void
+fd_report(const char *reason);
+
+/*
+ * Cheap enough for the frame loop: samples the descriptor count every few
+ * seconds and reports a breakdown when it crosses half the limit, and again
+ * whenever it has grown by half since the last report.
+ */
+void
+fd_pressure_check(void);
+
 static inline uint32_t
 get_time(void)
 {
@@ -81,13 +109,20 @@ get_time(void)
 
 extern pixman_box32_t infinite_extents;
 
+/*
+ * Half-open containment, so adjoining rectangles tile the plane exactly once
+ * and no pixel belongs to none of them. Testing both edges exclusively left
+ * the top row and left column of every rectangle unowned: the pointer at the
+ * desktop origin was on no screen at all, and the column where two monitors
+ * meet belonged to neither of them.
+ */
 static inline bool
 rectangle_contains_point(const struct swc_rectangle *rectangle,
                          int32_t x,
                          int32_t y)
 {
-	return x > rectangle->x && x < rectangle->x + rectangle->width &&
-	       y > rectangle->y && y < rectangle->y + rectangle->height;
+	return x >= rectangle->x && x < rectangle->x + (int32_t)rectangle->width &&
+	       y >= rectangle->y && y < rectangle->y + (int32_t)rectangle->height;
 }
 
 static inline bool

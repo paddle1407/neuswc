@@ -34,6 +34,7 @@
 
 #include "swc-server-protocol.h"
 #include <assert.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 struct panel {
@@ -53,32 +54,46 @@ struct panel {
 static void
 update_position(struct panel *panel)
 {
-	int32_t x, y;
+	int64_t x, y;
 	struct swc_rectangle *screen = &panel->screen->base.geometry,
 	                     *view = &panel->view->base.geometry;
 
+	/*
+	 * offset, y_offset and the view's size are all client-controlled. The
+	 * subtractions below are unsigned, so a view taller or wider than the
+	 * screen used to wrap and put the panel far off-screen; clamp to the
+	 * screen origin instead.
+	 */
 	switch (panel->edge) {
 	case SWC_PANEL_EDGE_TOP:
-		x = screen->x + panel->offset;
-		y = screen->y + panel->y_offset;
+		x = screen->x + (int64_t)panel->offset;
+		y = screen->y + (int64_t)panel->y_offset;
 		break;
 	case SWC_PANEL_EDGE_BOTTOM:
-		x = screen->x + panel->offset;
-		y = screen->y + screen->height - view->height - panel->y_offset;
+		x = screen->x + (int64_t)panel->offset;
+		y = screen->y + MAX((int64_t)screen->height - view->height
+		                        - (int64_t)panel->y_offset,
+		                    (int64_t)0);
 		break;
 	case SWC_PANEL_EDGE_LEFT:
 		x = screen->x;
-		y = screen->y + screen->height - view->height - panel->offset;
+		y = screen->y + MAX((int64_t)screen->height - view->height
+		                        - (int64_t)panel->offset,
+		                    (int64_t)0);
 		break;
 	case SWC_PANEL_EDGE_RIGHT:
-		x = screen->x + screen->width - view->width;
-		y = screen->y + panel->offset;
+		x = screen->x + MAX((int64_t)screen->width - view->width, (int64_t)0);
+		y = screen->y + (int64_t)panel->offset;
 		break;
 	default:
 		return;
 	}
 
-	view_move(&panel->view->base, x, y);
+	/* A client can name an offset far outside any int32 coordinate. */
+	x = MIN(MAX(x, (int64_t)INT32_MIN), (int64_t)INT32_MAX);
+	y = MIN(MAX(y, (int64_t)INT32_MIN), (int64_t)INT32_MAX);
+
+	view_move(&panel->view->base, (int32_t)x, (int32_t)y);
 }
 
 static void
@@ -191,26 +206,34 @@ modify(struct screen_modifier *modifier, const struct swc_rectangle *geom,
 	struct panel *panel = wl_container_of(modifier, panel, modifier);
 	pixman_box32_t box = {.x1 = geom->x,
 	                      .y1 = geom->y,
-	                      .x2 = geom->x + geom->width,
-	                      .y2 = geom->y + geom->height};
+	                      .x2 = geom->x + (int32_t)geom->width,
+	                      .y2 = geom->y + (int32_t)geom->height};
+	int64_t strut;
 
 	assert(panel->docked);
 
 	DEBUG("Original geometry { x1: %d, y1: %d, x2: %d, y2: %d }\n", box.x1,
 	      box.y1, box.x2, box.y2);
 
+	/*
+	 * set_strut takes an unbounded uint32 from the client. Clamping against
+	 * the opposite edge keeps the box well formed: an inverted one makes
+	 * pixman report a bad rectangle and gives the screen nonsense extents.
+	 */
+	strut = panel->strut_size;
+
 	switch (panel->edge) {
 	case SWC_PANEL_EDGE_TOP:
-		box.y1 = MAX(box.y1, geom->y + panel->strut_size);
+		box.y1 = MIN((int64_t)box.y1 + strut, (int64_t)box.y2);
 		break;
 	case SWC_PANEL_EDGE_BOTTOM:
-		box.y2 = MIN(box.y2, geom->y + geom->height - panel->strut_size);
+		box.y2 = MAX((int64_t)box.y2 - strut, (int64_t)box.y1);
 		break;
 	case SWC_PANEL_EDGE_LEFT:
-		box.x1 = MAX(box.x1, geom->x + panel->strut_size);
+		box.x1 = MIN((int64_t)box.x1 + strut, (int64_t)box.x2);
 		break;
 	case SWC_PANEL_EDGE_RIGHT:
-		box.x2 = MIN(box.x2, geom->x + geom->width - panel->strut_size);
+		box.x2 = MAX((int64_t)box.x2 - strut, (int64_t)box.x1);
 		break;
 	}
 
@@ -230,6 +253,7 @@ destroy_panel(struct wl_resource *resource)
 		screen_update_usable_geometry(panel->screen);
 	}
 
+	wl_list_remove(&panel->surface_destroy_listener.link);
 	compositor_view_destroy(panel->view);
 	free(panel);
 }
@@ -258,7 +282,7 @@ panel_new(struct wl_client *client, uint32_t version, uint32_t id,
 	    wl_resource_create(client, &swc_panel_interface, version, id);
 
 	if (!panel->resource) {
-		goto error0;
+		goto error2;
 	}
 
 	if (!surface_set_role(surface, panel->resource)) {

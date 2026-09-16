@@ -49,9 +49,13 @@ struct swc {
 #endif
 	struct swc_backend *backend;
 	struct wl_global *data_device_manager;
+	struct wl_global *foreign_toplevel_manager;
+	struct wl_global *idle_inhibit_manager;
 	struct wl_global *kde_decoration_manager;
 	struct wl_global *layer_shell;
 	struct wl_global *panel_manager;
+	struct wl_global *pointer_constraints;
+	struct wl_global *relative_pointer_manager;
 	struct wl_global *screencopy_manager;
 	struct wl_global *shell;
 	struct wl_global *snap_manager;
@@ -60,6 +64,7 @@ struct swc {
 	struct wl_global *xdg_decoration_manager;
 	struct wl_global *xdg_output_manager;
 	struct wl_global *xdg_shell;
+	struct wl_global *workspace_manager;
 
 #ifdef ENABLE_XWAYLAND
 	const struct swc_xserver *const xserver;

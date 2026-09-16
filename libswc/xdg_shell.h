@@ -24,9 +24,18 @@
 #ifndef SWC_XDG_SHELL_H
 #define SWC_XDG_SHELL_H
 
+#include <stdbool.h>
+
+struct compositor_view;
 struct wl_display;
+struct wl_resource;
 
 struct wl_global *
 xdg_shell_create(struct wl_display *display);
+
+/* Attach an xdg_popup created with a NULL parent to a non-XDG shell surface. */
+bool
+xdg_popup_set_parent(struct wl_resource *popup_resource,
+                     struct compositor_view *parent);
 
 #endif

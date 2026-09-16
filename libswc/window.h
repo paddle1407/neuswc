@@ -36,6 +36,8 @@ struct window_pointer_interaction {
 	struct pointer_handler handler, *original_handler;
 };
 
+struct foreign_toplevel;
+
 enum window_mode {
 	WINDOW_MODE_STACKED,
 	WINDOW_MODE_TILED,
@@ -51,7 +53,17 @@ struct window {
 	struct compositor_view *view;
 	struct view_handler view_handler;
 	bool managed;
+	bool minimized;
+	bool raise_on_click;
+	bool movable;
+	bool resizable;
 	unsigned mode;
+	/* The numbered workspace the window manager placed this window on, or
+	 * zero when it does not use numbered workspaces. swc never acts on it;
+	 * it only publishes it so a taskbar can tell a hidden window's workspace
+	 * from the one its monitor is showing. */
+	uint32_t workspace;
+	struct foreign_toplevel *foreign_toplevel;
 
 	struct {
 		struct swc_rectangle geom;
@@ -100,6 +112,8 @@ window_initialize(struct window *window, const struct window_impl *impl,
                   struct surface *surface);
 void
 window_finalize(struct window *window);
+void
+window_commit(struct window *window);
 void
 window_manage(struct window *window);
 void

@@ -81,6 +81,8 @@ handle_focus_view_destroy(struct wl_listener *listener, void *data)
 
 	input_focus->client = NULL;
 	input_focus->view = NULL;
+	struct input_focus_event_data change = {.old = view, .new = NULL};
+	send_event(&input_focus->event_signal, INPUT_FOCUS_EVENT_CHANGED, &change);
 }
 
 bool
@@ -102,7 +104,13 @@ input_focus_initialize(struct input_focus *input_focus,
 void
 input_focus_finalize(struct input_focus *input_focus)
 {
-	/* XXX: Destroy resources? */
+	/* The focused view still holds this listener in its destroy signal. The
+	 * seat is destroyed before the views are, so leaving it registered lets a
+	 * later view destruction walk a node inside freed memory. */
+	if (input_focus->view) {
+		wl_list_remove(&input_focus->view_destroy_listener.link);
+		input_focus->view = NULL;
+	}
 }
 
 void

@@ -103,7 +103,7 @@ update_protocols(struct xwl_window *xwl_window)
 
 	cookie = xcb_icccm_get_wm_protocols(xwm.connection, xwl_window->id,
 	                                    xwm.atoms[ATOM_WM_PROTOCOLS].value);
-	xwl_window->supports_delete = true;
+	xwl_window->supports_delete = false;
 
 	if (!xcb_icccm_get_wm_protocols_reply(xwm.connection, cookie, &reply,
 	                                      NULL)) {
@@ -232,7 +232,37 @@ close_(struct window *window)
 	xcb_flush(xwm.connection);
 }
 
+static void
+set_mode(struct window *window, enum window_mode mode)
+{
+	struct xwl_window *xwl = wl_container_of(window, xwl, window);
+	xcb_ewmh_get_atoms_reply_t reply = {0};
+	bool have = xcb_ewmh_get_wm_state_reply(&xwm.ewmh,
+	    xcb_ewmh_get_wm_state(&xwm.ewmh, xwl->id), &reply, NULL);
+	xcb_atom_t *atoms = calloc((have ? reply.atoms_len : 0) + 3, sizeof(*atoms));
+	if (!atoms) { if (have) xcb_ewmh_get_atoms_reply_wipe(&reply); return; }
+	unsigned n = 0;
+	if (have) {
+		for (unsigned i = 0; i < reply.atoms_len; ++i) {
+			xcb_atom_t atom = reply.atoms[i];
+			if (atom != xwm.ewmh._NET_WM_STATE_FULLSCREEN &&
+			    atom != xwm.ewmh._NET_WM_STATE_MAXIMIZED_VERT &&
+			    atom != xwm.ewmh._NET_WM_STATE_MAXIMIZED_HORZ) atoms[n++] = atom;
+		}
+		xcb_ewmh_get_atoms_reply_wipe(&reply);
+	}
+	if (mode == WINDOW_MODE_FULLSCREEN) atoms[n++] = xwm.ewmh._NET_WM_STATE_FULLSCREEN;
+	if (mode == WINDOW_MODE_TILED) {
+		atoms[n++] = xwm.ewmh._NET_WM_STATE_MAXIMIZED_VERT;
+		atoms[n++] = xwm.ewmh._NET_WM_STATE_MAXIMIZED_HORZ;
+	}
+	xcb_ewmh_set_wm_state(&xwm.ewmh, xwl->id, n, atoms);
+	free(atoms);
+	xcb_flush(xwm.connection);
+}
+
 static const struct window_impl xwl_window_handler = {
+    .set_mode = set_mode,
     .move = move,
     .configure = configure,
     .focus = focus,
@@ -271,10 +301,37 @@ manage_window(struct xwl_window *xwl_window)
 		return false;
 	}
 
-	surface = wl_resource_get_user_data(resource);
+	/*
+	 * WL_SURFACE_ID is an ordinary X11 client message, so the id is whatever
+	 * an X client put there. Without this check the user data of a wl_buffer
+	 * or a wl_output -- any live object in Xwayland's connection -- would be
+	 * used as a struct surface.
+	 */
+	surface = surface_from_resource(resource);
+
+	if (!surface) {
+		WARNING("X window %u named a Wayland object that is not a surface\n",
+		        xwl_window->id);
+		return false;
+	}
+
+	/*
+	 * A surface that already carries a role belongs to another shell; pairing
+	 * it with an X window would let one client hijack another's surface.
+	 */
+	if (surface->role) {
+		WARNING("X window %u named a Wayland surface that already has a "
+		        "role\n",
+		        xwl_window->id);
+		return false;
+	}
+
 	geometry_cookie = xcb_get_geometry(xwm.connection, xwl_window->id);
 
-	window_initialize(&xwl_window->window, &xwl_window_handler, surface);
+	if (!window_initialize(&xwl_window->window, &xwl_window_handler, surface)) {
+		xcb_discard_reply(xwm.connection, geometry_cookie.sequence);
+		return false;
+	}
 	xwl_window->surface_destroy_listener.notify = &handle_surface_destroy;
 	wl_resource_add_destroy_listener(surface->resource,
 	                                 &xwl_window->surface_destroy_listener);
@@ -349,6 +406,7 @@ destroy_notify(xcb_destroy_notify_event_t *event)
 	struct xwl_window *xwl_window;
 
 	if ((xwl_window = find_window(&xwm.windows, event->window))) {
+		if (xwm.focus == xwl_window) xwm.focus = NULL;
 		wl_list_remove(&xwl_window->surface_destroy_listener.link);
 		window_finalize(&xwl_window->window);
 	} else if (!(xwl_window =
@@ -369,6 +427,25 @@ map_request(xcb_map_request_event_t *event)
 static void
 configure_request(xcb_configure_request_event_t *event)
 {
+	struct xwl_window *xwl = find_window(&xwm.windows, event->window);
+	if (!xwl) return;
+	struct window *window = &xwl->window;
+	if (window->mode == WINDOW_MODE_STACKED && window->resizable) {
+		uint32_t width = window->view->base.geometry.width;
+		uint32_t height = window->view->base.geometry.height;
+		if (event->value_mask & XCB_CONFIG_WINDOW_WIDTH) width = event->width;
+		if (event->value_mask & XCB_CONFIG_WINDOW_HEIGHT) height = event->height;
+		if (width && height) swc_window_set_size(&window->base, width, height);
+	}
+	struct swc_rectangle *g = &window->view->base.geometry;
+	xcb_configure_notify_event_t reply = {
+	    .response_type = XCB_CONFIGURE_NOTIFY, .event = xwl->id, .window = xwl->id,
+	    .x = g->x, .y = g->y,
+	    .width = window->configure.pending ? window->configure.width : g->width,
+	    .height = window->configure.pending ? window->configure.height : g->height,
+	};
+	xcb_send_event(xwm.connection, false, xwl->id, XCB_EVENT_MASK_STRUCTURE_NOTIFY, (const char *)&reply);
+
 }
 
 static void
@@ -391,6 +468,27 @@ property_notify(xcb_property_notify_event_t *event)
 static void
 client_message(xcb_client_message_event_t *event)
 {
+	if (event->format != 32) return;
+	if (event->type == xwm.ewmh._NET_WM_STATE) {
+		struct xwl_window *xwl = find_window(&xwm.windows, event->window);
+		if (!xwl || xwl->override_redirect || event->data.data32[0] > 2) return;
+		struct window *window = &xwl->window;
+		uint32_t action = event->data.data32[0];
+		bool full = false, maximized = false;
+		for (unsigned i = 1; i <= 2; ++i) {
+			xcb_atom_t atom = event->data.data32[i];
+			full |= atom == xwm.ewmh._NET_WM_STATE_FULLSCREEN;
+			maximized |= atom == xwm.ewmh._NET_WM_STATE_MAXIMIZED_VERT || atom == xwm.ewmh._NET_WM_STATE_MAXIMIZED_HORZ;
+		}
+		if (full && window->handler->request_fullscreen)
+			window->handler->request_fullscreen(window->handler_data,
+			    action == 2 ? window->mode != WINDOW_MODE_FULLSCREEN : action == 1, NULL);
+		else if (maximized && window->handler->request_maximized)
+			window->handler->request_maximized(window->handler_data,
+			    action == 2 ? window->mode != WINDOW_MODE_TILED : action == 1);
+		return;
+	}
+
 	if (event->type == xwm.atoms[ATOM_WL_SURFACE_ID].value) {
 		struct xwl_window *xwl_window;
 
@@ -530,6 +628,7 @@ xwm_initialize(int fd)
 
 	if (error) {
 		ERROR("xwm: Failed to get EWMH atom replies: %u\n", error->error_code);
+		free(error);
 		goto error3;
 	}
 
@@ -539,13 +638,21 @@ xwm_initialize(int fd)
 
 		if (error) {
 			ERROR("xwm: Failed to get atom reply: %u\n", error->error_code);
-			return false;
+			free(error);
+			goto error3;
 		}
 
 		xwm.atoms[index].value = atom_reply->atom;
 		free(atom_reply);
 	}
 
+	xcb_atom_t supported[] = { xwm.ewmh._NET_SUPPORTED, xwm.ewmh._NET_SUPPORTING_WM_CHECK,
+	    xwm.ewmh._NET_WM_NAME, xwm.ewmh._NET_WM_STATE, xwm.ewmh._NET_WM_STATE_FULLSCREEN,
+	    xwm.ewmh._NET_WM_STATE_MAXIMIZED_VERT, xwm.ewmh._NET_WM_STATE_MAXIMIZED_HORZ };
+	xcb_ewmh_set_supported(&xwm.ewmh, 0, ARRAY_LENGTH(supported), supported);
+	xcb_ewmh_set_supporting_wm_check(&xwm.ewmh, xwm.screen->root, xwm.window);
+	xcb_ewmh_set_supporting_wm_check(&xwm.ewmh, xwm.window, xwm.window);
+	xcb_ewmh_set_wm_name(&xwm.ewmh, xwm.window, 4, "charaWC");
 	xcb_set_selection_owner(xwm.connection, xwm.window,
 	                        xwm.atoms[ATOM_WM_S0].value, XCB_CURRENT_TIME);
 	xcb_flush(xwm.connection);
@@ -567,7 +674,27 @@ error0:
 void
 xwm_finalize(void)
 {
-	wl_event_source_remove(xwm.source);
+	struct xwl_window *window, *next;
+
+	wl_list_remove(&new_surface_listener.link);
+	wl_list_for_each_safe(window, next, &xwm.windows, link)
+	{
+		wl_list_remove(&window->surface_destroy_listener.link);
+		window_finalize(&window->window);
+		wl_list_remove(&window->link);
+		free(window);
+	}
+	wl_list_for_each_safe(window, next, &xwm.unpaired_windows, link)
+	{
+		wl_list_remove(&window->link);
+		free(window);
+	}
+	xwm.focus = NULL;
+	if (xwm.source) {
+		wl_event_source_remove(xwm.source);
+		xwm.source = NULL;
+	}
 	xcb_ewmh_connection_wipe(&xwm.ewmh);
 	xcb_disconnect(xwm.connection);
+	xwm.connection = NULL;
 }

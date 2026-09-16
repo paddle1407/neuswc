@@ -205,15 +205,22 @@ bind_seat(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 static int
 ws_to_xkb(unsigned type, int key)
 {
+	/* ev.value comes from the kernel, but the maps are far shorter than its
+	 * range, so an unexpected keycode would read past the end. */
 	switch (type) {
 	case WSKBD_TYPE_PC_XT:
 	case WSKBD_TYPE_PC_AT:
+		if (key < 0 || (size_t)key >= ARRAY_LENGTH(wsXtMap)) {
+			return key;
+		}
 		return wsXtMap[key];
 	case WSKBD_TYPE_USB:
 #ifdef WSKBD_TYPE_MAPLE
 	case WSKBD_TYPE_MAPLE:
-		return wsUsbMap[key];
 #endif
+		if (key < 0 || (size_t)key >= ARRAY_LENGTH(wsUsbMap)) {
+			return key;
+		}
 		return wsUsbMap[key];
 	default:
 		fprintf(stderr, "Unknown wskbd type %d\n", type);

@@ -103,6 +103,9 @@ data_device_destroy(struct data_device *data_device)
 
 	wl_list_for_each_safe(resource, tmp, &data_device->resources, link)
 	    wl_resource_destroy(resource);
+	if (data_device->selection) {
+		wl_list_remove(&data_device->selection_destroy_listener.link);
+	}
 	free(data_device);
 }
 

@@ -30,15 +30,57 @@
 #include "util.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <wayland-util.h>
 #include <xkbcommon/xkbcommon.h>
 
 struct binding {
+	struct wl_list link;
+	enum swc_binding_type type;
+	unsigned presses;
+	bool removed;
 	uint32_t value;
 	uint32_t modifiers;
 	swc_binding_handler handler;
 	void *data;
 };
+
+struct swc_binding_batch {
+	struct wl_list entries;
+};
+
+EXPORT struct swc_binding_batch *
+swc_binding_batch_create(void)
+{
+	struct swc_binding_batch *batch = malloc(sizeof(*batch));
+	if (batch) wl_list_init(&batch->entries);
+	return batch;
+}
+
+EXPORT bool
+swc_binding_batch_add(struct swc_binding_batch *batch, enum swc_binding_type type,
+                      uint32_t mods, uint32_t value, swc_binding_handler handler, void *data)
+{
+	if (type != SWC_BINDING_KEY && type != SWC_BINDING_BUTTON) return false;
+	struct binding *b = calloc(1, sizeof(*b));
+	if (!b) return false;
+	b->type = type; b->modifiers = mods; b->value = value;
+	b->handler = handler; b->data = data;
+	wl_list_insert(batch->entries.prev, &b->link);
+	return true;
+}
+
+EXPORT void
+swc_binding_batch_discard(struct swc_binding_batch *batch)
+{
+	if (!batch) return;
+	struct binding *b, *tmp;
+	wl_list_for_each_safe(b, tmp, &batch->entries, link) {
+		wl_list_remove(&b->link);
+		free(b);
+	}
+	free(batch);
+}
 
 struct axis_binding {
 	uint32_t axis;
@@ -68,7 +110,20 @@ static struct pointer_handler button_binding_handler = {
     .axis = handle_axis,
 };
 
-static struct wl_array key_bindings, button_bindings, axis_bindings;
+static struct wl_list key_bindings, button_bindings;
+
+EXPORT void
+swc_binding_batch_commit(struct swc_binding_batch *batch)
+{
+	struct binding *b, *tmp;
+	wl_list_for_each_safe(b, tmp, &batch->entries, link) {
+		wl_list_remove(&b->link);
+		struct wl_list *list = b->type == SWC_BINDING_KEY ? &key_bindings : &button_bindings;
+		wl_list_insert(list->prev, &b->link);
+	}
+	free(batch);
+}
+static struct wl_array axis_bindings;
 
 const struct swc_bindings swc_bindings = {
     .keyboard_handler = &key_binding_handler,
@@ -76,13 +131,13 @@ const struct swc_bindings swc_bindings = {
 };
 
 static struct binding *
-find_binding(struct wl_array *bindings, uint32_t modifiers, uint32_t value)
+find_binding(struct wl_list *bindings, uint32_t modifiers, uint32_t value)
 {
 	struct binding *binding;
 
-	wl_array_for_each(binding, bindings)
+	wl_list_for_each(binding, bindings, link)
 	{
-		if (binding->value == value && (binding->modifiers == modifiers ||
+		if (!binding->removed && binding->value == value && (binding->modifiers == modifiers ||
 		                                binding->modifiers == SWC_MOD_ANY)) {
 			return binding;
 		}
@@ -160,12 +215,23 @@ handle_binding(uint32_t time, struct press *press, uint32_t state,
 			return false;
 		}
 
+		++binding->presses;
 		press->data = binding;
 	} else {
 		binding = press->data;
 	}
 
-	binding->handler(binding->data, time, binding->value, state);
+	/* Entries have stable addresses while held, even if bindings are added or
+	 * removed by IPC. Removed entries must never call freed handler data. */
+	if (!binding->removed)
+		binding->handler(binding->data, time, binding->value, state);
+	if (!state) {
+		press->data = NULL;
+		if (--binding->presses == 0 && binding->removed) {
+			wl_list_remove(&binding->link);
+			free(binding);
+		}
+	}
 
 	return true;
 }
@@ -215,8 +281,8 @@ handle_axis(struct pointer_handler *handler, uint32_t time,
 bool
 bindings_initialize(void)
 {
-	wl_array_init(&key_bindings);
-	wl_array_init(&button_bindings);
+	wl_list_init(&key_bindings);
+	wl_list_init(&button_bindings);
 	wl_array_init(&axis_bindings);
 
 	return true;
@@ -225,8 +291,14 @@ bindings_initialize(void)
 void
 bindings_finalize(void)
 {
-	wl_array_release(&key_bindings);
-	wl_array_release(&button_bindings);
+	struct wl_list *lists[] = { &key_bindings, &button_bindings };
+	for (unsigned i = 0; i < 2; ++i) {
+		struct binding *b, *tmp;
+		wl_list_for_each_safe(b, tmp, lists[i], link) {
+			wl_list_remove(&b->link);
+			free(b);
+		}
+	}
 	wl_array_release(&axis_bindings);
 }
 
@@ -235,7 +307,7 @@ swc_add_binding(enum swc_binding_type type, uint32_t modifiers, uint32_t value,
                 swc_binding_handler handler, void *data)
 {
 	struct binding *binding;
-	struct wl_array *bindings;
+	struct wl_list *bindings;
 
 	switch (type) {
 	case SWC_BINDING_KEY:
@@ -248,7 +320,7 @@ swc_add_binding(enum swc_binding_type type, uint32_t modifiers, uint32_t value,
 		return -EINVAL;
 	}
 
-	if (!(binding = wl_array_add(bindings, sizeof(*binding)))) {
+	if (!(binding = calloc(1, sizeof(*binding)))) {
 		return -ENOMEM;
 	}
 
@@ -256,6 +328,7 @@ swc_add_binding(enum swc_binding_type type, uint32_t modifiers, uint32_t value,
 	binding->modifiers = modifiers;
 	binding->handler = handler;
 	binding->data = data;
+	wl_list_insert(bindings->prev, &binding->link);
 
 	return 0;
 }
@@ -264,7 +337,7 @@ EXPORT void
 swc_remove_binding(enum swc_binding_type type, uint32_t modifiers,
                    uint32_t value)
 {
-	struct wl_array *bindings;
+	struct wl_list *bindings;
 	switch (type) {
 	case SWC_BINDING_KEY:
 		bindings = &key_bindings;
@@ -276,17 +349,21 @@ swc_remove_binding(enum swc_binding_type type, uint32_t modifiers,
 		return;
 	}
 
-	struct binding *b = find_binding(bindings, modifiers, value);
-	if (!b) {
+	struct binding *b;
+	wl_list_for_each(b, bindings, link) {
+		/* Removal is exact: an ANY binding must not swallow a specific one. */
+		if (b->removed || b->value != value || b->modifiers != modifiers)
+			continue;
+		b->removed = true;
+		/* Finish an active operation (e.g. a drag) before its data is freed. */
+		if (b->presses)
+			b->handler(b->data, 0, b->value, 0);
+		if (!b->presses) {
+			wl_list_remove(&b->link);
+			free(b);
+		}
 		return;
 	}
-
-	struct binding *last = (struct binding *)((char *)bindings->data +
-	                                          bindings->size - sizeof(*b));
-	if (b != last) {
-		*b = *last;
-	}
-	bindings->size -= sizeof(*b);
 }
 
 EXPORT int

@@ -77,8 +77,8 @@ struct view_handler_impl {
 	void (*resize)(struct view_handler *handler, uint32_t old_width,
 	               uint32_t old_height);
 	/* Called when the set of screens the view is visible on changes. */
-	void (*screens)(struct view_handler *handler, uint32_t left,
-	                uint32_t entered);
+	void (*screens)(struct view_handler *handler, uint32_t entered,
+	                uint32_t left);
 };
 
 /**

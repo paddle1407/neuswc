@@ -52,12 +52,16 @@ struct pointer_handler {
 struct pointer {
 	struct input_focus focus;
 	struct input_focus_handler focus_handler;
+	struct wl_listener focus_changed, activity_changed;
+	struct wl_signal destroy_signal;
 
 	struct {
 		struct view view;
 		struct surface *surface;
 		struct wl_listener destroy_listener;
 		struct wld_buffer *buffer;
+		struct wl_event_source *frame_timer;
+		bool frame_pending;
 
 		/* Used for cursors set with pointer_set_cursor */
 		struct wld_buffer *internal_buffer;
@@ -74,6 +78,7 @@ struct pointer {
 
 	wl_fixed_t x, y;
 	pixman_region32_t region;
+
 };
 
 bool
@@ -86,6 +91,9 @@ void
 pointer_set_region(struct pointer *pointer, pixman_region32_t *region);
 void
 pointer_set_cursor(struct pointer *pointer, uint32_t id);
+/* Restore a lock-release hint without dispatching physical motion or focus. */
+void
+pointer_warp(struct pointer *pointer, wl_fixed_t x, wl_fixed_t y);
 
 struct button *
 pointer_get_button(struct pointer *pointer, uint32_t serial);

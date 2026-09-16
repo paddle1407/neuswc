@@ -56,15 +56,47 @@ configure(struct window *window, uint32_t width, uint32_t height)
 	window->configure.acknowledged = true;
 }
 
+static const struct wl_shell_surface_interface shell_surface_implementation;
+
+static enum wl_iterator_result
+count_shell_surface(struct wl_resource *resource, void *data)
+{
+	unsigned *count = data;
+
+	if (wl_resource_instance_of(resource, &wl_shell_surface_interface,
+	                            &shell_surface_implementation)) {
+		++*count;
+	}
+
+	return WL_ITERATOR_CONTINUE;
+}
+
 static void
 close_(struct window *window)
 {
 	struct shell_surface *shell_surface =
 	    wl_container_of(window, shell_surface, window);
 	struct wl_client *client;
+	unsigned windows = 0;
 	pid_t pid;
 
 	client = wl_resource_get_client(shell_surface->resource);
+
+	/*
+	 * wl_shell has no close event, so terminating the process is the only way
+	 * to close its window. That is acceptable for the last window a client
+	 * has, and wrong for any earlier one: closing one window would take the
+	 * client's other windows with it.
+	 */
+	wl_client_for_each_resource(client, count_shell_surface, &windows);
+
+	if (windows > 1) {
+		WARNING("Not closing a wl_shell window: the client has %u of them and "
+		        "the protocol has no close event\n",
+		        windows);
+		return;
+	}
+
 	wl_client_get_credentials(client, &pid, NULL, NULL);
 	kill(pid, SIGTERM);
 }
@@ -267,8 +299,8 @@ shell_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
 
 error2:
 	wl_resource_destroy(shell_surface->resource);
-	free(shell_surface);
 error1:
+	free(shell_surface);
 error0:
 	return NULL;
 }

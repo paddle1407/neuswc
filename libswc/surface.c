@@ -22,6 +22,10 @@
  */
 
 #include "surface.h"
+#include "compositor.h"
+#include "drm_syncobj.h"
+#include "pointer.h"
+#include "seat.h"
 #include "event.h"
 #include "internal.h"
 #include "output.h"
@@ -256,9 +260,19 @@ static void
 surface_apply_pending(struct surface *surface, bool flush_children)
 {
 	struct wld_buffer *buffer;
+	bool attached;
+
+	/*
+	 * An explicit-synchronization protocol error leaves the client dead, so
+	 * nothing of this commit may be applied.
+	 */
+	if (!drm_syncobj_surface_check_commit(surface)) {
+		return;
+	}
 
 	/* Attach */
-	if (surface->pending.commit & SURFACE_COMMIT_ATTACH) {
+	attached = surface->pending.commit & SURFACE_COMMIT_ATTACH;
+	if (attached) {
 		if (surface->state.buffer &&
 		    surface->state.buffer != surface->pending.state.buffer) {
 			wl_buffer_send_release(surface->state.buffer_resource);
@@ -268,7 +282,26 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 		                 surface->pending.state.buffer_resource);
 	}
 
+	/*
+	 * Signal the release point of the buffer just replaced and make the
+	 * renderer wait for the new buffer's acquire point, before anything can
+	 * schedule a repaint that would sample it.
+	 */
+	drm_syncobj_surface_apply_commit(surface, attached);
+
 	buffer = surface->state.buffer;
+	/* Destroying the wl_buffer object does not detach its committed contents.
+	 * The view still owns those pixels until an explicit replacement attach. */
+	if (!(surface->pending.commit & SURFACE_COMMIT_ATTACH) && surface->view)
+		buffer = surface->view->buffer;
+	if (surface->pending.commit & SURFACE_COMMIT_GEOMETRY) {
+		const struct swc_rectangle *g = &surface->pending.window_geometry;
+		surface->has_window_geometry = true;
+		surface->window_x = g->x;
+		surface->window_y = g->y;
+		surface->window_width = g->width;
+		surface->window_height = g->height;
+	}
 
 	/* Damage */
 	if (surface->pending.commit & SURFACE_COMMIT_DAMAGE) {
@@ -300,7 +333,7 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	trim_region(&surface->state.opaque, buffer);
 
 	if (surface->view) {
-		if (surface->pending.commit & SURFACE_COMMIT_ATTACH) {
+		if (surface->pending.commit & (SURFACE_COMMIT_ATTACH | SURFACE_COMMIT_GEOMETRY)) {
 			view_attach(surface->view, buffer);
 		}
 		view_update(surface->view);
@@ -347,14 +380,37 @@ commit(struct wl_client *client, struct wl_resource *resource)
 	surface_apply_pending(surface, true);
 }
 
+/*
+ * Buffer transforms and scales other than the defaults are not implemented:
+ * the renderer only blits buffers one to one.
+ *
+ * wl_surface only defines invalid_transform for a value outside the
+ * wl_output.transform enumeration and invalid_scale for a non-positive scale,
+ * so posting a protocol error for a legal-but-unsupported value would kill a
+ * conforming client. Chromium/Electron sends set_buffer_scale for a forced
+ * device scale factor and set_buffer_transform for a rotated output, so that
+ * error was fatal to those clients. Accept the request and ignore it instead;
+ * the surface is composited unscaled and unrotated.
+ */
 static void
 set_buffer_transform(struct wl_client *client, struct wl_resource *surface,
                      int32_t transform)
 {
-	if (transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+	static bool warned;
+
+	if (transform < WL_OUTPUT_TRANSFORM_NORMAL ||
+	    transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
 		wl_resource_post_error(surface, WL_SURFACE_ERROR_INVALID_TRANSFORM,
-		                       "buffer transform %" PRId32 " not supported",
+		                       "buffer transform %" PRId32 " is not a valid "
+		                       "wl_output.transform value",
 		                       transform);
+		return;
+	}
+
+	if (transform != WL_OUTPUT_TRANSFORM_NORMAL && !warned) {
+		warned = true;
+		WARNING("Ignoring unsupported buffer transform %" PRId32 "\n",
+		        transform);
 	}
 }
 
@@ -362,9 +418,18 @@ static void
 set_buffer_scale(struct wl_client *client, struct wl_resource *surface,
                  int32_t scale)
 {
-	if (scale != 1) {
+	static bool warned;
+
+	if (scale <= 0) {
 		wl_resource_post_error(surface, WL_SURFACE_ERROR_INVALID_SCALE,
-		                       "buffer scale not supported");
+		                       "buffer scale %" PRId32 " is not positive",
+		                       scale);
+		return;
+	}
+
+	if (scale != 1 && !warned) {
+		warned = true;
+		WARNING("Ignoring unsupported buffer scale %" PRId32 "\n", scale);
 	}
 }
 
@@ -393,6 +458,12 @@ surface_destroy(struct wl_resource *resource)
 {
 	struct surface *surface = wl_resource_get_user_data(resource);
 
+	drm_syncobj_surface_finish(surface);
+	wl_signal_emit(&surface->signal.destroy, surface);
+	/* Clear pointer focus while the surface used by wl_pointer.leave exists. */
+	if (swc.seat && swc.seat->pointer && swc.seat->pointer->focus.view &&
+	    swc.seat->pointer->focus.view->surface == surface)
+		pointer_set_focus(swc.seat->pointer, NULL);
 	state_finalize(&surface->state);
 	state_finalize(&surface->pending.state);
 
@@ -404,6 +475,18 @@ surface_destroy(struct wl_resource *resource)
 	}
 
 	free(surface);
+}
+
+struct surface *
+surface_from_resource(struct wl_resource *resource)
+{
+	if (!resource ||
+	    !wl_resource_instance_of(resource, &wl_surface_interface,
+	                             &surface_impl)) {
+		return NULL;
+	}
+
+	return wl_resource_get_user_data(resource);
 }
 
 /**
@@ -434,18 +517,19 @@ surface_new(struct wl_client *client, uint32_t version, uint32_t id)
 	/* Initialize the surface. */
 	surface->pending.commit = 0;
 	wl_signal_init(&surface->signal.commit);
+	wl_signal_init(&surface->signal.destroy);
 	surface->view = NULL;
 	surface->view_handler.impl = &view_handler_impl;
 	surface->role = NULL;
 	surface->role_destroy_listener.notify = handle_role_destroy;
 	surface->subsurface = NULL;
 	wl_list_init(&surface->subsurfaces);
+	surface->synced = NULL;
 	surface->has_window_geometry = false;
 	surface->window_x = 0;
 	surface->window_y = 0;
 	surface->window_width = 0;
 	surface->window_height = 0;
-	surface->window_geometry_applied = false;
 
 	state_initialize(&surface->state);
 	state_initialize(&surface->pending.state);
@@ -470,6 +554,9 @@ surface_set_view(struct surface *surface, struct view *view)
 	}
 
 	surface->view = view;
+	struct subsurface *child;
+	wl_list_for_each(child, &surface->subsurfaces, link)
+		subsurface_set_parent_view(child, view);
 
 	if (view) {
 		wl_list_insert(&view->handlers, &surface->view_handler.link);

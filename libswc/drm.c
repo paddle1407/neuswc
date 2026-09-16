@@ -23,6 +23,7 @@
 
 #include "drm.h"
 #include "dmabuf.h"
+#include "drm_syncobj.h"
 #include "event.h"
 #include "internal.h"
 #include "launch.h"
@@ -37,6 +38,7 @@
 #include <drm.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +58,7 @@ static struct {
 
 	struct wl_global *global;
 	struct wl_global *dmabuf;
+	struct wl_global *syncobj;
 	struct wl_event_source *event_source;
 } drm;
 
@@ -97,6 +100,49 @@ create_prime_buffer(struct wl_client *client, struct wl_resource *resource,
 	struct wld_buffer *buffer;
 	struct wl_resource *buffer_resource;
 	union wld_object object = {.i = fd};
+
+	/*
+	 * These come straight off the wire as signed values. Unvalidated they
+	 * reach the backends as a declared layout: the dumb backend maps
+	 * pitch * height, and the GPU backends build commands from them.
+	 * linux-dmabuf validates the same fields; this legacy path did not.
+	 */
+	if (width <= 0 || height <= 0) {
+		close(fd);
+		wl_resource_post_error(resource, WL_DRM_ERROR_INVALID_FORMAT,
+		                       "buffer dimensions must be positive");
+		return;
+	}
+
+	switch (format) {
+	case WL_DRM_FORMAT_XRGB8888:
+	case WL_DRM_FORMAT_ARGB8888:
+		break;
+	default:
+		close(fd);
+		wl_resource_post_error(resource, WL_DRM_ERROR_INVALID_FORMAT,
+		                       "unsupported format %#" PRIx32, format);
+		return;
+	}
+
+	/* Only stride0 reaches the importer, so a non-zero offset would be
+	 * silently ignored and the wrong pixels imported. */
+	if (offset0 != 0 || offset1 != 0 || stride1 != 0 || offset2 != 0 ||
+	    stride2 != 0) {
+		close(fd);
+		wl_resource_post_error(resource, WL_DRM_ERROR_INVALID_FORMAT,
+		                       "only single-plane buffers at offset 0 are "
+		                       "supported");
+		return;
+	}
+
+	if (stride0 <= 0 || (uint64_t)stride0 < (uint64_t)width * 4 ||
+	    (uint64_t)stride0 * (uint64_t)height > UINT32_MAX) {
+		close(fd);
+		wl_resource_post_error(resource, WL_DRM_ERROR_INVALID_FORMAT,
+		                       "buffer stride or extent is invalid");
+		return;
+	}
 
 	buffer = wld_import_buffer(swc.drm->context, WLD_DRM_OBJECT_PRIME_FD,
 	                           object, width, height, format, stride0);
@@ -203,8 +249,14 @@ find_available_crtc(drmModeRes *resources, drmModeConnector *connector,
 		possible_crtcs = encoder->possible_crtcs;
 		drmModeFreeEncoder(encoder);
 
-		for (j = 0; j < resources->count_crtcs; ++j) {
-			if ((possible_crtcs & (1 << j)) && !(taken_crtcs & (1 << j))) {
+		/*
+		 * screen->id is taken from this index and addresses a bit in a
+		 * uint32_t screen mask, so CRTCs past that width cannot be used --
+		 * and shifting by them would be undefined anyway.
+		 */
+		for (j = 0; j < resources->count_crtcs && j < SWC_MAX_SCREENS; ++j) {
+			if ((possible_crtcs & (UINT32_C(1) << j)) &&
+			    !(taken_crtcs & (UINT32_C(1) << j))) {
 				*crtc_index = j;
 				return true;
 			}
@@ -333,6 +385,13 @@ drm_initialize(void)
 		if (!drm.dmabuf) {
 			WARNING("Could not create wp_linux_dmabuf global\n");
 		}
+
+		/*
+		 * Explicit synchronization. Drivers that do not attach implicit fences
+		 * to a dmabuf give the compositor no other way to know when a client
+		 * has finished drawing into the buffer it just committed.
+		 */
+		drm.syncobj = drm_syncobj_manager_create(swc.display);
 	}
 
 	return true;
@@ -352,6 +411,9 @@ error0:
 void
 drm_finalize(void)
 {
+	if (drm.syncobj) {
+		wl_global_destroy(drm.syncobj);
+	}
 	if (drm.global) {
 		wl_global_destroy(drm.global);
 	}
@@ -425,18 +487,41 @@ drm_create_screens(struct wl_list *screens)
 			}
 
 			if (!(output = output_new(connector))) {
+				/* The cursor plane was taken out of the list for this
+				 * connector, so nothing else will free it. */
+				if (cursor_plane) {
+					plane_destroy(cursor_plane);
+				}
 				continue;
 			}
 
 			output->screen =
 			    screen_new(resources->crtcs[crtc_index], output, cursor_plane);
+			if (!output->screen) {
+				ERROR("Could not create screen for CRTC %d\n", crtc_index);
+				output_destroy(output);
+				if (cursor_plane) {
+					plane_destroy(cursor_plane);
+				}
+				continue;
+			}
 			output->screen->id = crtc_index;
-			taken_crtcs |= 1 << crtc_index;
+			taken_crtcs |= UINT32_C(1) << crtc_index;
 
 			wl_list_insert(screens, &output->screen->link);
 		}
 	}
 	drmModeFreeResources(resources);
+
+	/* Only the cursor planes taken above were handed to a screen. The rest of
+	 * the list is still ours, and each one holds a listener on
+	 * swc.event_signal that only plane_destroy unregisters. */
+	{
+		struct plane *p, *ptmp;
+
+		wl_list_for_each_safe(p, ptmp, &planes, link)
+			plane_destroy(p);
+	}
 
 	return true;
 }

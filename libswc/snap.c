@@ -16,8 +16,9 @@
 
 /* get cursor */
 void
-snap_overlay_cursor(uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
-                    uint32_t dst_pitch, struct screen *screen)
+snap_overlay_cursor_region(uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
+                           uint32_t dst_pitch, struct screen *screen,
+                           int32_t origin_x, int32_t origin_y)
 {
 	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
 	struct wld_buffer *cursor_buf;
@@ -35,12 +36,16 @@ snap_overlay_cursor(uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
 	}
 
 	cursor_buf = pointer->cursor.buffer;
-	if (!wld_map(cursor_buf) || !cursor_buf->map) {
+	if (!wld_map(cursor_buf)) {
+		return;
+	}
+	if (!cursor_buf->map) {
+		wld_unmap(cursor_buf);
 		return;
 	}
 
-	dst_x = pointer->cursor.view.geometry.x - screen->base.geometry.x;
-	dst_y = pointer->cursor.view.geometry.y - screen->base.geometry.y;
+	dst_x = pointer->cursor.view.geometry.x - screen->base.geometry.x - origin_x;
+	dst_y = pointer->cursor.view.geometry.y - screen->base.geometry.y - origin_y;
 
 	if (dst_x >= (int32_t)dst_width || dst_y >= (int32_t)dst_height ||
 	    dst_x + (int32_t)cursor_buf->width <= 0 ||
@@ -99,11 +104,41 @@ snap_overlay_cursor(uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
 			uint32_t b =
 			    (src_px & 0xFF) + (((dst_px & 0xFF) * inv + 127) / 255);
 
-			dst_row[x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+			/* A client cursor need not be correctly premultiplied, so a
+			 * channel can exceed 255 and spill into the next byte. */
+			dst_row[x] = 0xFF000000 | (MIN(r, 255u) << 16) |
+			             (MIN(g, 255u) << 8) | MIN(b, 255u);
 		}
 	}
 
 	wld_unmap(cursor_buf);
+}
+
+void
+snap_overlay_cursor(uint8_t *dst, uint32_t width, uint32_t height,
+                    uint32_t pitch, struct screen *screen)
+{
+	snap_overlay_cursor_region(dst, width, height, pitch, screen, 0, 0);
+}
+
+/* Composite directly into a GPU capture buffer; never touch the scanout. */
+bool
+snap_render_cursor(struct wld_renderer *renderer, struct screen *screen,
+                   const struct swc_rectangle *rect)
+{
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+	if (!pointer || !pointer->cursor.buffer || !pointer->cursor.view.buffer ||
+	    !(pointer->cursor.view.screens & screen_mask(screen))) return true;
+	struct wld_buffer *buffer = pointer->cursor.buffer;
+	if (!(wld_capabilities(renderer, buffer) & WLD_CAPABILITY_READ)) return false;
+	int32_t x = pointer->cursor.view.geometry.x - screen->base.geometry.x - rect->x;
+	int32_t y = pointer->cursor.view.geometry.y - screen->base.geometry.y - rect->y;
+	pixman_region32_t region;
+	pixman_region32_init_rect(&region, 0, 0, buffer->width, buffer->height);
+	pixman_region32_intersect_rect(&region, &region, -x, -y, rect->width, rect->height);
+	wld_blend_region(renderer, buffer, x, y, &region);
+	pixman_region32_fini(&region);
+	return true;
 }
 
 static void
@@ -187,7 +222,13 @@ capture(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	if (!wld_map(shm_buffer) || !shm_buffer->map) {
+	if (!wld_map(shm_buffer)) {
+		wld_buffer_unreference(shm_buffer);
+		swc_snap_send_failed(resource, SWC_SNAP_FAILURE_REASON_INTERNAL);
+		return;
+	}
+	if (!shm_buffer->map) {
+		wld_unmap(shm_buffer);
 		wld_buffer_unreference(shm_buffer);
 		swc_snap_send_failed(resource, SWC_SNAP_FAILURE_REASON_INTERNAL);
 		return;

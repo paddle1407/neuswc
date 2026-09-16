@@ -22,6 +22,7 @@
  */
 
 #include "screen.h"
+#include "wallpaper.h"
 #ifdef ENABLE_DRM
 #include "drm.h"
 #else
@@ -36,6 +37,7 @@
 #endif
 #include "pointer.h"
 #include "util.h"
+#include "workspace.h"
 
 #include "swc-server-protocol.h"
 #include <stdlib.h>
@@ -44,6 +46,31 @@
 
 static struct screen *active_screen;
 static const struct swc_screen_handler null_handler;
+
+EXPORT const char *
+swc_screen_get_name(const struct swc_screen *base)
+{
+	const struct screen *screen = (const struct screen *)base;
+	struct output *output;
+	if (!screen || wl_list_empty(&screen->outputs))
+		return NULL;
+	output = wl_container_of(screen->outputs.next, output, link);
+	return output->name;
+}
+
+EXPORT bool
+swc_screen_set_initial_position(struct swc_screen *base, int32_t x, int32_t y)
+{
+	struct screen *screen = INTERNAL(base);
+	if (!screen || !screen->configuring || x < -32768 || y < -32768 ||
+	    (int64_t)x + base->geometry.width > 32768 ||
+	    (int64_t)y + base->geometry.height > 32768)
+		return false;
+	view_move(&screen->planes.primary.view, x, y);
+	base->geometry = screen->planes.primary.view.geometry;
+	base->usable_geometry = base->geometry;
+	return true;
+}
 
 static bool
 handle_motion(struct pointer_handler *handler,
@@ -131,6 +158,7 @@ screen_new(struct output *output)
 	if (!(screen = malloc(sizeof(*screen)))) {
 		goto error0;
 	}
+	screen->wallpaper = NULL;
 
 	screen->global = wl_global_create(
 	    swc.display, &swc_screen_interface, 1, screen, &bind_screen);
@@ -151,7 +179,11 @@ screen_new(struct output *output)
 		goto error2;
 	}
 
-	cursor_plane->screen = screen;
+	/* drm_create_screens only warns when a CRTC has no cursor plane, and
+	 * screen_destroy already tolerates its absence. */
+	if (cursor_plane) {
+		cursor_plane->screen = screen;
+	}
 	screen->planes.cursor = cursor_plane;
 #else
 	if (!primary_plane_initialize(&screen->planes.primary,
@@ -163,6 +195,7 @@ screen_new(struct output *output)
 #endif
 
 	screen->handler = &null_handler;
+	screen->active_workspace = 1;
 	wl_signal_init(&screen->destroy_signal);
 	wl_list_init(&screen->resources);
 	wl_list_init(&screen->outputs);
@@ -173,7 +206,9 @@ screen_new(struct output *output)
 	screen->base.geometry = screen->planes.primary.view.geometry;
 	screen->base.usable_geometry = screen->base.geometry;
 
+	screen->configuring = true;
 	swc.manager->new_screen(&screen->base);
+	screen->configuring = false;
 
 	return screen;
 
@@ -189,6 +224,8 @@ void
 screen_destroy(struct screen *screen)
 {
 	struct output *output, *next;
+	wallpaper_screen_finish(screen);
+	workspace_screen_removed(screen);
 
 	if (active_screen == screen) {
 		active_screen = NULL;
@@ -230,6 +267,22 @@ screen_update_usable_geometry(struct screen *screen)
 
 	extents = pixman_region32_extents(&total_usable);
 
+	/*
+	 * A panel strut or a layer-shell exclusive zone as large as the screen
+	 * leaves nothing behind, and an empty region reports extents of all
+	 * zeroes. Handing charaWC a 0x0 workspace would make the whole screen
+	 * unusable for as long as that client stays mapped, so keep the full
+	 * geometry instead: a client cannot reserve the entire output.
+	 */
+	if (extents->x2 <= extents->x1 || extents->y2 <= extents->y1) {
+		WARNING("Screen reservations left no usable area; using full "
+		        "geometry\n");
+		pixman_region32_fini(&total_usable);
+		pixman_region32_init_rect(&total_usable, geom->x, geom->y, geom->width,
+		                          geom->height);
+		extents = pixman_region32_extents(&total_usable);
+	}
+
 	if (extents->x1 != screen->base.usable_geometry.x ||
 	    extents->y1 != screen->base.usable_geometry.y ||
 	    (extents->x2 - extents->x1) != screen->base.usable_geometry.width ||
@@ -243,6 +296,9 @@ screen_update_usable_geometry(struct screen *screen)
 			screen->handler->usable_geometry_changed(screen->handler_data);
 		}
 	}
+
+	pixman_region32_fini(&usable);
+	pixman_region32_fini(&total_usable);
 }
 
 bool

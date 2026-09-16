@@ -24,6 +24,7 @@
 #include "window.h"
 #include "compositor.h"
 #include "event.h"
+#include "foreign_toplevel.h"
 #include "internal.h"
 #include "keyboard.h"
 #include "seat.h"
@@ -189,6 +190,44 @@ swc_window_set_handler(struct swc_window *base,
 }
 
 EXPORT void
+swc_window_set_raise_on_click(struct swc_window *base, bool enabled)
+{
+	struct window *window = INTERNAL(base);
+	if (window)
+		window->raise_on_click = enabled;
+}
+
+EXPORT void
+swc_window_set_movable(struct swc_window *base, bool enabled)
+{
+	struct window *window = INTERNAL(base);
+	if (!window)
+		return;
+	if (!enabled)
+		end_interaction(&window->move.interaction, NULL);
+	window->movable = enabled;
+}
+
+EXPORT void
+swc_window_set_resizable(struct swc_window *base, bool enabled)
+{
+	struct window *window = INTERNAL(base);
+	if (!window)
+		return;
+	if (!enabled)
+		end_interaction(&window->resize.interaction, NULL);
+	window->resizable = enabled;
+}
+
+EXPORT void
+swc_window_raise(struct swc_window *base)
+{
+	struct window *window = INTERNAL(base);
+	if (window)
+		raise_window(window->view);
+}
+
+EXPORT void
 swc_window_close(struct swc_window *base)
 {
 	struct window *window = INTERNAL(base);
@@ -232,6 +271,28 @@ swc_window_focus(struct swc_window *base)
 	}
 
 	keyboard_set_focus(swc.seat->keyboard, new);
+	if (old && old->window)
+		foreign_toplevel_window_state(old->window);
+	if (window)
+		foreign_toplevel_window_state(window);
+}
+
+EXPORT void swc_window_set_minimized(struct swc_window *base, bool minimized)
+{
+	struct window *window = INTERNAL(base);
+	if (!window || window->minimized == minimized)
+		return;
+	window->minimized = minimized;
+	foreign_toplevel_window_state(window);
+}
+
+EXPORT void swc_window_set_workspace(struct swc_window *base, uint32_t workspace)
+{
+	struct window *window = INTERNAL(base);
+	if (!window || window->workspace == workspace)
+		return;
+	window->workspace = workspace;
+	foreign_toplevel_window_workspace(window);
 }
 
 EXPORT void
@@ -241,12 +302,16 @@ swc_window_set_stacked(struct swc_window *base)
 
 	flush(window);
 	window->configure.pending = false;
+	window->configure.acknowledged = false;
 	window->configure.width = 0;
 	window->configure.height = 0;
 	if (window->impl->set_mode) {
 		window->impl->set_mode(window, WINDOW_MODE_STACKED);
 	}
+	if (window->mode == WINDOW_MODE_FULLSCREEN)
+		compositor_view_set_stack_layer(window->view, STACK_LAYER_NORMAL, true);
 	window->mode = WINDOW_MODE_STACKED;
+	foreign_toplevel_window_state(window);
 }
 
 EXPORT void
@@ -259,7 +324,10 @@ swc_window_set_tiled(struct swc_window *base)
 	if (window->impl->set_mode) {
 		window->impl->set_mode(window, WINDOW_MODE_TILED);
 	}
+	if (window->mode == WINDOW_MODE_FULLSCREEN)
+		compositor_view_set_stack_layer(window->view, STACK_LAYER_NORMAL, true);
 	window->mode = WINDOW_MODE_TILED;
+	foreign_toplevel_window_state(window);
 }
 
 EXPORT void
@@ -267,24 +335,16 @@ swc_window_set_fullscreen(struct swc_window *base, struct swc_screen *screen)
 {
 	struct window *window = INTERNAL(base);
 
-	struct swc_rectangle geom;
-	swc_window_get_geometry(base, &geom);
-
-	if (window->mode != WINDOW_MODE_FULLSCREEN) {
-		window->prev.geom = geom;
-		window->prev.mode = window->mode;
-		swc_window_set_geometry(base, &screen->usable_geometry);
-
-		if (window->impl->set_mode) {
-			window->impl->set_mode(window, WINDOW_MODE_FULLSCREEN);
-		}
-		window->mode = WINDOW_MODE_FULLSCREEN;
-	}
-
-	else {
-		swc_window_set_geometry(base, &window->prev.geom);
-		window->mode = window->prev.mode;
-	}
+	if (!screen) return;
+	end_interaction(&window->move.interaction, NULL);
+	end_interaction(&window->resize.interaction, NULL);
+	if (window->mode != WINDOW_MODE_FULLSCREEN && window->impl->set_mode)
+		window->impl->set_mode(window, WINDOW_MODE_FULLSCREEN);
+	window->mode = WINDOW_MODE_FULLSCREEN;
+	/* Set the mode before sizing: fullscreen must ignore normal size hints. */
+	swc_window_set_geometry(base, &screen->geometry);
+	compositor_view_set_stack_layer(window->view, STACK_LAYER_FULLSCREEN, true);
+	foreign_toplevel_window_state(window);
 }
 
 EXPORT void
@@ -314,7 +374,8 @@ swc_window_set_size(struct swc_window *base, uint32_t width, uint32_t height)
 	struct window *window = INTERNAL(base);
 	struct swc_rectangle *geom = &window->view->base.geometry;
 
-	clamp_window_size(window, &width, &height);
+	if (window->mode == WINDOW_MODE_STACKED)
+		clamp_window_size(window, &width, &height);
 
 	if ((window->configure.pending && width == window->configure.width &&
 	     height == window->configure.height) ||
@@ -323,13 +384,10 @@ swc_window_set_size(struct swc_window *base, uint32_t width, uint32_t height)
 		return;
 	}
 
+	window->configure.width = width;
+	window->configure.height = height;
+	window->configure.pending = true;
 	window->impl->configure(window, width, height);
-
-	if (window->mode == WINDOW_MODE_TILED) {
-		window->configure.width = width;
-		window->configure.height = height;
-		window->configure.pending = true;
-	}
 }
 
 EXPORT void
@@ -382,6 +440,12 @@ swc_window_begin_move(struct swc_window *window)
 }
 
 EXPORT void
+swc_window_apply_decor(struct swc_window *window, struct swc_prepared_decor *prepared)
+{
+	compositor_view_apply_decor(INTERNAL(window)->view, prepared);
+}
+
+EXPORT void
 swc_window_end_move(struct swc_window *window)
 {
 	end_interaction(&INTERNAL(window)->move.interaction, NULL);
@@ -425,7 +489,7 @@ resize_motion(struct pointer_handler *handler, uint32_t time, wl_fixed_t fx,
 	struct window *window =
 	    wl_container_of(handler, window, resize.interaction.handler);
 	const struct swc_rectangle *geometry = &window->view->base.geometry;
-	uint32_t width = geometry->width, height = geometry->height;
+	int64_t width = geometry->width, height = geometry->height;
 
 	if (should_throttle_motion(window->base.motion_throttle_ms,
 	                           &window->resize.last_time, time)) {
@@ -444,8 +508,10 @@ resize_motion(struct pointer_handler *handler, uint32_t time, wl_fixed_t fx,
 		height = wl_fixed_to_int(fy) + window->resize.offset.y - geometry->y;
 	}
 
-	clamp_window_size(window, &width, &height);
-	window->impl->configure(window, width, height);
+	/* Crossing the opposite edge must not wrap into a multi-gigapixel size. */
+	width = width < 1 ? 1 : width > INT32_MAX ? INT32_MAX : width;
+	height = height < 1 ? 1 : height > INT32_MAX ? INT32_MAX : height;
+	swc_window_set_size(&window->base, width, height);
 
 	return true;
 }
@@ -466,15 +532,21 @@ handle_button(struct pointer_handler *handler, uint32_t time,
 	return true;
 }
 
+void
+window_commit(struct window *window)
+{
+	if (window->configure.acknowledged) {
+		flush(window);
+		window->configure.pending = false;
+		window->configure.acknowledged = false;
+	}
+}
+
 static void
 handle_attach(struct view_handler *handler)
 {
 	struct window *window = wl_container_of(handler, window, view_handler);
-
-	if (window->configure.acknowledged) {
-		flush(window);
-	}
-	window->configure.pending = false;
+	window_commit(window);
 }
 
 static void
@@ -499,9 +571,17 @@ handle_resize(struct view_handler *handler, uint32_t old_width,
 	}
 }
 
+static void handle_screens(struct view_handler *handler, uint32_t entered,
+		uint32_t left)
+{
+	struct window *window = wl_container_of(handler, window, view_handler);
+	foreign_toplevel_window_screens(window, entered, left);
+}
+
 static const struct view_handler_impl view_handler_impl = {
     .attach = handle_attach,
     .resize = handle_resize,
+    .screens = handle_screens,
 };
 
 bool
@@ -535,6 +615,11 @@ window_initialize(struct window *window, const struct window_impl *impl,
 	window->base.max_width = 0;
 	window->base.max_height = 0;
 	window->managed = false;
+	window->minimized = false;
+	window->raise_on_click = true;
+	window->movable = true;
+	window->resizable = true;
+	window->foreign_toplevel = NULL;
 	window->mode = WINDOW_MODE_STACKED;
 	window->move.pending = false;
 	window->move.last_time = 0;
@@ -544,6 +629,7 @@ window_initialize(struct window *window, const struct window_impl *impl,
 	    .button = handle_button,
 	};
 	window->configure.pending = false;
+	window->configure.acknowledged = false;
 	window->configure.width = 0;
 	window->configure.height = 0;
 	window->resize.interaction.active = false;
@@ -578,6 +664,7 @@ window_manage(struct window *window)
 
 	swc.manager->new_window(&window->base);
 	window->managed = true;
+	foreign_toplevel_window_manage(window);
 }
 
 void
@@ -587,6 +674,7 @@ window_unmanage(struct window *window)
 		return;
 	}
 
+	foreign_toplevel_window_unmanage(window);
 	if (window->handler->destroy) {
 		window->handler->destroy(window->handler_data);
 	}
@@ -598,11 +686,12 @@ void
 window_set_title(struct window *window, const char *title, size_t length)
 {
 	free(window->base.title);
-	window->base.title = strndup(title, length);
+	window->base.title = title ? strndup(title, length) : NULL;
 
 	if (window->handler->title_changed) {
 		window->handler->title_changed(window->handler_data);
 	}
+	foreign_toplevel_window_title(window);
 }
 
 void
@@ -614,26 +703,32 @@ window_set_app_id(struct window *window, const char *app_id)
 	if (window->handler->app_id_changed) {
 		window->handler->app_id_changed(window->handler_data);
 	}
+	foreign_toplevel_window_app_id(window);
 }
 
 void
 window_set_parent(struct window *window, struct window *parent)
 {
-	if (window->base.parent == &parent->base) {
+	struct swc_window *base_parent = parent ? &parent->base : NULL;
+	if (window->base.parent == base_parent) {
 		return;
 	}
 
-	compositor_view_set_parent(window->view, parent->view);
-	window->base.parent = &parent->base;
+	compositor_view_set_parent(window->view, parent ? parent->view : NULL);
+	window->base.parent = base_parent;
 
 	if (window->handler->parent_changed) {
 		window->handler->parent_changed(window->handler_data);
 	}
+	foreign_toplevel_window_parent(window);
 }
 
 void
 window_begin_move(struct window *window, struct button *button)
 {
+	if (!window->movable)
+		return;
+
 	if (window->mode != WINDOW_MODE_STACKED && window->handler->move) {
 		window->handler->move(window->handler_data);
 	}
@@ -657,6 +752,9 @@ void
 window_begin_resize(struct window *window, uint32_t edges,
                     struct button *button)
 {
+	if (!window->resizable)
+		return;
+
 	if (window->mode != WINDOW_MODE_STACKED && window->handler->resize) {
 		window->handler->resize(window->handler_data);
 	}

@@ -215,7 +215,9 @@ deactivate(void)
 static void
 handle_signal(int sig)
 {
+	int saved_errno = errno;
 	write(sigfd[1], (char[]){sig}, 1);
+	errno = saved_errno;
 }
 
 static void
@@ -516,7 +518,13 @@ setup_tty(int fd)
 			goto error2;
 		}
 
-		if (ioctl(fd, VT_WAITACTIVE, vt) == -1) {
+		/* VT acquisition can deliver SIGUSR2 while this ioctl sleeps. Linux
+		 * returns EINTR here even with SA_RESTART; the switch has not failed. */
+		int ret;
+		do {
+			ret = ioctl(fd, VT_WAITACTIVE, vt);
+		} while (ret == -1 && errno == EINTR);
+		if (ret == -1) {
 			perror("failed to wait for VT to become active");
 			goto error2;
 		}
@@ -546,6 +554,7 @@ run(int fd)
 	    {.fd = sigfd[0], .events = POLLIN},
 	};
 	int status;
+	pid_t child;
 	char sig;
 
 	for (;;) {
@@ -564,9 +573,15 @@ run(int fd)
 			}
 			switch (sig) {
 			case SIGCHLD:
-				wait(&status);
+				/* A stopped/continued child is not an exited compositor. */
+				do {
+					child = waitpid(-1, &status, WNOHANG);
+				} while (child < 0 && errno == EINTR);
+				if (child <= 0)
+					break;
 				cleanup();
-				exit(WEXITSTATUS(status));
+				exit(WIFEXITED(status) ? WEXITSTATUS(status)
+				                       : 128 + WTERMSIG(status));
 			case SIGUSR1:
 				deactivate();
 				ioctl(tty_fd, VT_RELDISP, 1);

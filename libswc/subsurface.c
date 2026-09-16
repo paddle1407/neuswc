@@ -95,7 +95,7 @@ subsurface_update_visibility(struct subsurface *subsurface)
 	}
 
 	if (subsurface->added && parent_view->visible &&
-	    subsurface->surface->state.buffer) {
+	    view->base.buffer) {
 		compositor_view_show(view);
 	} else {
 		compositor_view_hide(view);
@@ -124,6 +124,39 @@ static const struct view_handler_impl parent_view_handler_impl = {
     .move = handle_parent_view_change,
     .resize = handle_parent_view_resize,
 };
+
+/* The xdg role/view may disappear before its wl_surface. A resource-destroy
+ * listener alone leaves callbacks linked into the freed parent view. */
+void
+subsurface_set_parent_view(struct subsurface *subsurface, struct view *parent)
+{
+	struct compositor_view *parent_view = compositor_view(parent);
+	struct compositor_view *view = subsurface->surface ?
+	    compositor_view(subsurface->surface->view) : NULL;
+
+	list_remove_if_linked(&subsurface->parent_view_handler.link);
+	list_remove_if_linked(&subsurface->parent_view_destroy_listener.link);
+	if (parent_view) {
+		wl_list_insert(&parent_view->base.handlers,
+		               &subsurface->parent_view_handler.link);
+		wl_signal_add(&parent_view->destroy_signal,
+		              &subsurface->parent_view_destroy_listener);
+	}
+	if (view) {
+		compositor_view_set_parent(view, parent_view);
+		if (!parent_view) compositor_view_hide(view);
+	}
+	if (parent_view) subsurface_update_position(subsurface);
+}
+
+static void
+handle_parent_view_destroy(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct subsurface *subsurface =
+	    wl_container_of(listener, subsurface, parent_view_destroy_listener);
+	subsurface_set_parent_view(subsurface, NULL);
+}
 
 static struct subsurface *
 subsurface_find_sibling(struct subsurface *subsurface, struct surface *surface)
@@ -196,21 +229,8 @@ handle_parent_destroy(struct wl_listener *listener, void *data)
 	(void)data;
 	struct subsurface *subsurface =
 	    wl_container_of(listener, subsurface, parent_destroy_listener);
-	struct compositor_view *view = NULL;
-
-	if (subsurface->surface && subsurface->surface->view) {
-		view = compositor_view(subsurface->surface->view);
-	}
-
-	if (view) {
-		view->parent = NULL;
-		compositor_view_hide(view);
-	}
-
-	if (!wl_list_empty(&subsurface->parent_view_handler.link)) {
-		wl_list_remove(&subsurface->parent_view_handler.link);
-		wl_list_init(&subsurface->parent_view_handler.link);
-	}
+	subsurface_set_parent_view(subsurface, NULL);
+	list_remove_if_linked(&subsurface->parent_destroy_listener.link);
 
 	if (!wl_list_empty(&subsurface->link)) {
 		wl_list_remove(&subsurface->link);
@@ -417,6 +437,7 @@ static void
 subsurface_destroy(struct wl_resource *resource)
 {
 	struct subsurface *subsurface = wl_resource_get_user_data(resource);
+	subsurface_set_parent_view(subsurface, NULL);
 
 	if (subsurface->surface) {
 		if (subsurface->surface->subsurface == subsurface) {
@@ -494,6 +515,8 @@ subsurface_new(struct wl_client *client, uint32_t version, uint32_t id,
 	wl_list_init(&subsurface->parent_view_handler.link);
 	wl_list_init(&subsurface->surface_destroy_listener.link);
 	wl_list_init(&subsurface->parent_destroy_listener.link);
+	wl_list_init(&subsurface->parent_view_destroy_listener.link);
+	subsurface->parent_view_destroy_listener.notify = handle_parent_view_destroy;
 	wl_list_init(&subsurface->link);
 	wl_list_init(&subsurface->pending_link);
 	wl_list_init(&subsurface->current_link);
@@ -511,13 +534,10 @@ subsurface_new(struct wl_client *client, uint32_t version, uint32_t id,
 		goto error2;
 	}
 
-	compositor_view_set_parent(view, parent_view);
+	subsurface_set_parent_view(subsurface, &parent_view->base);
 	wl_list_remove(&view->link);
 	wl_list_insert(parent_view->link.prev, &view->link);
 
-	wl_list_insert(&parent_view->base.handlers,
-	               &subsurface->parent_view_handler.link);
-	subsurface_update_position(subsurface);
 	wl_list_insert(&parent->subsurfaces, &subsurface->link);
 	wl_list_insert(parent->pending.state.subsurfaces_above.prev,
 	               &subsurface->pending_link);

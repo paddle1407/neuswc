@@ -62,13 +62,15 @@ void
 compositor_finalize(void);
 void
 compositor_damage_all(void);
+void
+compositor_release_capture_cache(void);
 
 struct compositor_view {
 	struct view base;
 	struct surface *surface;
 	struct wld_buffer *buffer;
-	bool buffer_opaque_valid;
-	bool buffer_opaque;
+	/* A freshly allocated proxy holds no content yet. */
+	bool proxy_dirty;
 	struct window *window;
 	struct compositor_view *parent;
 	int32_t buffer_offset_x;
@@ -107,6 +109,10 @@ struct compositor_view {
 		uint32_t color;
 		uint32_t top, right, bottom, left;
 		struct swc_decor_text text;
+		struct swc_titlebar titlebar;
+		int hover_button, pressed_button;
+		struct wld_buffer *bar_buffer;
+		bool bar_dirty;
 		const struct swc_decor_parts *parts_key;
 		struct decor_part_buffer parts[8];
 		char *string;
@@ -152,6 +158,7 @@ compositor_view_set_border_width(struct compositor_view *view,
 void
 compositor_view_set_decor(struct compositor_view *view,
                            const struct swc_decor *decor);
+void compositor_view_apply_decor(struct compositor_view *, struct swc_prepared_decor *);
 void
 compositor_view_damage_decor(struct compositor_view *view);
 
@@ -161,6 +168,10 @@ compositor_view_damage_decor(struct compositor_view *view);
  */
 struct wld_buffer *
 compositor_get_buffer(struct screen *screen);
+
+/* Newest completed composition; borrowed, read-only, synchronous use only. */
+struct wld_buffer *
+compositor_capture_buffer(struct screen *screen);
 
 /**
  * render the compositor scene into a shm buffer
@@ -179,7 +190,8 @@ enum compositor_stack_layer {
 	STACK_LAYER_BOTTOM = 1,
 	STACK_LAYER_NORMAL = 2,
 	STACK_LAYER_TOP = 3,
-	STACK_LAYER_OVERLAY = 4,
+	STACK_LAYER_FULLSCREEN = 4,
+	STACK_LAYER_OVERLAY = 5,
 };
 
 void

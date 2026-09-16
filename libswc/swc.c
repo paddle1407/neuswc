@@ -31,6 +31,8 @@
 #include "fb.h"
 #endif
 #include "event.h"
+#include "foreign_toplevel.h"
+#include "idle_inhibit.h"
 #include "internal.h"
 #include "kde_decoration.h"
 #include "keyboard.h"
@@ -43,11 +45,14 @@
 #include "select.h"
 #include "shell.h"
 #include "shm.h"
+#include "pointer_constraints.h"
+#include "relative_pointer.h"
 #include "screencopy.h"
 #include "snap.h"
 #include "subcompositor.h"
 #include "util.h"
 #include "window.h"
+#include "workspace.h"
 #include "xdg_decoration.h"
 #include "xdg_output.h"
 #include "xdg_shell.h"
@@ -300,14 +305,59 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
 		goto error18;
 	}
 
+	swc.relative_pointer_manager = relative_pointer_manager_create(display);
+	if (!swc.relative_pointer_manager) {
+		ERROR("Could not initialize relative pointer manager\n");
+		goto error19;
+	}
+
+	swc.pointer_constraints = pointer_constraints_create(display);
+	if (!swc.pointer_constraints) {
+		ERROR("Could not initialize pointer constraints\n");
+		goto error20;
+	}
+
+	swc.idle_inhibit_manager = idle_inhibit_manager_create(display);
+	if (!swc.idle_inhibit_manager) {
+		ERROR("Could not initialize idle inhibit manager\n");
+		goto error21;
+	}
+
+	swc.workspace_manager = workspace_manager_create(display);
+	if (!swc.workspace_manager) {
+		ERROR("Could not initialize workspace manager\n");
+		goto error22;
+	}
+
+	swc.foreign_toplevel_manager = foreign_toplevel_manager_create(display);
+	if (!swc.foreign_toplevel_manager) {
+		ERROR("Could not initialize foreign toplevel manager\n");
+		goto error23;
+	}
+
 	setup_compositor();
 
 	return true;
 
+error23:
+	workspace_manager_finish();
+	wl_global_destroy(swc.workspace_manager);
+error22:
+	idle_inhibit_manager_finish();
+	wl_global_destroy(swc.idle_inhibit_manager);
+error21:
+	wl_global_destroy(swc.pointer_constraints);
+error20:
+	wl_global_destroy(swc.relative_pointer_manager);
+error19:
+	wl_global_destroy(swc.screencopy_manager);
 error18:
 	wl_global_destroy(swc.xdg_output_manager);
 error17:
-	wl_global_destroy(swc.select_manager);
+	/* Reached by select_manager_create failing, where this is still NULL. */
+	if (swc.select_manager) {
+		wl_global_destroy(swc.select_manager);
+	}
 #ifdef ENABLE_XWAYLAND
 error16:
 #endif
@@ -326,6 +376,7 @@ error10:
 	wl_global_destroy(swc.shell);
 error9:
 	seat_destroy(swc.seat);
+	swc.seat = NULL;
 error8:
 	wl_global_destroy(swc.data_device_manager);
 error7:
@@ -356,6 +407,14 @@ swc_finalize(void)
 #ifdef ENABLE_XWAYLAND
 	xserver_finalize();
 #endif
+	foreign_toplevel_manager_finish();
+	workspace_manager_finish();
+	idle_inhibit_manager_finish();
+	wl_global_destroy(swc.foreign_toplevel_manager);
+	wl_global_destroy(swc.workspace_manager);
+	wl_global_destroy(swc.idle_inhibit_manager);
+	wl_global_destroy(swc.pointer_constraints);
+	wl_global_destroy(swc.relative_pointer_manager);
 	wl_global_destroy(swc.screencopy_manager);
 	wl_global_destroy(swc.xdg_output_manager);
 	wl_global_destroy(swc.snap_manager);
@@ -366,6 +425,7 @@ swc_finalize(void)
 	wl_global_destroy(swc.xdg_shell);
 	wl_global_destroy(swc.shell);
 	seat_destroy(swc.seat);
+	swc.seat = NULL;
 	wl_global_destroy(swc.data_device_manager);
 	compositor_finalize();
 	screens_finalize();

@@ -7,6 +7,9 @@ libswc_src = files(
   'data_device.c',
   'data_device_manager.c',
   'decor.c',
+  'foreign_toplevel.c',
+  'idle_inhibit.c',
+  'titlebar.c',
   'input.c',
   'kde_decoration.c',
   'keyboard.c',
@@ -17,6 +20,8 @@ libswc_src = files(
   'panel.c',
   'panel_manager.c',
   'pointer.c',
+  'pointer_constraints.c',
+  'relative_pointer.c',
   'primary_plane.c',
   'region.c',
   'screen.c',
@@ -32,8 +37,10 @@ libswc_src = files(
   'swc.c',
   'util.c',
   'view.c',
+  'wallpaper.c',
   'wayland_buffer.c',
   'window.c',
+  'workspace.c',
   'xdg_decoration.c',
   'xdg_output.c',
   'xdg_shell.c',
@@ -43,7 +50,7 @@ libswc_src = files(
 
   xwayland.found() ? ['xserver.c', 'xwm.c'] : [],  
 
-  video_backend == 'drm' ? ['dmabuf.c', 'drm.c', 'plane.c'] : [],
+  video_backend == 'drm' ? ['dmabuf.c', 'drm.c', 'drm_syncobj.c', 'plane.c'] : [],
   framebuffer_backend == 'fbdev' ? ['fb.c', 'fb_fbdev.c'] : [],
   framebuffer_backend == 'wsdisplay' ? ['fb.c', 'fb_wsdisplay.c'] : [],
 )

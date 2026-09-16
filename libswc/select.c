@@ -13,7 +13,8 @@ static struct wl_list select_resources;
 static int32_t start_x, start_y;
 static struct pointer_handler select_pointer_handler;
 
-enum select_state { STATE_WAIT, STATE_DRAG };
+/* STATE_NONE means the handler is not in the pointer's handler list. */
+enum select_state { STATE_NONE, STATE_WAIT, STATE_DRAG };
 static enum select_state select_state;
 
 static bool
@@ -57,7 +58,7 @@ handle_button(struct pointer_handler *h, uint32_t time, struct button *button,
 	    select_state == STATE_DRAG) {
 		swc_overlay_clear();
 		wl_list_remove(&select_pointer_handler.link);
-		select_state = STATE_WAIT;
+		select_state = STATE_NONE;
 		swc_set_cursor(SWC_CURSOR_DEFAULT);
 
 		wl_resource_for_each(resource, &select_resources)
@@ -72,11 +73,31 @@ handle_button(struct pointer_handler *h, uint32_t time, struct button *button,
 static void
 handle_grab(struct wl_client *client, struct wl_resource *resource)
 {
+	if (select_state != STATE_NONE) {
+		/* Already grabbed: the handler node is in the list once and must
+		 * not be inserted again. */
+		return;
+	}
 	select_state = STATE_WAIT;
 	select_pointer_handler.motion = handle_motion;
 	select_pointer_handler.button = handle_button;
 	wl_list_insert(&swc.seat->pointer->handlers, &select_pointer_handler.link);
 	swc_set_cursor(SWC_CURSOR_CROSS);
+}
+
+/* A client that goes away mid-grab would otherwise leave the handler in the
+ * pointer's list for good, and the grab state with it. */
+static void
+select_resource_destroy(struct wl_resource *resource)
+{
+	remove_resource(resource);
+	if (!wl_list_empty(&select_resources) || select_state == STATE_NONE) {
+		return;
+	}
+	swc_overlay_clear();
+	wl_list_remove(&select_pointer_handler.link);
+	select_state = STATE_NONE;
+	swc_set_cursor(SWC_CURSOR_DEFAULT);
 }
 
 static const struct swc_select_interface select_impl = {
@@ -95,7 +116,7 @@ bind_select(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	}
 
 	wl_resource_set_implementation(resource, &select_impl, NULL,
-	                               remove_resource);
+	                               select_resource_destroy);
 	wl_list_insert(&select_resources, wl_resource_get_link(resource));
 }
 

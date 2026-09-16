@@ -1,4 +1,5 @@
 #include "decor.h"
+#include "titlebar.h"
 #include "backend.h"
 
 #include "compositor.h"
@@ -420,6 +421,7 @@ decor_initialize(void)
 void
 decor_finalize(void)
 {
+	titlebar_finalize();
 	if (font_context) {
 		wld_font_destroy_context(font_context);
 		font_context = NULL;
@@ -430,6 +432,10 @@ void
 decor_view_initialize(struct compositor_view *view)
 {
 	memset(&view->decor.text, 0, sizeof(view->decor.text));
+	memset(&view->decor.titlebar, 0, sizeof(view->decor.titlebar));
+	view->decor.hover_button = view->decor.pressed_button = -1;
+	view->decor.bar_buffer = NULL;
+	view->decor.bar_dirty = true;
 	view->decor.parts_key = NULL;
 	memset(view->decor.parts, 0, sizeof(view->decor.parts));
 	view->decor.string = NULL;
@@ -440,6 +446,7 @@ decor_view_initialize(struct compositor_view *view)
 void
 decor_view_finalize(struct compositor_view *view)
 {
+	titlebar_finish(view);
 	close_decor_parts(view);
 	close_decor_string(view);
 	close_decor_font(view);
@@ -472,6 +479,10 @@ decor_repaint(struct wld_renderer *renderer,
 	uint32_t br_width = view->decor.parts[DECOR_PART_BOTTOM_RIGHT].width;
 	uint32_t br_height = view->decor.parts[DECOR_PART_BOTTOM_RIGHT].height;
 
+	if (view->decor.titlebar.enabled) {
+		titlebar_repaint(renderer, target_geom, view, damage);
+		return;
+	}
 	if (!view->decor.top && !view->decor.right && !view->decor.bottom &&
 	    !view->decor.left) {
 		return;
@@ -685,12 +696,14 @@ decor_repaint(struct wld_renderer *renderer,
 	              y - target_geom->y, title, title_len, NULL);
 }
 
-void
+bool
 decor_view_set(struct compositor_view *view, const struct swc_decor *decor)
 {
 	const char *font_name = NULL;
 	struct wld_font *font = NULL;
 	struct swc_decor_text text = { 0 };
+	struct swc_titlebar bar = { 0 };
+	bool keep_font = false;
 	char *owned_string = NULL;
 	char *owned_font_name = NULL;
 	const struct swc_decor_parts *parts = NULL;
@@ -707,6 +720,8 @@ decor_view_set(struct compositor_view *view, const struct swc_decor *decor)
 	left = decor->left;
 	parts = decor->parts;
 	text = decor->title;
+	bar = decor->titlebar;
+	if (bar.count > 3) bar.count = 3;
 	if (text.enabled) {
 		font_name = text.font ? text.font : DEFAULT_DECOR_FONT;
 	}
@@ -714,6 +729,16 @@ decor_view_set(struct compositor_view *view, const struct swc_decor *decor)
 	if (view->decor.color == color && view->decor.top == top &&
 	    view->decor.right == right && view->decor.bottom == bottom &&
 	    view->decor.left == left &&
+	    view->decor.titlebar.enabled == bar.enabled &&
+	    view->decor.titlebar.count == bar.count &&
+	    view->decor.titlebar.hover_color == bar.hover_color &&
+	    view->decor.titlebar.pressed_color == bar.pressed_color &&
+	    view->decor.titlebar.buttons_style == bar.buttons_style &&
+	    view->decor.titlebar.buttons_left == bar.buttons_left &&
+	    view->decor.titlebar.close_color == bar.close_color &&
+	    view->decor.titlebar.minimize_color == bar.minimize_color &&
+	    view->decor.titlebar.fullscreen_color == bar.fullscreen_color &&
+	    !memcmp(view->decor.titlebar.buttons, bar.buttons, sizeof(bar.buttons)) &&
 	    view->decor.text.enabled == text.enabled &&
 	    view->decor.text.edge == text.edge &&
 	    view->decor.text.align == text.align &&
@@ -724,21 +749,28 @@ decor_view_set(struct compositor_view *view, const struct swc_decor *decor)
 	    view->decor.text.offset_y == text.offset_y &&
 	    streq(view->decor.font_name, font_name) &&
 	    decor_parts_equal(view, parts)) {
-		return;
+		return true;
 	}
 
 	if (text.string) {
 		owned_string = strdup(text.string);
+		if (!owned_string) return false;
 	}
 
-	if (font_name) {
+	keep_font = streq(view->decor.font_name, font_name);
+	if (font_name && !keep_font) {
 		owned_font_name = strdup(font_name);
 		if (owned_font_name && font_context) {
 			font = wld_font_open_name(font_context, font_name);
 		}
+		if (!owned_font_name || !font) goto error;
 	}
 
 apply:
+	if (!copy_decor_parts(view, parts)) goto error;
+	view->decor.titlebar = bar;
+	view->decor.bar_dirty = true;
+	if (!bar.enabled) titlebar_finish(view);
 	view->decor.color = color;
 	view->decor.top = top;
 	view->decor.right = right;
@@ -747,19 +779,49 @@ apply:
 	view->decor.text = text;
 	view->decor.text.string = NULL;
 	view->decor.text.font = NULL;
-	if (!copy_decor_parts(view, parts)) {
-		close_decor_parts(view);
-	}
 	close_decor_string(view);
 	view->decor.string = owned_string;
-	close_decor_font(view);
-	view->decor.font_name = owned_font_name;
-	view->decor.font = font;
+	if (!keep_font) {
+		close_decor_font(view);
+		view->decor.font_name = owned_font_name;
+		view->decor.font = font;
+	}
 	view->decor.damaged = true;
+	return true;
+error:
+	free(owned_string);
+	free(owned_font_name);
+	if (font) wld_font_close(font);
+	return false;
 }
 
 void
 decor_view_damage(struct compositor_view *view)
 {
 	view->decor.damaged = true;
+}
+
+EXPORT struct swc_prepared_decor *
+swc_decor_prepare(const struct swc_decor *decor, uint32_t width)
+{
+	struct swc_prepared_decor *prepared = calloc(1, sizeof(*prepared));
+	if (!prepared) return NULL;
+	prepared->view = calloc(1, sizeof(*prepared->view));
+	if (!prepared->view) { free(prepared); return NULL; }
+	decor_view_initialize(prepared->view);
+	prepared->view->base.geometry.width = width;
+	if (!decor_view_set(prepared->view, decor) || !titlebar_prepare(prepared->view)) {
+		swc_decor_discard(prepared);
+		return NULL;
+	}
+	return prepared;
+}
+
+EXPORT void
+swc_decor_discard(struct swc_prepared_decor *prepared)
+{
+	if (!prepared) return;
+	decor_view_finalize(prepared->view);
+	free(prepared->view);
+	free(prepared);
 }

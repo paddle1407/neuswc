@@ -54,9 +54,15 @@ view_initialize(struct view *view, const struct view_impl *impl)
 void
 view_finalize(struct view *view)
 {
+	struct view_handler *handler, *next;
+	wl_list_for_each_safe(handler, next, &view->handlers, link) {
+		wl_list_remove(&handler->link);
+		wl_list_init(&handler->link);
+	}
 	if (view->buffer) {
 		wld_buffer_unreference(view->buffer);
 	}
+	view->buffer = NULL;
 }
 
 int
@@ -69,12 +75,12 @@ view_attach(struct view *view, struct wld_buffer *buffer)
 		return ret;
 	}
 
-	if (view->buffer) {
-		wld_buffer_unreference(view->buffer);
-	}
-
+	/* Reattaching the same buffer must retain it before dropping the old ref. */
 	if (buffer) {
 		wld_buffer_reference(buffer);
+	}
+	if (view->buffer) {
+		wld_buffer_unreference(view->buffer);
 	}
 
 	view->buffer = buffer;

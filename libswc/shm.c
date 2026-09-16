@@ -31,6 +31,7 @@
 #include "wayland_buffer.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -40,11 +41,16 @@
 #include <wld/pixman.h>
 #include <wld/wld.h>
 
+struct pool_mapping {
+	void *data;
+	uint32_t size;
+	unsigned references;
+};
+
 struct pool {
 	struct wl_resource *resource;
 	struct swc_shm *shm;
-	void *data;
-	uint32_t size;
+	struct pool_mapping *mapping;
 	int fd;
 	bool writable;
 	unsigned references;
@@ -53,6 +59,7 @@ struct pool {
 struct pool_reference {
 	struct wld_destructor destructor;
 	struct pool *pool;
+	struct pool_mapping *mapping;
 };
 
 struct shm_buffer_record {
@@ -69,6 +76,17 @@ struct shm_buffer_record {
 
 static struct wl_list shm_buffer_records;
 static bool shm_buffer_records_initialized;
+static uint64_t live_mapping_bytes;
+static unsigned live_mappings;
+
+static void
+log_mapping_memory(void)
+{
+	const char *enabled = getenv("CHARAWC_DEBUG_MEMORY");
+	if (enabled && strcmp(enabled, "1") == 0)
+		fprintf(stderr, "memory-profile: pid=%ld shm_mappings=%u shm_bytes=%" PRIu64 "\n",
+		        (long)getpid(), live_mappings, live_mapping_bytes);
+}
 
 static void
 ensure_shm_buffer_records(void)
@@ -86,28 +104,44 @@ handle_shm_buffer_resource_destroy(struct wl_listener *listener, void *data)
 	    wl_container_of(listener, record, destroy_listener);
 	(void)data;
 
+	wl_list_remove(&record->destroy_listener.link);
 	wl_list_remove(&record->link);
 	free(record);
 }
 
-static void *
-swc_mremap(struct pool *pool, void *oldp, size_t oldsize, size_t newsize)
+/* Existing pixman images retain their original data pointer. Keep each
+ * mapping alive until the buffers imported from it have been released. */
+static struct pool_mapping *
+map_pool(int fd, uint32_t size, bool writable)
 {
-#ifdef __NetBSD__
-	return mremap(oldp, oldsize, NULL, newsize, 0);
-#elif defined(__linux__)
-	return mremap(oldp, oldsize, newsize, MREMAP_MAYMOVE);
-#else
-	void *newp;
+	struct pool_mapping *mapping = malloc(sizeof(*mapping));
 
-	newp = mmap(NULL, newsize, PROT_READ, MAP_SHARED, pool->fd, 0);
-	if (newp == MAP_FAILED) {
-		return MAP_FAILED;
+	if (!mapping)
+		return NULL;
+	mapping->data = mmap(NULL, size, PROT_READ | (writable ? PROT_WRITE : 0),
+	                     MAP_SHARED, fd, 0);
+	if (mapping->data == MAP_FAILED) {
+		free(mapping);
+		return NULL;
 	}
+	mapping->size = size;
+	mapping->references = 1;
+	++live_mappings;
+	live_mapping_bytes += size;
+	log_mapping_memory();
+	return mapping;
+}
 
-	(void)munmap(oldp, oldsize);
-	return newp;
-#endif
+static void
+unref_mapping(struct pool_mapping *mapping)
+{
+	if (--mapping->references)
+		return;
+	munmap(mapping->data, mapping->size);
+	--live_mappings;
+	live_mapping_bytes -= mapping->size;
+	free(mapping);
+	log_mapping_memory();
 }
 
 static void
@@ -117,7 +151,7 @@ unref_pool(struct pool *pool)
 		return;
 	}
 
-	munmap(pool->data, pool->size);
+	unref_mapping(pool->mapping);
 	close(pool->fd);
 	free(pool);
 }
@@ -134,7 +168,9 @@ handle_buffer_destroy(struct wld_destructor *destructor)
 {
 	struct pool_reference *reference =
 	    wl_container_of(destructor, reference, destructor);
+	unref_mapping(reference->mapping);
 	unref_pool(reference->pool);
+	free(reference);
 }
 
 static inline uint32_t
@@ -162,13 +198,20 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 	struct wl_resource *buffer_resource;
 	union wld_object object;
 
-	if (offset > pool->size || offset < 0) {
+	if (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888) {
+		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FORMAT,
+		                       "unsupported shm format");
+		return;
+	}
+	if (offset < 0 || width <= 0 || height <= 0 || stride <= 0 ||
+	    stride % 4 || (uint64_t)width * 4 > (uint32_t)stride ||
+	    (uint64_t)offset + (uint64_t)stride * height > pool->mapping->size) {
 		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_STRIDE,
-		                       "offset is too big or negative");
+		                       "buffer dimensions exceed the pool or stride");
 		return;
 	}
 
-	object.ptr = (void *)((uintptr_t)pool->data + offset);
+	object.ptr = (void *)((uintptr_t)pool->mapping->data + offset);
 	buffer =
 	    wld_import_buffer(pool->shm->context, WLD_OBJECT_DATA, object, width,
 	                      height, format_shm_to_wld(format), stride);
@@ -205,6 +248,8 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 	}
 
 	reference->pool = pool;
+	reference->mapping = pool->mapping;
+	++reference->mapping->references;
 	reference->destructor.destroy = &handle_buffer_destroy;
 	wld_buffer_add_destructor(buffer, &reference->destructor);
 	++pool->references;
@@ -219,6 +264,8 @@ error3:
 	}
 error2:
 	wl_resource_destroy(buffer_resource);
+	wl_resource_post_no_memory(resource);
+	return;
 error1:
 	wld_buffer_unreference(buffer);
 error0:
@@ -229,38 +276,30 @@ static void
 resize(struct wl_client *client, struct wl_resource *resource, int32_t size)
 {
 	struct pool *pool = wl_resource_get_user_data(resource);
-	void *data;
+	struct pool_mapping *mapping;
 	struct stat st;
 
-	if (fstat(pool->fd, &st) != 0) {
+	if (size <= 0 || (uint32_t)size < pool->mapping->size) {
 		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
-		                       "fstat failed: %s", strerror(errno));
+		                       "shm pools cannot shrink");
 		return;
 	}
-	if (st.st_size < size) {
-		if (ftruncate(pool->fd, size) != 0) {
-			int saved = errno;
-			/* some clients seal memfd if size is already fine,
-		 * alloc will fail */
-			if ((saved == EPERM || saved == EACCES) &&
-			    fstat(pool->fd, &st) == 0 && st.st_size >= size) {
-				goto remap;
-			}
-			wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
-			                       "ftruncate failed: %s", strerror(saved));
-			return;
-		}
+	if ((uint32_t)size == pool->mapping->size)
+		return;
+	if (fstat(pool->fd, &st) != 0 || st.st_size < size) {
+		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
+		                       "backing file is smaller than the requested pool");
+		return;
 	}
 
-remap:
-	data = swc_mremap(pool, pool->data, pool->size, size);
-	if (data == MAP_FAILED) {
+	mapping = map_pool(pool->fd, size, pool->writable);
+	if (!mapping) {
 		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
-		                       "mremap failed: %s", strerror(errno));
+		                       "mmap failed: %s", strerror(errno));
 		return;
 	}
-	pool->data = data;
-	pool->size = size;
+	unref_mapping(pool->mapping);
+	pool->mapping = mapping;
 }
 
 static const struct wl_shm_pool_interface shm_pool_impl = {
@@ -275,40 +314,44 @@ create_pool(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 {
 	struct swc_shm *shm = wl_resource_get_user_data(resource);
 	struct pool *pool;
+	struct stat st;
 
+	if (size <= 0 || fstat(fd, &st) != 0 || st.st_size < size) {
+		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
+		                       "invalid shm pool size or backing file");
+		goto error0;
+	}
 	pool = malloc(sizeof(*pool));
 	if (!pool) {
 		wl_resource_post_no_memory(resource);
 		goto error0;
 	}
 	pool->shm = shm;
+	pool->writable = true;
+	pool->mapping = map_pool(fd, size, true);
+	if (!pool->mapping) {
+		pool->writable = false;
+		pool->mapping = map_pool(fd, size, false);
+		if (!pool->mapping) {
+			wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
+			                       "mmap failed: %s", strerror(errno));
+			goto error1;
+		}
+	}
+	pool->references = 1;
+	pool->fd = fd;
 	pool->resource = wl_resource_create(client, &wl_shm_pool_interface,
 	                                    wl_resource_get_version(resource), id);
 	if (!pool->resource) {
+		unref_mapping(pool->mapping);
 		wl_resource_post_no_memory(resource);
 		goto error1;
 	}
+	/* Install the destructor only after all the pool's fields are valid. */
 	wl_resource_set_implementation(pool->resource, &shm_pool_impl, pool,
 	                               &destroy_pool_resource);
-	pool->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	pool->writable = true;
-	if (pool->data == MAP_FAILED) {
-		pool->data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-		pool->writable = false;
-		if (pool->data == MAP_FAILED) {
-			wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
-			                       "mmap failed: %s", strerror(errno));
-			goto error2;
-		}
-	}
-	/* close(fd); */
-	pool->size = size;
-	pool->references = 1;
-	pool->fd = fd;
 	return;
 
-error2:
-	wl_resource_destroy(pool->resource);
 error1:
 	free(pool);
 error0:
@@ -399,11 +442,11 @@ shm_buffer_get_info(struct wl_resource *resource, struct swc_shm_buffer_info *in
 		}
 
 		size = (uint64_t)record->stride * (uint64_t)record->height;
-		if ((uint64_t)record->offset + size > record->pool->size) {
+		if ((uint64_t)record->offset + size > record->pool->mapping->size) {
 			return false;
 		}
 
-		info->data = (uint8_t *)record->pool->data + record->offset;
+		info->data = (uint8_t *)record->pool->mapping->data + record->offset;
 		info->width = record->width;
 		info->height = record->height;
 		info->stride = record->stride;

@@ -37,6 +37,24 @@ struct wl_display;
 struct wl_event_loop;
 struct wld_buffer;
 
+enum swc_wallpaper_mode {
+	SWC_WALLPAPER_FILL,
+	SWC_WALLPAPER_FIT,
+	SWC_WALLPAPER_CENTER,
+};
+
+struct swc_prepared_wallpaper;
+/* Prepare output-sized caches after swc_initialize, on the compositor thread.
+ * Pixels are tightly packed premultiplied ARGB8888, borrowed only for this call.
+ * NULL pixels selects a solid background. A NULL result indicates failure.
+ * Commit consumes the candidate; discard accepts NULL. No event dispatch may
+ * occur between prepare and commit (the connected outputs must stay the same). */
+struct swc_prepared_wallpaper *
+swc_wallpaper_prepare(const uint32_t *pixels, uint32_t width, uint32_t height,
+                      enum swc_wallpaper_mode mode, uint32_t background);
+void swc_wallpaper_commit(struct swc_prepared_wallpaper *);
+void swc_wallpaper_discard(struct swc_prepared_wallpaper *);
+
 /**
  * Get the current cursor position.
  *
@@ -115,15 +133,17 @@ swc_set_cursor_mode(enum swc_cursor_mode mode);
  * set a custom argb8888 cursor image for a given kind
  *
  * `argb8888` is a pointer to `width*height` pixels in ARGB8888 order.
- * the caller has to keep the pixel memory alive for as long as it may be used
+ * swc copies the pixels; failure leaves the previous image intact
  */
-void
+bool
 swc_set_cursor_image(enum swc_cursor_kind kind, const uint32_t *argb8888,
                      uint32_t width, uint32_t height, int32_t hotspot_x,
                      int32_t hotspot_y);
 
 void
 swc_clear_cursor_image(enum swc_cursor_kind kind);
+
+bool swc_pointer_has_buttons(void);
 
 /**
  * draw [or update] a simple box overlay
@@ -215,9 +235,28 @@ void
 swc_screen_set_handler(struct swc_screen *screen,
                        const struct swc_screen_handler *handler, void *data);
 
+/** Connector name, such as DVI-D-1 or HDMI-A-1; owned by the screen. */
+const char *
+swc_screen_get_name(const struct swc_screen *screen);
+
+/**
+ * Set desktop coordinates during the manager's new_screen callback only.
+ * Must precede input/render initialization; no runtime output rearrangement.
+ * Returns false outside that callback or for out-of-range coordinates.
+ */
+bool
+swc_screen_set_initial_position(struct swc_screen *screen, int32_t x, int32_t y);
+
 /* }}} */
 
 /* Windows {{{ */
+
+enum swc_titlebar_action {
+	SWC_TITLEBAR_FOCUS,
+	SWC_TITLEBAR_MINIMIZE,
+	SWC_TITLEBAR_FULLSCREEN,
+	SWC_TITLEBAR_CLOSE,
+};
 
 struct swc_window_handler {
 	/**
@@ -267,6 +306,16 @@ struct swc_window_handler {
 	 * the interactive resize will be honored.
 	 */
 	void (*resize)(void *data);
+
+	/* A compositor-owned titlebar was clicked. */
+	void (*titlebar_action)(void *data, enum swc_titlebar_action action);
+
+	/* Requests from desktop taskbars and docks. */
+	void (*request_activate)(void *data);
+	void (*request_minimized)(void *data, bool minimized);
+	void (*request_maximized)(void *data, bool maximized);
+	void (*request_fullscreen)(void *data, bool fullscreen,
+	                           struct swc_screen *screen);
 };
 
 struct swc_window {
@@ -288,6 +337,22 @@ void
 swc_window_set_handler(struct swc_window *window,
                        const struct swc_window_handler *handler, void *data);
 
+/** Control whether a direct pointer press raises this window. */
+void
+swc_window_set_raise_on_click(struct swc_window *window, bool enabled);
+
+/** Control whether pointer-driven move requests may start for this window. */
+void
+swc_window_set_movable(struct swc_window *window, bool enabled);
+
+/** Control whether pointer-driven resize requests may start for this window. */
+void
+swc_window_set_resizable(struct swc_window *window, bool enabled);
+
+/** Raise the window above other windows in the same compositor layer. */
+void
+swc_window_raise(struct swc_window *window);
+
 /**
  * Request that the specified window close.
  */
@@ -305,6 +370,22 @@ swc_window_show(struct swc_window *window);
  */
 void
 swc_window_hide(struct swc_window *window);
+
+/** Publish the minimized state to desktop taskbars. */
+void
+swc_window_set_minimized(struct swc_window *window, bool minimized);
+
+/**
+ * Publish the numbered workspace this window belongs to.
+ *
+ * Workspaces are numbered per screen, so the number only identifies a
+ * workspace together with the screen the window is on. Pass zero when the
+ * window manager does not use numbered workspaces. swc does not act on the
+ * value; it forwards it to desktop taskbars, which need it to tell a window
+ * hidden on another workspace from one on the workspace being shown.
+ */
+void
+swc_window_set_workspace(struct swc_window *window, uint32_t workspace);
 
 /**
  * Set the keyboard focus to the specified window.
@@ -491,12 +572,38 @@ struct swc_decor_parts {
  *
  * The title field controls an optional text slot rendered on one edge.
  */
+enum swc_titlebar_buttons_style {
+	SWC_TITLEBAR_BUTTONS_CLASSIC,
+	SWC_TITLEBAR_BUTTONS_CIRCLES,
+};
+
+/* An optional solid top bar. Buttons are ordered left to right on the chosen
+ * edge; count is at most three. The top edge supplies the bar's height. */
+struct swc_titlebar {
+	bool enabled;
+	uint32_t count;
+	enum swc_titlebar_action buttons[3];
+	/* Classic button backgrounds; zero derives a shade from the bar colors. */
+	uint32_t hover_color, pressed_color;
+	enum swc_titlebar_buttons_style buttons_style;
+	bool buttons_left;
+	uint32_t close_color, minimize_color, fullscreen_color;
+};
+
 struct swc_decor {
 	uint32_t color;
 	uint32_t top, right, bottom, left;
 	const struct swc_decor_parts *parts;
 	struct swc_decor_text title;
+	struct swc_titlebar titlebar;
 };
+
+/* Prepare decoration resources without changing any window. Apply consumes
+ * the prepared object and cannot fail; discard releases an unused candidate. */
+struct swc_prepared_decor;
+struct swc_prepared_decor *swc_decor_prepare(const struct swc_decor *, uint32_t width);
+void swc_decor_discard(struct swc_prepared_decor *);
+void swc_window_apply_decor(struct swc_window *, struct swc_prepared_decor *);
 
 /**
  * Set window decor around the window.
@@ -583,7 +690,7 @@ enum swc_binding_type {
 };
 
 typedef void (*swc_binding_handler)(void *data, uint32_t time, uint32_t value,
-                                    uint32_t state);
+                                   uint32_t state);
 typedef void (*swc_axis_binding_handler)(void *data, uint32_t time,
                                          uint32_t axis, int32_t value120);
 
@@ -603,6 +710,14 @@ swc_add_binding(enum swc_binding_type type, uint32_t modifiers, uint32_t value,
 void
 swc_remove_binding(enum swc_binding_type type, uint32_t modifiers,
                    uint32_t value);
+
+/* Allocate bindings off-list, then publish them without allocating. */
+struct swc_binding_batch;
+struct swc_binding_batch *swc_binding_batch_create(void);
+bool swc_binding_batch_add(struct swc_binding_batch *, enum swc_binding_type,
+                           uint32_t modifiers, uint32_t value, swc_binding_handler, void *);
+void swc_binding_batch_commit(struct swc_binding_batch *);
+void swc_binding_batch_discard(struct swc_binding_batch *);
 
 /**
  * register a new pointer axis binding
@@ -646,7 +761,17 @@ struct swc_manager {
 	 * Called when the session gets deactivated.
 	 */
 	void (*deactivate)(void);
+
+	/**
+	 * Called when a desktop shell asks to activate a numbered workspace on a
+	 * screen. Each screen carries its own set of numbered workspaces.
+	 */
+	void (*workspace_activate)(struct swc_screen *screen, uint32_t workspace);
 };
+
+/** Publish a screen's active numbered workspace (1 through 9). */
+void
+swc_workspace_set_active(struct swc_screen *screen, uint32_t workspace);
 
 /**
  * Initializes the compositor using the specified display, event_loop, and

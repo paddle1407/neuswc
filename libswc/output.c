@@ -3,9 +3,11 @@
 #include "drm.h"
 #endif
 #include "internal.h"
+#include "foreign_toplevel.h"
 #include "mode.h"
 #include "screen.h"
 #include "util.h"
+#include "workspace.h"
 
 #ifdef ENABLE_DRM
 #include <drm.h>
@@ -39,6 +41,8 @@ bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	wl_resource_set_implementation(resource, &output_impl, output,
 	                               &remove_resource);
 	wl_list_insert(&output->resources, wl_resource_get_link(resource));
+	workspace_output_bound(output, resource);
+	foreign_toplevel_output_bound(output, resource);
 
 	wl_output_send_geometry(resource, screen->base.geometry.x,
 	                        screen->base.geometry.y, output->physical_width,
@@ -65,6 +69,9 @@ bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	}
 
 	if (version >= 2) {
+		/* Composition is one to one, so state the scale the compositor can
+		 * actually honor rather than leaving clients to guess it. */
+		wl_output_send_scale(resource, 1);
 		wl_output_send_done(resource);
 	}
 }
@@ -174,6 +181,8 @@ void
 output_destroy(struct output *output)
 {
 	struct wl_resource *resource, *tmp;
+	workspace_output_removed(output);
+	foreign_toplevel_output_removed(output);
 
 	wl_list_for_each_safe(resource, tmp, &output->resources, link)
 		wl_resource_destroy(resource);

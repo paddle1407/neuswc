@@ -31,11 +31,15 @@
 #include "backend.h"
 #include "data_device_manager.h"
 #include "decor.h"
+#include "titlebar.h"
+#include <unistd.h>
+#include <linux/input-event-codes.h>
 #ifdef ENABLE_DRM
 #include "drm.h"
 #endif
 #include "event.h"
 #include "internal.h"
+#include "layer_shell.h"
 #include "launch.h"
 #include "output.h"
 #include "pointer.h"
@@ -50,19 +54,58 @@
 #include "util.h"
 #include "view.h"
 #include "window.h"
+#include "wallpaper.h"
 
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+
+/* Enabled by the existing input diagnostic flag as well, so one run covers
+ * time spent between input events, not just inside the pointer handler. */
+static bool profile_render;
+static uint64_t compositor_started;
+static uint64_t frame_draw, frame_finish;
+
+static uint64_t monotonic_us(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
+static void report_frame(struct screen *screen, uint64_t total,
+                         uint64_t submit, uint64_t capture)
+{
+	static uint64_t last_report;
+	static uint64_t totals[5], worst;
+	static unsigned count;
+	uint64_t now = monotonic_us();
+	uint64_t sample[] = {total, frame_draw, frame_finish, submit, capture};
+	for (unsigned i = 0; i < 5; ++i) totals[i] += sample[i];
+	worst = MAX(worst, total);
+	++count;
+	if (total >= 25000 && now - last_report >= 1000000) {
+		fprintf(stderr, "render-profile: slow output %u: total %.3f ms, draw %.3f ms, GPU finish %.3f ms, submit %.3f ms, capture %.3f ms\n",
+		        screen->id, total / 1000.0, frame_draw / 1000.0,
+		        frame_finish / 1000.0, submit / 1000.0, capture / 1000.0);
+		last_report = now;
+	}
+	if (count == 60) {
+		fprintf(stderr, "render-profile: 60 output frames, average total %.3f ms (draw %.3f, GPU finish %.3f, submit %.3f, capture %.3f), worst %.3f ms\n",
+		        totals[0] / 60000.0, totals[1] / 60000.0, totals[2] / 60000.0,
+		        totals[3] / 60000.0, totals[4] / 60000.0, worst / 1000.0);
+		memset(totals, 0, sizeof(totals));
+		count = 0; worst = 0;
+	}
+}
 #ifdef ENABLE_DRM
 #include <wld/drm.h>
 #endif
 #include <wld/wld.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
-
-#define DEFAULT_BG 0xff000000u
 
 static inline int32_t
 clamp_i32(int64_t v)
@@ -91,6 +134,10 @@ span_u32(int32_t a, int32_t b)
 }
 
 struct target {
+	bool first_frame_presented;
+	/* Set while the last attempted flip/modeset for this screen failed, so a
+	 * persistently failing output retries once rather than spinning on idle. */
+	bool swap_failed;
 	struct wld_surface *surface;
 	struct wld_buffer *next_buffer, *current_buffer;
 	struct view *view;
@@ -126,6 +173,10 @@ static struct {
 	/* A mask of screens that are scheduled to be repainted on the next idle. */
 	uint32_t scheduled_updates;
 
+	/* A mask of screens whose last frame was never presented because the
+	 * mode set or page flip failed, and which need another update. */
+	uint32_t recover_updates;
+
 	bool updating;
 	struct wl_global *global;
 	bool initialized;
@@ -134,6 +185,23 @@ static struct {
 	float zoom;
 	struct wld_buffer *zoom_buffer;
 } compositor;
+
+/* The static handler retains ownership of a claimed button even if the window
+ * disappears before release. Hide/destroy clears both view references. */
+static struct {
+	struct compositor_view *hover, *pressed;
+	int button;
+	int32_t offset_x, offset_y;
+	bool left_down;
+} bar_grab;
+
+static void
+bar_forget(struct compositor_view *view)
+{
+	if (bar_grab.hover == view) bar_grab.hover = NULL;
+	if (bar_grab.pressed == view) bar_grab.pressed = NULL;
+	titlebar_highlight(view, -1, -1);
+}
 
 static struct {
 	bool active;
@@ -153,6 +221,8 @@ handle_screen_destroy(struct wl_listener *listener, void *data)
 	struct target *target =
 	    wl_container_of(listener, target, screen_destroy_listener);
 
+	wl_list_remove(&target->view_handler.link);
+	wl_list_remove(&target->screen_destroy_listener.link);
 	wld_destroy_surface(target->surface);
 	free(target);
 }
@@ -173,6 +243,11 @@ handle_screen_frame(struct view_handler *handler, uint32_t time)
 {
 	struct target *target = wl_container_of(handler, target, view_handler);
 	struct compositor_view *view;
+	if (!target->first_frame_presented) {
+		fprintf(stderr, "startup: output mask 0x%x first frame presented %.3f ms after compositor initialization began\n",
+		        target->mask, (monotonic_us() - compositor_started) / 1000.0);
+		target->first_frame_presented = true;
+	}
 
 	compositor.pending_flips &= ~target->mask;
 
@@ -205,8 +280,45 @@ static const struct view_handler_impl screen_view_handler = {
 static int
 target_swap_buffers(struct target *target)
 {
-	target->next_buffer = wld_surface_take(target->surface);
-	return view_attach(target->view, target->next_buffer);
+	struct wld_buffer *buffer;
+	int ret;
+
+	if (!(buffer = wld_surface_take(target->surface))) {
+		return -ENOMEM;
+	}
+
+	if ((ret = view_attach(target->view, buffer)) < 0) {
+		/*
+		 * view_attach() only takes a reference once the attach succeeded, and
+		 * only a completed page flip releases a taken buffer. Hand the buffer
+		 * back to the surface, or it stays busy forever and the pool grows by
+		 * one scanout buffer for every failure.
+		 */
+		wld_surface_release(target->surface, buffer);
+		return ret;
+	}
+
+	target->next_buffer = buffer;
+	return 0;
+}
+
+/*
+ * Restore full damage for a screen whose frame was never presented.
+ *
+ * calculate_damage() has already consumed the client surface damage and
+ * perform_update() clears compositor.damage, while wld_surface_take() cleared
+ * the damage recorded on the buffer that was rendered into. Without this the
+ * content of the dropped frame is lost until something else happens to damage
+ * the same region.
+ */
+static void
+target_restore_damage(struct target *target, const struct swc_rectangle *geom)
+{
+	pixman_region32_t full;
+
+	pixman_region32_init_rect(&full, 0, 0, geom->width, geom->height);
+	wld_surface_damage(target->surface, &full);
+	pixman_region32_fini(&full);
 }
 
 static struct target *
@@ -218,6 +330,8 @@ target_new(struct screen *screen)
 	if (!(target = malloc(sizeof(*target)))) {
 		goto error0;
 	}
+	target->first_frame_presented = false;
+	target->swap_failed = false;
 
 	target->surface =
 	    wld_create_surface(swc.backend->context, geom->width, geom->height,
@@ -237,6 +351,7 @@ target_new(struct screen *screen)
 	target->view_handler.impl = &screen_view_handler;
 	wl_list_insert(&target->view->handlers, &target->view_handler.link);
 	target->current_buffer = NULL;
+	target->next_buffer = NULL;
 	target->mask = screen_mask(screen);
 
 	target->screen_destroy_listener.notify = &handle_screen_destroy;
@@ -252,77 +367,31 @@ error0:
 
 /* Rendering {{{ */
 
-/* check the client's window buffer is opaque */
-static bool
-view_buffer_is_opaque(struct compositor_view *view)
+/* Borders enclose the content and built-in titlebar as one frame. Client
+ * buffer coordinates remain relative to the original content geometry. */
+static struct swc_rectangle
+frame_geometry(const struct compositor_view *view)
 {
-	const struct swc_rectangle *geom = &view->base.geometry;
-	struct wld_buffer *buffer = view->base.buffer;
-	uint32_t x1, y1, width, height;
-
-	if (view->buffer_opaque_valid) {
-		return view->buffer_opaque;
+	struct swc_rectangle frame = view->base.geometry;
+	if (view->decor.titlebar.enabled) {
+		frame.y -= view->decor.top;
+		frame.height += view->decor.top;
 	}
-
-	view->buffer_opaque_valid = true;
-	view->buffer_opaque = false;
-	if (!buffer || buffer->format != WLD_FORMAT_ARGB8888) {
-		return false;
-	}
-
-	if (view->window) {
-		if (view->buffer_offset_x < 0 || view->buffer_offset_y < 0) {
-			return false;
-		}
-		x1 = (uint32_t)view->buffer_offset_x;
-		y1 = (uint32_t)view->buffer_offset_y;
-		width = geom->width;
-		height = geom->height;
-	} else {
-		x1 = 0;
-		y1 = 0;
-		width = buffer->width;
-		height = buffer->height;
-	}
-
-	if (x1 > buffer->width || y1 > buffer->height ||
-	    width > buffer->width - x1 || height > buffer->height - y1 ||
-	    !wld_map(buffer)) {
-		return false;
-	}
-
-	view->buffer_opaque = true;
-	for (uint32_t y = 0; y < height && view->buffer_opaque; ++y) {
-		const uint8_t *row = (const uint8_t *)buffer->map +
-		                     (size_t)(y1 + y) * buffer->pitch +
-		                     (size_t)x1 * 4;
-
-		for (uint32_t x = 0; x < width; ++x) {
-			uint32_t pixel;
-
-			memcpy(&pixel, row + (size_t)x * 4, sizeof(pixel));
-			if ((pixel >> 24) != 0xff) {
-				view->buffer_opaque = false;
-				break;
-			}
-		}
-	}
-	wld_unmap(buffer);
-
-	return view->buffer_opaque;
+	return frame;
 }
 
 static void
 repaint_view(struct target *target, struct compositor_view *view,
              pixman_region32_t *damage)
 {
-	pixman_region32_t geom_region, buffer_region, border_region, view_damage,
+	pixman_region32_t frame_region, buffer_region, border_region, view_damage,
 	    buffer_damage, border_damage;
 	const struct swc_rectangle *geom = &view->base.geometry,
 	                           *target_geom = &target->view->geometry;
 	int32_t buf_x, buf_y;
 	uint32_t buf_w, buf_h;
 	int64_t total_border;
+	const struct swc_rectangle frame = frame_geometry(view);
 
 	if (!view->base.buffer) {
 		return;
@@ -335,8 +404,8 @@ repaint_view(struct target *target, struct compositor_view *view,
 
 	total_border =
 	    (int64_t)view->border.outwidth + (int64_t)view->border.inwidth;
-	pixman_region32_init_rect(&geom_region, geom->x, geom->y, geom->width,
-	                          geom->height);
+	pixman_region32_init_rect(&frame_region, frame.x, frame.y, frame.width,
+	                          frame.height);
 	if (view->window) {
 		pixman_region32_init_rect(&buffer_region, geom->x, geom->y, geom->width,
 		                          geom->height);
@@ -344,11 +413,11 @@ repaint_view(struct target *target, struct compositor_view *view,
 		pixman_region32_init_rect(&buffer_region, buf_x, buf_y, buf_w, buf_h);
 	}
 	pixman_region32_init_rect(&border_region,
-	                          geom->x - (int32_t)total_border,
-	                          geom->y - (int32_t)total_border,
-	                          geom->width + (uint32_t)(2 * total_border),
-	                          geom->height + (uint32_t)(2 * total_border));
-	pixman_region32_subtract(&border_region, &border_region, &geom_region);
+	                          frame.x - (int32_t)total_border,
+	                          frame.y - (int32_t)total_border,
+	                          frame.width + (uint32_t)(2 * total_border),
+	                          frame.height + (uint32_t)(2 * total_border));
+	pixman_region32_subtract(&border_region, &border_region, &frame_region);
 	pixman_region32_init_with_extents(&view_damage, &view->extents);
 	pixman_region32_init(&buffer_damage);
 	pixman_region32_init(&border_damage);
@@ -365,8 +434,9 @@ repaint_view(struct target *target, struct compositor_view *view,
 		if (view->buffer->format == WLD_FORMAT_ARGB8888) {
 			pixman_region32_t opaque_damage, blend_damage;
 
-			/* keep pixels that we know are opaque on the accelerated path; only
-			 * pixels which might have alpha need blending. */
+			/* Trust the committed opaque region. Scanning a whole client
+			 * buffer to discover opacity can force costly GPU mappings;
+			 * blending the remaining pixels is correct even when opaque. */
 			pixman_region32_init(&opaque_damage);
 			pixman_region32_intersect(&opaque_damage, &buffer_damage,
 			                          &view->surface->state.opaque);
@@ -374,8 +444,7 @@ repaint_view(struct target *target, struct compositor_view *view,
 			pixman_region32_subtract(&blend_damage, &buffer_damage,
 			                         &opaque_damage);
 
-			if (!pixman_region32_not_empty(&blend_damage) ||
-			    view_buffer_is_opaque(view)) {
+			if (!pixman_region32_not_empty(&blend_damage)) {
 				wld_copy_region(swc.backend->renderer, view->buffer,
 				                buf_x - target_geom->x,
 				                buf_y - target_geom->y, &buffer_damage);
@@ -402,10 +471,10 @@ repaint_view(struct target *target, struct compositor_view *view,
 
 	pixman_region32_t in_rect;
 	pixman_region32_init_rect(&in_rect,
-	                          geom->x - view->border.inwidth,
-	                          geom->y - view->border.inwidth,
-	                          geom->width + (2 * view->border.inwidth),
-	                          geom->height + (2 * view->border.inwidth));
+	                          frame.x - view->border.inwidth,
+	                          frame.y - view->border.inwidth,
+	                          frame.width + (2 * view->border.inwidth),
+	                          frame.height + (2 * view->border.inwidth));
 
 	pixman_region32_t out_border;
 	pixman_region32_init(&out_border);
@@ -413,10 +482,10 @@ repaint_view(struct target *target, struct compositor_view *view,
 
 	pixman_region32_t in_border;
 	pixman_region32_init(&in_border);
-	pixman_region32_subtract(&in_border, &in_rect, &geom_region);
+	pixman_region32_subtract(&in_border, &in_rect, &frame_region);
 	pixman_region32_intersect(&in_border, &in_border, &border_damage);
 
-	pixman_region32_fini(&geom_region);
+	pixman_region32_fini(&frame_region);
 	pixman_region32_fini(&buffer_region);
 	pixman_region32_fini(&border_region);
 
@@ -498,6 +567,7 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 {
 	struct compositor_view *view;
 	const struct swc_rectangle *target_geom = &target->view->geometry;
+	uint64_t start = profile_render ? monotonic_us() : 0;
 
 	DEBUG("Rendering to target { x: %d, y: %d, w: %u, h: %u }\n",
 	      target->view->geometry.x, target->view->geometry.y,
@@ -508,8 +578,7 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 	if (pixman_region32_not_empty(base_damage)) {
 		pixman_region32_translate(base_damage, -target->view->geometry.x,
 		                          -target->view->geometry.y);
-		wld_fill_region(swc.backend->renderer, DEFAULT_BG,
-		                base_damage);
+		wallpaper_repaint(screen, swc.backend->renderer, base_damage);
 	}
 
 	wl_list_for_each_reverse(view, views, link)
@@ -521,7 +590,12 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 
 	draw_overlays(swc.backend->renderer, target_geom);
 
+	uint64_t drawn = profile_render ? monotonic_us() : 0;
 	wld_flush(swc.backend->renderer);
+	if (profile_render) {
+		frame_draw = drawn - start;
+		frame_finish = monotonic_us() - drawn;
+	}
 }
 
 static int
@@ -560,6 +634,7 @@ renderer_attach(struct compositor_view *view, struct wld_buffer *client_buffer)
 				if (!buffer) {
 					return -ENOMEM;
 				}
+				view->proxy_dirty = true;
 			} else {
 				/* Otherwise we can keep the original proxy buffer. */
 				buffer = view->buffer;
@@ -580,7 +655,7 @@ renderer_attach(struct compositor_view *view, struct wld_buffer *client_buffer)
 	}
 
 	view->buffer = buffer;
-	view->buffer_opaque_valid = false;
+	if (!needs_proxy) view->proxy_dirty = false;
 
 	return 0;
 }
@@ -588,13 +663,36 @@ renderer_attach(struct compositor_view *view, struct wld_buffer *client_buffer)
 static void
 renderer_flush_view(struct compositor_view *view)
 {
+	/*
+	 * view->buffer differs from base.buffer only when it is a proxy, and
+	 * renderer_attach only creates one from a non-NULL client buffer, which
+	 * view_attach then stores as base.buffer. So base.buffer is non-NULL
+	 * below; detaching clears both and takes the early return.
+	 */
 	if (view->buffer == view->base.buffer) {
 		return;
 	}
 
 	wld_set_target_buffer(swc.shm->renderer, view->buffer);
-	wld_copy_region(swc.shm->renderer, view->base.buffer, 0, 0,
-	                &view->surface->state.damage);
+
+	/*
+	 * A new proxy starts empty, so copying only the damaged region leaves it
+	 * blank when a client attaches its first buffer without posting damage --
+	 * which is allowed, and which wfreeze does. Copy the whole buffer once.
+	 */
+	if (view->proxy_dirty) {
+		pixman_region32_t full;
+
+		pixman_region32_init_rect(&full, 0, 0, view->base.buffer->width,
+		                          view->base.buffer->height);
+		wld_copy_region(swc.shm->renderer, view->base.buffer, 0, 0, &full);
+		pixman_region32_fini(&full);
+		view->proxy_dirty = false;
+	} else {
+		wld_copy_region(swc.shm->renderer, view->base.buffer, 0, 0,
+		                &view->surface->state.damage);
+	}
+
 	wld_flush(swc.shm->renderer);
 }
 
@@ -628,7 +726,7 @@ damage_view(struct compositor_view *view)
 }
 
 static void
-update_extents(struct compositor_view *view)
+update_extents_for_buffer(struct compositor_view *view, struct wld_buffer *buffer)
 {
 	int64_t total_border =
 	    (int64_t)view->border.outwidth + (int64_t)view->border.inwidth;
@@ -637,10 +735,11 @@ update_extents(struct compositor_view *view)
 	int64_t geom_w = view->base.geometry.width;
 	int64_t geom_h = view->base.geometry.height;
 
-	int64_t border_x1 = geom_x - total_border;
-	int64_t border_y1 = geom_y - total_border;
-	int64_t border_x2 = geom_x + geom_w + total_border;
-	int64_t border_y2 = geom_y + geom_h + total_border;
+	const struct swc_rectangle frame = frame_geometry(view);
+	int64_t border_x1 = (int64_t)frame.x - total_border;
+	int64_t border_y1 = (int64_t)frame.y - total_border;
+	int64_t border_x2 = (int64_t)frame.x + frame.width + total_border;
+	int64_t border_y2 = (int64_t)frame.y + frame.height + total_border;
 	int64_t decor_x1 = geom_x - (int64_t)view->decor.left;
 	int64_t decor_y1 = geom_y - (int64_t)view->decor.top;
 	int64_t decor_x2 = geom_x + geom_w + (int64_t)view->decor.right;
@@ -650,10 +749,10 @@ update_extents(struct compositor_view *view)
 	int64_t buffer_y1 = geom_y - view->buffer_offset_y;
 	int64_t buffer_x2 =
 	    buffer_x1 +
-	    (view->base.buffer ? view->base.buffer->width : (uint32_t)geom_w);
+	    (buffer ? buffer->width : (uint32_t)geom_w);
 	int64_t buffer_y2 =
 	    buffer_y1 +
-	    (view->base.buffer ? view->base.buffer->height : (uint32_t)geom_h);
+	    (buffer ? buffer->height : (uint32_t)geom_h);
 
 	view->extents.x1 = clamp_i32(MIN(MIN(border_x1, decor_x1), buffer_x1));
 	view->extents.y1 = clamp_i32(MIN(MIN(border_y1, decor_y1), buffer_y1));
@@ -671,6 +770,12 @@ update_extents(struct compositor_view *view)
 	view->border.damaged_border1 = true;
 	view->border.damaged_border2 = true;
 	view->decor.damaged = true;
+}
+
+static void
+update_extents(struct compositor_view *view)
+{
+	update_extents_for_buffer(view, view->base.buffer);
 }
 
 static void
@@ -870,7 +975,7 @@ render_zoomed_to_shm(struct screen *screen, float zoom)
 
 	pixman_region32_t full;
 	pixman_region32_init_rect(&full, 0, 0, width, height);
-	wld_fill_region(swc.shm->renderer, DEFAULT_BG, &full);
+	wallpaper_repaint(screen, swc.shm->renderer, &full);
 	pixman_region32_fini(&full);
 	wld_flush(swc.shm->renderer);
 
@@ -1036,6 +1141,18 @@ update(struct view *base)
 		return false;
 	}
 
+	/*
+	 * Damage is scheduled per screen, and the screen mask is what says which
+	 * ones. It was only recomputed when a view moved or changed size, so a view
+	 * whose mask was stale -- or never computed, because it has not moved since
+	 * it was shown -- scheduled an update for the wrong screens, or for none at
+	 * all. Its damage then sat in the accumulated region unpainted until
+	 * something else on that screen happened to schedule a frame, which for a
+	 * panel on an otherwise idle monitor means it went stale until the pointer
+	 * moved across it. Recomputing here is two rectangle tests, and
+	 * view_set_screens does nothing when the mask has not actually changed.
+	 */
+	view_update_screens(&view->base);
 	schedule_updates(view->base.screens);
 
 	return true;
@@ -1046,8 +1163,10 @@ attach(struct view *base, struct wld_buffer *buffer)
 {
 	struct compositor_view *view = (void *)base;
 	struct surface *surface = view->surface;
-	pixman_box32_t old_extents;
-	pixman_region32_t old, new, both;
+	pixman_box32_t old_extents = view->extents;
+	int32_t old_offset_x = view->buffer_offset_x, old_offset_y = view->buffer_offset_y;
+	bool buffer_resized = !view->base.buffer || !buffer ||
+	    view->base.buffer->width != buffer->width || view->base.buffer->height != buffer->height;
 	uint32_t new_width = buffer ? buffer->width : 0;
 	uint32_t new_height = buffer ? buffer->height : 0;
 	int ret;
@@ -1071,25 +1190,19 @@ attach(struct view *base, struct wld_buffer *buffer)
 		}
 	}
 
-	if (view_set_size(&view->base, new_width, new_height)) {
-		/* The view was resized. */
-		old_extents = view->extents;
-		update_extents(view);
-
+	bool resized = view_set_size(&view->base, new_width, new_height);
+	if (resized || buffer_resized || old_offset_x != view->buffer_offset_x ||
+	    old_offset_y != view->buffer_offset_y) {
+		/* base.buffer is replaced by view_attach only after this callback.
+		 * Use the incoming buffer to calculate shadows and other extents. */
+		update_extents_for_buffer(view, buffer);
 		if (view->visible) {
-			/* Damage the region that was newly uncovered or covered. */
-			pixman_region32_init_with_extents(&old, &old_extents);
-			pixman_region32_init_with_extents(&new, &view->extents);
-			pixman_region32_init(&both);
-			pixman_region32_intersect(&both, &old, &new);
-			pixman_region32_union(&new, &old, &new);
-			pixman_region32_subtract(&new, &new, &both);
-			pixman_region32_union(&compositor.damage, &compositor.damage, &new);
-			pixman_region32_fini(&old);
-			pixman_region32_fini(&new);
-			pixman_region32_fini(&both);
-
+			pixman_region32_union_rect(&compositor.damage, &compositor.damage,
+			    old_extents.x1, old_extents.y1,
+			    span_u32(old_extents.x1, old_extents.x2), span_u32(old_extents.y1, old_extents.y2));
+			pixman_region32_clear(&view->clip);
 			view_update_screens(&view->base);
+			damage_view(view);
 			update(&view->base);
 		}
 	}
@@ -1101,6 +1214,12 @@ static bool
 move(struct view *base, int32_t x, int32_t y)
 {
 	struct compositor_view *view = (void *)base;
+	struct compositor_view *child;
+	int32_t old_x = view->base.geometry.x;
+	int32_t old_y = view->base.geometry.y;
+
+	if (old_x == x && old_y == y)
+		return true;
 
 	if (view->visible) {
 		damage_below_view(view);
@@ -1108,6 +1227,9 @@ move(struct view *base, int32_t x, int32_t y)
 	}
 
 	if (view_set_position(&view->base, x, y)) {
+		int32_t dx = x - old_x;
+		int32_t dy = y - old_y;
+
 		update_extents(view);
 
 		if (view->visible) {
@@ -1118,6 +1240,17 @@ move(struct view *base, int32_t x, int32_t y)
 			view_update_screens(&view->base);
 			damage_below_view(view);
 			update(&view->base);
+		}
+
+		/* Popup coordinates are relative to their parent surface. */
+		wl_list_for_each(child, &compositor.views, link)
+		{
+			/* Subsurfaces already follow the parent's view-handler callback.
+			 * Applying this delta too would move them twice on every drag. */
+			if (child->parent == view && !child->surface->subsurface) {
+				view_move(&child->base, child->base.geometry.x + dx,
+				          child->base.geometry.y + dy);
+			}
 		}
 	}
 
@@ -1130,49 +1263,69 @@ static const struct view_impl view_impl = {
     .move = move,
 };
 
+/* A window's child surfaces are part of its stack entry. Keep their existing
+ * above/below order when moving the entry; below-parent subsurfaces must not
+ * become popups merely because the window changed mode. */
+static bool
+view_descends_from(struct compositor_view *view, struct compositor_view *parent)
+{
+	for (view = view->parent; view; view = view->parent)
+		if (view == parent) return true;
+	return false;
+}
+
+struct view_children {
+	struct wl_list above, below;
+};
+
+static void
+take_view_children(struct compositor_view *view, struct view_children *children)
+{
+	struct compositor_view *child, *next;
+	bool above = true;
+	wl_list_init(&children->above);
+	wl_list_init(&children->below);
+	wl_list_for_each_safe(child, next, &compositor.views, link) {
+		if (child == view) above = false;
+		if (!view_descends_from(child, view)) continue;
+		damage_view(child);
+		pixman_region32_clear(&child->clip);
+		schedule_updates(child->base.screens);
+		wl_list_remove(&child->link);
+		wl_list_insert(above ? children->above.prev : children->below.prev,
+		               &child->link);
+	}
+}
+
+static void
+restore_view_children(struct compositor_view *view, struct view_children *children)
+{
+	struct compositor_view *child;
+	wl_list_for_each(child, &children->above, link) {
+		child->stack_layer = view->stack_layer;
+		child->always_top = view->always_top;
+	}
+	wl_list_for_each(child, &children->below, link) {
+		child->stack_layer = view->stack_layer;
+		child->always_top = view->always_top;
+	}
+	if (!wl_list_empty(&children->above))
+		wl_list_insert_list(view->link.prev, &children->above);
+	if (!wl_list_empty(&children->below))
+		wl_list_insert_list(&view->link, &children->below);
+}
+
 static void
 restack_view_for_layer(struct compositor_view *view, bool raise)
 {
 	struct compositor_view *other;
 	struct wl_list *insert_after = &compositor.views;
-	bool found_same = false;
-
-	wl_list_for_each(other, &compositor.views, link)
-	{
-		if (other == view) {
-			continue;
-		}
-
-		if (other->stack_layer > view->stack_layer) {
-			insert_after = &other->link;
-			continue;
-		}
-
-		if (other->stack_layer == view->stack_layer) {
-			found_same = true;
-			if (raise) {
-				insert_after = other->link.prev;
-			} else {
-				insert_after = &other->link;
-			}
-			break;
-		}
-
-		insert_after = other->link.prev;
-		break;
+	wl_list_for_each(other, &compositor.views, link) {
+		if (other == view) continue;
+		if (other->stack_layer < view->stack_layer ||
+		    (raise && other->stack_layer == view->stack_layer)) break;
+		insert_after = &other->link;
 	}
-
-	if (!found_same && !raise && insert_after == &compositor.views) {
-		insert_after = compositor.views.prev;
-		if (insert_after == &view->link) {
-			insert_after = insert_after->prev;
-		}
-	}
-
-	if (insert_after == &view->link) {
-		insert_after = insert_after->prev;
-	}
-
 	wl_list_remove(&view->link);
 	wl_list_insert(insert_after, &view->link);
 }
@@ -1191,6 +1344,7 @@ view_at(int32_t x, int32_t y)
 		}
 
 		geom = &view->base.geometry;
+		if (titlebar_hit(view, x, y) != -2) return view;
 		if (view->window) {
 			if (!rectangle_contains_point(geom, x, y)) {
 				continue;
@@ -1227,10 +1381,19 @@ window_view(struct compositor_view *view)
 	return (view && view->window) ? view : NULL;
 }
 
+static void
+raise_window_from_click(struct compositor_view *view)
+{
+	struct compositor_view *window = window_view(view);
+	if (!window || window->window->raise_on_click)
+		raise_window(view);
+}
+
 void
 raise_window(struct compositor_view *view)
 {
-	struct compositor_view *other, *top_window;
+	struct compositor_view *other;
+	struct view_children children;
 	struct wl_list *insert_after;
 	uint32_t screens;
 
@@ -1239,7 +1402,7 @@ raise_window(struct compositor_view *view)
 		return;
 	}
 
-	top_window = NULL;
+	take_view_children(view, &children);
 	insert_after = &compositor.views;
 	wl_list_for_each(other, &compositor.views, link)
 	{
@@ -1251,31 +1414,27 @@ raise_window(struct compositor_view *view)
 			continue;
 		}
 
-		if (other->stack_layer > STACK_LAYER_NORMAL ||
-		    other->always_top) {
+		if (other->stack_layer > view->stack_layer ||
+		    (other->stack_layer == view->stack_layer && other->always_top)) {
 			insert_after = &other->link;
 			continue;
 		}
 
-		if (other->stack_layer < STACK_LAYER_NORMAL) {
+		if (other->stack_layer < view->stack_layer) {
 			break;
 		}
 
 		if (other->window) {
-			top_window = other;
 			break;
 		}
 		insert_after = &other->link;
-	}
-
-	if (view == top_window) {
-		return;
 	}
 
 	screens = view->base.screens;
 
 	wl_list_remove(&view->link);
 	wl_list_insert(insert_after, &view->link);
+	restore_view_children(view, &children);
 
 	view->border.damaged_border1 = true;
 	pixman_region32_union_rect(&compositor.damage, &compositor.damage,
@@ -1288,28 +1447,20 @@ raise_window(struct compositor_view *view)
 void
 raise_window_top(struct compositor_view *view)
 {
-	view->stack_layer = STACK_LAYER_OVERLAY;
-	restack_view_for_layer(view, true);
-	damage_view(view);
-	schedule_updates(view->base.screens);
+	compositor_view_set_stack_layer(view, STACK_LAYER_OVERLAY, true);
 }
 
 void
 compositor_view_set_stack_layer(struct compositor_view *view, uint32_t layer,
 	                            bool raise)
 {
-	if (view->stack_layer == layer) {
-		if (raise) {
-			restack_view_for_layer(view, true);
-			damage_view(view);
-			schedule_updates(view->base.screens);
-		}
-		return;
-	}
-
+	struct view_children children;
+	if (view->stack_layer == layer && !raise) return;
+	take_view_children(view, &children);
 	damage_view(view);
 	view->stack_layer = layer;
 	restack_view_for_layer(view, raise);
+	restore_view_children(view, &children);
 	damage_view(view);
 	schedule_updates(view->base.screens);
 }
@@ -1344,7 +1495,8 @@ prev_window_view(struct compositor_view *view)
 	for (link = view->link.prev; link != &compositor.views; link = link->prev) {
 		other = wl_container_of(link, other, link);
 
-		if (other->visible && other->window) {
+		if (other->visible && other->window &&
+		    other->stack_layer == view->stack_layer) {
 			return other;
 		}
 	}
@@ -1361,7 +1513,8 @@ next_window_view(struct compositor_view *view)
 	for (link = view->link.next; link != &compositor.views; link = link->next) {
 		other = wl_container_of(link, other, link);
 
-		if (other->visible && other->window) {
+		if (other->visible && other->window &&
+		    other->stack_layer == view->stack_layer) {
 			return other;
 		}
 	}
@@ -1408,18 +1561,23 @@ swc_window_stack(struct swc_window *window, int32_t direction)
 		if (!other) {
 			return;
 		}
-		wl_list_remove(&view->link);
-		wl_list_insert(other->link.prev, &view->link);
+		compositor_view_restack(view, other, true);
 	} else {
 		other = next_window_view(view);
 		if (!other) {
 			return;
 		}
-		wl_list_remove(&view->link);
-		wl_list_insert(&other->link, &view->link);
+		compositor_view_restack(view, other, false);
 	}
+}
 
-	damage_views(view, other);
+static void
+log_view_memory(const char *event)
+{
+	const char *enabled = getenv("CHARAWC_DEBUG_MEMORY");
+	if (enabled && strcmp(enabled, "1") == 0)
+		fprintf(stderr, "memory-profile: pid=%ld view-%s live_views=%d\n",
+		        (long)getpid(), event, wl_list_length(&compositor.views));
 }
 
 struct compositor_view *
@@ -1436,8 +1594,7 @@ compositor_create_view(struct surface *surface)
 	view_initialize(&view->base, &view_impl);
 	view->surface = surface;
 	view->buffer = NULL;
-	view->buffer_opaque_valid = false;
-	view->buffer_opaque = false;
+	view->proxy_dirty = false;
 	view->window = NULL;
 	view->parent = NULL;
 	view->buffer_offset_x = 0;
@@ -1466,6 +1623,7 @@ compositor_create_view(struct surface *surface)
 	wl_signal_init(&view->destroy_signal);
 	surface_set_view(surface, &view->base);
 	wl_list_insert(&compositor.views, &view->link);
+	log_view_memory("create");
 
 	return view;
 }
@@ -1476,17 +1634,28 @@ compositor_view_destroy(struct compositor_view *view)
 	wl_signal_emit(&view->destroy_signal, NULL);
 	compositor_view_hide(view);
 	surface_set_view(view->surface, NULL);
+	/* The renderer's upload proxy owns a separate reference from the
+	 * client's buffer retained by view_finalize(). */
+	if (view->buffer && view->buffer != view->base.buffer)
+		wld_buffer_unreference(view->buffer);
 	view_finalize(&view->base);
 	decor_view_finalize(view);
 	pixman_region32_fini(&view->clip);
 	wl_list_remove(&view->link);
 	free(view);
+	log_view_memory("destroy");
 }
 
 struct compositor_view *
 compositor_view(struct view *view)
 {
-	return view->impl == &view_impl ? (struct compositor_view *)view : NULL;
+	/*
+	 * A surface that has no view yet is a normal thing to be asked about --
+	 * callers check the result for NULL -- so do not dereference before the
+	 * impl comparison.
+	 */
+	return view && view->impl == &view_impl ? (struct compositor_view *)view
+	                                        : NULL;
 }
 
 void
@@ -1499,6 +1668,8 @@ compositor_view_set_parent(struct compositor_view *view,
 		return;
 	}
 
+	view->stack_layer = parent->stack_layer;
+	view->always_top = parent->always_top;
 	if (parent->visible) {
 		compositor_view_show(view);
 	} else {
@@ -1510,24 +1681,28 @@ void
 compositor_view_restack(struct compositor_view *view,
                         struct compositor_view *sibling, bool above)
 {
-	if (!view || !sibling || view == sibling) {
+	struct compositor_view *other;
+	struct view_children children;
+	struct wl_list *edge;
+	if (!view || !sibling || view == sibling || view_descends_from(sibling, view))
 		return;
-	}
 
-	if (above) {
-		if (view->link.next == &sibling->link) {
-			return;
+	edge = &sibling->link;
+	if (!view_descends_from(view, sibling)) {
+		/* Sibling subsurface trees are indivisible stack entries. */
+		wl_list_for_each(other, &compositor.views, link) {
+			if (other != sibling && !view_descends_from(other, sibling)) continue;
+			edge = &other->link;
+			if (above) break;
 		}
-		wl_list_remove(&view->link);
-		wl_list_insert(sibling->link.prev, &view->link);
-	} else {
-		if (view->link.prev == &sibling->link) {
-			return;
-		}
-		wl_list_remove(&view->link);
-		wl_list_insert(&sibling->link, &view->link);
 	}
+	if ((above && view->link.next == edge) ||
+	    (!above && view->link.prev == edge)) return;
 
+	take_view_children(view, &children);
+	wl_list_remove(&view->link);
+	wl_list_insert(above ? edge->prev : edge, &view->link);
+	restore_view_children(view, &children);
 	damage_views(view, sibling);
 }
 
@@ -1543,7 +1718,7 @@ compositor_view_show(struct compositor_view *view)
 
 	subsurface = view->surface ? view->surface->subsurface : NULL;
 	if (subsurface) {
-		if (!subsurface->added || !view->surface->state.buffer) {
+		if (!subsurface->added || !view->base.buffer) {
 			return;
 		}
 	}
@@ -1573,6 +1748,7 @@ void
 compositor_view_hide(struct compositor_view *view)
 {
 	struct compositor_view *other;
+	bar_forget(view);
 
 	if (!view->visible) {
 		return;
@@ -1584,6 +1760,8 @@ compositor_view_hide(struct compositor_view *view)
 
 	view_set_screens(&view->base, 0);
 	view->visible = false;
+	if (swc.seat && swc.seat->pointer && swc.seat->pointer->focus.view == view)
+		pointer_set_focus(swc.seat->pointer, NULL);
 
 	wl_list_for_each(other, &compositor.views, link)
 	{
@@ -1600,6 +1778,8 @@ compositor_view_set_border_width(struct compositor_view *view,
 	if (view->border.outwidth == outwidth && view->border.inwidth == inwidth) {
 		return;
 	}
+
+	if (view->visible) damage_below_view(view);
 
 	view->border.outwidth = outwidth;
 	view->border.damaged_border1 = true;
@@ -1642,6 +1822,7 @@ compositor_view_set_decor(struct compositor_view *view,
 		damage_below_view(view);
 	}
 
+	if (!decor || !decor->titlebar.enabled) bar_forget(view);
 	decor_view_set(view, decor);
 	update_extents(view);
 	update(&view->base);
@@ -1656,6 +1837,21 @@ compositor_view_damage_decor(struct compositor_view *view)
 	}
 
 	decor_view_damage(view);
+	update(&view->base);
+}
+
+void
+compositor_view_apply_decor(struct compositor_view *view, struct swc_prepared_decor *prepared)
+{
+	if (view->visible) damage_below_view(view);
+	/* A new button order/side must not inherit an old hover or click index. */
+	bar_forget(view);
+	struct compositor_view old = {0};
+	old.decor = view->decor;
+	view->decor = prepared->view->decor;
+	prepared->view->decor = old.decor;
+	swc_decor_discard(prepared);
+	update_extents(view);
 	update(&view->base);
 }
 
@@ -1695,15 +1891,32 @@ calculate_damage(void)
 		pixman_region32_intersect(&surface_opaque, &surface_opaque,
 		                          &view_region);
 
+		/* The cached solid bar is opaque too; avoid drawing windows behind it. */
+		if (view->decor.titlebar.enabled && view->base.buffer)
+			pixman_region32_union_rect(&surface_opaque, &surface_opaque,
+			    geom->x, geom->y - view->decor.top, geom->width, view->decor.top);
+
 		/* Add the surface's opaque region to the accumulated opaque region. */
 		pixman_region32_union(&compositor.opaque, &compositor.opaque,
 		                      &surface_opaque);
 
 		surface_damage = &view->surface->state.damage;
 
-		if (pixman_region32_not_empty(surface_damage)) {
-			view->buffer_opaque_valid = false;
+		/*
+		 * A client may attach its first buffer without posting damage, which
+		 * is allowed. Fill the proxy anyway, or the surface renders as the
+		 * blank buffer it was allocated as.
+		 */
+		bool copied_full_proxy = view->proxy_dirty;
+		if (copied_full_proxy) {
 			renderer_flush_view(view);
+			pixman_region32_union_rect(&compositor.damage, &compositor.damage,
+			                           geom->x, geom->y, geom->width,
+			                           geom->height);
+		}
+
+		if (pixman_region32_not_empty(surface_damage)) {
+			if (!copied_full_proxy) renderer_flush_view(view);
 
 			/* Translate surface damage to global coordinates. */
 			pixman_region32_translate(surface_damage,
@@ -1748,6 +1961,7 @@ update_screen(struct screen *screen)
 	struct target *target;
 	const struct swc_rectangle *geom = &screen->base.geometry;
 	pixman_region32_t damage, *total_damage;
+	uint64_t start = profile_render ? monotonic_us() : 0;
 
 	if (!(compositor.scheduled_updates & screen_mask(screen))) {
 		return;
@@ -1770,12 +1984,15 @@ update_screen(struct screen *screen)
 	}
 
 	/* check if zoom */
+	if (profile_render) frame_draw = frame_finish = 0;
 	if (compositor.zoom != 1.0f) {
-		pixman_region32_fini(&damage);
+		pixman_region32_clear(&damage);
+		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 
 		struct wld_buffer *zoomed =
 		    render_zoomed_to_shm(screen, compositor.zoom);
 		if (!zoomed) {
+			pixman_region32_fini(&damage);
 			return;
 		}
 
@@ -1795,20 +2012,37 @@ update_screen(struct screen *screen)
 		pixman_region32_subtract(&base_damage, &damage, &compositor.opaque);
 		renderer_repaint(target, &damage, &base_damage, &compositor.views,
 		                 screen);
-		pixman_region32_fini(&damage);
 		pixman_region32_fini(&base_damage);
 	}
 
-	switch (target_swap_buffers(target)) {
-	case -EACCES:
-		/* If we get an EACCES, it is because this session is being deactivated,
-		 * but we haven't yet received the deactivate signal from swc-launch. */
-		swc_deactivate();
-		break;
-	case 0:
+	uint64_t rendered = profile_render ? monotonic_us() : 0;
+	int swap_result = target_swap_buffers(target);
+	uint64_t submitted = profile_render ? monotonic_us() : 0;
+	if (swap_result == 0) {
+		target->swap_failed = false;
 		compositor.pending_flips |= screen_mask(screen);
-		break;
+		screencopy_handle_damage(screen, &damage);
+	} else {
+		/* This frame will never be presented, so its damage must come back. */
+		target_restore_damage(target, geom);
+
+		if (swap_result == -EACCES) {
+			/* If we get an EACCES, it is because this session is being
+			 * deactivated, but we haven't yet received the deactivate signal
+			 * from swc-launch. */
+			swc_deactivate();
+		} else if (!target->swap_failed) {
+			/* Retry once. A screen that keeps failing then waits for new
+			 * damage instead of looping on the idle handler. */
+			target->swap_failed = true;
+			compositor.recover_updates |= screen_mask(screen);
+		}
 	}
+	if (profile_render) {
+		uint64_t end = monotonic_us();
+		report_frame(screen, end - start, submitted - rendered, end - submitted);
+	}
+	pixman_region32_fini(&damage);
 }
 
 static void
@@ -1824,18 +2058,64 @@ perform_update(void *data)
 	DEBUG("Performing update\n");
 
 	compositor.updating = true;
+	/*
+	 * Descriptor exhaustion shows up as unrelated-looking failures all over the
+	 * compositor -- client buffers that never arrive, dmabuf feedback that
+	 * cannot be sent, synchronization fences that cannot be exported -- so
+	 * sample the pressure here, where every frame passes, rather than waiting
+	 * for one of those to be noticed. The sampling itself is rate limited.
+	 */
+	fd_pressure_check();
+	uint64_t damage_start = profile_render ? monotonic_us() : 0;
 	calculate_damage();
+	if (profile_render) {
+		static uint64_t last_report;
+		uint64_t end = monotonic_us();
+		if (end - damage_start >= 10000 && end - last_report >= 1000000) {
+			fprintf(stderr, "render-profile: damage/proxy copies %.3f ms\n",
+			        (end - damage_start) / 1000.0);
+			last_report = end;
+		}
+	}
 
 	wl_list_for_each(screen, &swc.screens, link) update_screen(screen);
-
-	/* Feed screencopy clients that are waiting on damage, before it is
-	 * dropped below. */
-	screencopy_handle_damage(&compositor.damage);
 
 	/* XXX: Should assert that all damage was covered by some output */
 	pixman_region32_clear(&compositor.damage);
 	compositor.scheduled_updates &= ~updates;
 	compositor.updating = false;
+
+	if (compositor.recover_updates) {
+		uint32_t recover = compositor.recover_updates;
+
+		compositor.recover_updates = 0;
+		schedule_updates(recover);
+	}
+}
+
+static void
+bar_action(struct compositor_view *view, enum swc_titlebar_action action)
+{
+	struct window *w = view ? view->window : NULL;
+	if (w && w->handler && w->handler->titlebar_action)
+		w->handler->titlebar_action(w->handler_data, action);
+}
+
+static void
+bar_pointer_at(int32_t x, int32_t y)
+{
+	struct compositor_view *view = view_at(x, y);
+	int hit = titlebar_hit(view, x, y);
+	struct compositor_view *hover = hit != -2 ? view : NULL;
+	bool entered = hover && bar_grab.hover != hover;
+	if (bar_grab.hover && bar_grab.hover != hover)
+		titlebar_highlight(bar_grab.hover, -1, -1);
+	bar_grab.hover = hover;
+	if (hover) titlebar_highlight(hover, hit, -1);
+	/* Decorations are compositor input: never send out-of-content coordinates
+	 * or clicks to the application's wl_pointer. */
+	pointer_set_focus(swc.seat->pointer, hover ? NULL : view);
+	if (entered) bar_action(hover, SWC_TITLEBAR_FOCUS);
 }
 
 bool
@@ -1843,38 +2123,69 @@ handle_motion(struct pointer_handler *handler, uint32_t time, wl_fixed_t fx,
               wl_fixed_t fy)
 {
 	int32_t x = wl_fixed_to_int(fx), y = wl_fixed_to_int(fy);
-
-	/* If buttons are pressed, don't change pointer focus. */
-	if (swc.seat->pointer->buttons.size > 0) {
-		return false;
+	if (bar_grab.left_down) {
+		struct compositor_view *view = bar_grab.pressed;
+		if (view) {
+			if (bar_grab.button == -1 && view->window->movable &&
+			    view->window->mode == WINDOW_MODE_STACKED)
+				view_move(&view->base, x - bar_grab.offset_x, y - bar_grab.offset_y);
+			else
+				titlebar_highlight(view, view_at(x, y) == view ? titlebar_hit(view, x, y) : -1,
+				                   bar_grab.button);
+		}
+		return true;
 	}
-
-	struct compositor_view *view = view_at(x, y);
-
-	pointer_set_focus(swc.seat->pointer, view);
-
-	return false;
+	/* Preserve an application's implicit grab while any button is held. */
+	if (swc.seat->pointer->buttons.size > 0) return false;
+	bar_pointer_at(x, y);
+	return bar_grab.hover != NULL;
 }
 
 static bool
 handle_button(struct pointer_handler *handler, uint32_t time,
               struct button *button, uint32_t state)
 {
-	(void)handler;
-	(void)time;
-	(void)button;
-
+	struct pointer *pointer = swc.seat->pointer;
+	int32_t x = wl_fixed_to_int(pointer->x), y = wl_fixed_to_int(pointer->y);
 	if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
-		return false;
+		if (button->press.value == BTN_LEFT && bar_grab.left_down) {
+			struct compositor_view *view = bar_grab.pressed;
+			int hit = titlebar_hit(view, x, y);
+			int pressed = bar_grab.button;
+			bool activate = view && pressed >= 0 && hit == pressed && view_at(x, y) == view;
+			enum swc_titlebar_action action = activate ? view->decor.titlebar.buttons[pressed] : SWC_TITLEBAR_FOCUS;
+			bar_grab.left_down = false;
+			bar_grab.pressed = NULL;
+			if (view) titlebar_highlight(view, hit, -1);
+			/* Clear the grab before the action, which can hide/destroy its view. */
+			if (activate) bar_action(view, action);
+		}
+		/* The releasing button is still in the array until we return. */
+		if (pointer->buttons.size == sizeof(struct button)) bar_pointer_at(x, y);
+		return true;
 	}
-
-	int32_t x = wl_fixed_to_int(swc.seat->pointer->x);
-	int32_t y = wl_fixed_to_int(swc.seat->pointer->y);
+	if (bar_grab.left_down) return true;
+	/* A second press during a client grab must remain with that client. */
+	if (pointer->buttons.size > sizeof(struct button)) return false;
 	struct compositor_view *view = view_at(x, y);
-
-	pointer_set_focus(swc.seat->pointer, view);
-	raise_window(view);
-
+	int hit = titlebar_hit(view, x, y);
+	if (hit != -2) {
+		bar_pointer_at(x, y);
+		bar_action(view, SWC_TITLEBAR_FOCUS);
+		raise_window_from_click(view);
+		if (button->press.value == BTN_LEFT) {
+			bar_grab.left_down = true;
+			bar_grab.pressed = view;
+			bar_grab.button = hit;
+			bar_grab.offset_x = x - view->base.geometry.x;
+			bar_grab.offset_y = y - view->base.geometry.y;
+			titlebar_highlight(view, hit, hit);
+		}
+		return true;
+	}
+	bar_pointer_at(x, y);
+	layer_shell_handle_pointer_press(view);
+	raise_window_from_click(view);
 	return false;
 }
 
@@ -1906,7 +2217,12 @@ handle_swc_event(struct wl_listener *listener, void *data)
 		schedule_updates(-1);
 		break;
 	case SWC_EVENT_DEACTIVATED:
+		if (bar_grab.pressed) titlebar_highlight(bar_grab.pressed, -1, -1);
+		if (bar_grab.hover) titlebar_highlight(bar_grab.hover, -1, -1);
+		bar_grab.hover = bar_grab.pressed = NULL;
+		bar_grab.left_down = false;
 		compositor.scheduled_updates = 0;
+		compositor.recover_updates = 0;
 		break;
 	}
 }
@@ -1960,6 +2276,11 @@ bind_compositor(struct wl_client *client, void *data, uint32_t version,
 bool
 compositor_initialize(void)
 {
+	compositor_started = monotonic_us();
+	const char *render_profile = getenv("SWC_RENDER_PROFILE");
+	const char *input_profile = getenv("SWC_INPUT_PROFILE");
+	profile_render = (render_profile && !strcmp(render_profile, "1")) ||
+	                 (input_profile && !strcmp(input_profile, "1"));
 	struct screen *screen;
 	uint32_t keysym;
 
@@ -1971,6 +2292,7 @@ compositor_initialize(void)
 	}
 
 	compositor.scheduled_updates = 0;
+	compositor.recover_updates = 0;
 	compositor.pending_flips = 0;
 	compositor.updating = false;
 	compositor.zoom = 1.0f;
@@ -2007,6 +2329,9 @@ compositor_initialize(void)
 void
 compositor_finalize(void)
 {
+	wallpaper_finalize();
+	screencopy_finalize();
+	compositor_release_capture_cache();
 	compositor.initialized = false;
 
 	if (compositor.zoom_buffer) {
@@ -2029,6 +2354,57 @@ compositor_get_buffer(struct screen *screen)
 	return target->current_buffer;
 }
 
+/* Borrow the newest fully rendered output, including a submitted page flip.
+ * The main renderer has finished its writes before target_swap_buffers().
+ * Callers use it synchronously; the scanout buffer must never be modified. */
+struct wld_buffer *
+compositor_capture_buffer(struct screen *screen)
+{
+	struct target *target = target_get(screen);
+	if (!swc.active || !target) return NULL;
+	struct wld_buffer *buffer = (compositor.pending_flips & target->mask) ?
+	    target->next_buffer : target->current_buffer;
+	if (!buffer || buffer->width != screen->base.geometry.width ||
+	    buffer->height != screen->base.geometry.height) return NULL;
+	return buffer;
+}
+
+/*
+ * Buffers reused across captures.
+ *
+ * A screencast asks for a frame many times a second, and allocating a scanout
+ * buffer (with its dmabuf export, EGLImage and texture) plus an shm buffer
+ * every time costs far more than the capture itself.
+ */
+static struct {
+	struct wld_buffer *scratch, *shm;
+	uint32_t width, height;
+} capture_cache;
+
+static void
+capture_cache_reset(uint32_t width, uint32_t height)
+{
+	if (capture_cache.width == width && capture_cache.height == height)
+		return;
+
+	if (capture_cache.scratch) {
+		wld_buffer_unreference(capture_cache.scratch);
+		capture_cache.scratch = NULL;
+	}
+	if (capture_cache.shm) {
+		wld_buffer_unreference(capture_cache.shm);
+		capture_cache.shm = NULL;
+	}
+	capture_cache.width = width;
+	capture_cache.height = height;
+}
+
+void
+compositor_release_capture_cache(void)
+{
+	capture_cache_reset(0, 0);
+}
+
 struct wld_buffer *
 compositor_render_to_shm(struct screen *screen)
 {
@@ -2045,12 +2421,19 @@ compositor_render_to_shm(struct screen *screen)
 	pixman_region32_t damage;
 	uint32_t caps;
 
-	/* create shm buf */
-	buffer = wld_create_buffer(swc.shm->context, width, height,
-	                           WLD_FORMAT_ARGB8888, WLD_FLAG_MAP);
+	capture_cache_reset(width, height);
+
+	if (!capture_cache.shm) {
+		capture_cache.shm = wld_create_buffer(swc.shm->context, width, height,
+		                                      WLD_FORMAT_ARGB8888,
+		                                      WLD_FLAG_MAP);
+	}
+	buffer = capture_cache.shm;
 	if (!buffer) {
 		return NULL;
 	}
+	/* The caller drops a reference; the cache keeps its own. */
+	wld_buffer_reference(buffer);
 
 	/*
 	 * Composite with the backend renderer where we can, and read the result
@@ -2062,14 +2445,16 @@ compositor_render_to_shm(struct screen *screen)
 	 * hardware-accelerated window missing, even though they are on screen.
 	 */
 	if (swc.backend->renderer && swc.backend->context) {
-		scratch = wld_create_buffer(swc.backend->context, width, height,
-		                            WLD_FORMAT_XRGB8888, WLD_DRM_FLAG_SCANOUT);
-		if (scratch && wld_set_target_buffer(swc.backend->renderer, scratch)) {
-			renderer = swc.backend->renderer;
-		} else if (scratch) {
-			wld_buffer_unreference(scratch);
-			scratch = NULL;
+		if (!capture_cache.scratch) {
+			capture_cache.scratch = wld_create_buffer(
+			    swc.backend->context, width, height, WLD_FORMAT_XRGB8888,
+			    WLD_DRM_FLAG_SCANOUT);
 		}
+		scratch = capture_cache.scratch;
+		if (scratch && wld_set_target_buffer(swc.backend->renderer, scratch))
+			renderer = swc.backend->renderer;
+		else
+			scratch = NULL;
 	}
 
 	if (!scratch) {
@@ -2087,7 +2472,7 @@ compositor_render_to_shm(struct screen *screen)
 	                          screen->base.geometry.y, width, height);
 
 	/* background */
-	wld_fill_region(renderer, DEFAULT_BG, &region);
+	wallpaper_repaint(screen, renderer, &region);
 
 	wl_list_for_each_reverse(view, &compositor.views, link)
 	{
@@ -2128,11 +2513,11 @@ compositor_render_to_shm(struct screen *screen)
 		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
 		    view->base.buffer) {
 			pixman_region32_t view_region, view_damage, border_damage;
-			const struct swc_rectangle *geom = &view->base.geometry;
+			const struct swc_rectangle frame = frame_geometry(view);
 			const struct swc_rectangle *target_geom = &screen->base.geometry;
 
-			pixman_region32_init_rect(&view_region, geom->x, geom->y,
-			                          geom->width, geom->height);
+			pixman_region32_init_rect(&view_region, frame.x, frame.y,
+			                          frame.width, frame.height);
 			pixman_region32_init_with_extents(&view_damage, &view->extents);
 			pixman_region32_init(&border_damage);
 
@@ -2143,10 +2528,10 @@ compositor_render_to_shm(struct screen *screen)
 
 			pixman_region32_t in_rect;
 			pixman_region32_init_rect(&in_rect,
-			                          geom->x - view->border.inwidth,
-			                          geom->y - view->border.inwidth,
-			                          geom->width + (2 * view->border.inwidth),
-			                          geom->height +
+			                          frame.x - view->border.inwidth,
+			                          frame.y - view->border.inwidth,
+			                          frame.width + (2 * view->border.inwidth),
+			                          frame.height +
 			                              (2 * view->border.inwidth));
 
 			pixman_region32_t out_border;
@@ -2201,7 +2586,6 @@ compositor_render_to_shm(struct screen *screen)
 		}
 		/* wld_flush() drops the target, so this has to come after the read. */
 		wld_flush(renderer);
-		wld_buffer_unreference(scratch);
 
 		if (!ok) {
 			ERROR("Could not read back the composited screen\n");

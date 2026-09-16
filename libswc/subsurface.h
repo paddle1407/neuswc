@@ -40,6 +40,7 @@ struct subsurface {
 	struct view_handler parent_view_handler;
 	struct wl_listener surface_destroy_listener;
 	struct wl_listener parent_destroy_listener;
+	struct wl_listener parent_view_destroy_listener;
 	struct wl_list link;
 	struct wl_list pending_link;
 	struct wl_list current_link;
@@ -55,6 +56,8 @@ bool
 subsurface_is_synchronized(const struct subsurface *subsurface);
 void
 subsurface_update_visibility(struct subsurface *subsurface);
+void
+subsurface_set_parent_view(struct subsurface *subsurface, struct view *parent);
 void
 subsurface_parent_commit(struct surface *parent);
 

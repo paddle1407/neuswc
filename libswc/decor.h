@@ -23,9 +23,13 @@ void
 decor_repaint(struct wld_renderer *renderer,
               const struct swc_rectangle *target_geom,
               struct compositor_view *view, pixman_region32_t *damage);
-void
+bool
 decor_view_set(struct compositor_view *view, const struct swc_decor *decor);
 void
 decor_view_damage(struct compositor_view *view);
+
+struct swc_prepared_decor {
+	struct compositor_view *view;
+};
 
 #endif

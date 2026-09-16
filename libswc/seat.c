@@ -29,6 +29,7 @@
 #include "keyboard.h"
 #include "launch.h"
 #include "pointer.h"
+#include "relative_pointer.h"
 #include "screen.h"
 #include "surface.h"
 #include "util.h"
@@ -285,6 +286,13 @@ handle_libinput_data(int fd, uint32_t mask, void *data)
 			time = libinput_event_pointer_get_time(event.p);
 			x = wl_fixed_from_double(libinput_event_pointer_get_dx(event.p));
 			y = wl_fixed_from_double(libinput_event_pointer_get_dy(event.p));
+			relative_pointer_send_motion(
+			    &seat->pointer, libinput_event_pointer_get_time_usec(event.p),
+			    x, y,
+			    wl_fixed_from_double(
+			        libinput_event_pointer_get_dx_unaccelerated(event.p)),
+			    wl_fixed_from_double(
+			        libinput_event_pointer_get_dy_unaccelerated(event.p)));
 			pointer_handle_relative_motion(&seat->pointer, time, x, y);
 			pointer_handle_frame(&seat->pointer);
 			break;
@@ -299,7 +307,8 @@ handle_libinput_data(int fd, uint32_t mask, void *data)
 			y = wl_fixed_from_double(
 			    libinput_event_pointer_get_absolute_y_transformed(
 			        event.p, rect->height));
-			pointer_handle_absolute_motion(&seat->pointer, time, x, y);
+			pointer_handle_absolute_motion(&seat->pointer, time,
+			    x + wl_fixed_from_int(rect->x), y + wl_fixed_from_int(rect->y));
 			pointer_handle_frame(&seat->pointer);
 			break;
 		case LIBINPUT_EVENT_POINTER_BUTTON:
@@ -521,6 +530,7 @@ seat_destroy(struct swc_seat *seat_base)
 	keyboard_destroy(seat->base.keyboard);
 	data_device_destroy(seat->base.data_device);
 
+	wl_list_remove(&seat->swc_listener.link);
 	wl_global_destroy(seat->global);
 	free(seat->name);
 	free(seat);
