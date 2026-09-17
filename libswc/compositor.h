@@ -197,7 +197,10 @@ enum compositor_stack_layer {
 	STACK_LAYER_NORMAL = 2,
 	STACK_LAYER_TOP = 3,
 	STACK_LAYER_FULLSCREEN = 4,
-	STACK_LAYER_OVERLAY = 5,
+	/* Pinned windows sit above fullscreen ones, which is the point of
+	 * pinning, but below the overlay layer a lock screen uses. */
+	STACK_LAYER_PINNED = 5,
+	STACK_LAYER_OVERLAY = 6,
 };
 
 void

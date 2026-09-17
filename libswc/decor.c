@@ -721,7 +721,7 @@ decor_view_set(struct compositor_view *view, const struct swc_decor *decor)
 	parts = decor->parts;
 	text = decor->title;
 	bar = decor->titlebar;
-	if (bar.count > 3) bar.count = 3;
+	if (bar.count > 4) bar.count = 4;
 	if (text.enabled) {
 		font_name = text.font ? text.font : DEFAULT_DECOR_FONT;
 	}
@@ -738,6 +738,8 @@ decor_view_set(struct compositor_view *view, const struct swc_decor *decor)
 	    view->decor.titlebar.close_color == bar.close_color &&
 	    view->decor.titlebar.minimize_color == bar.minimize_color &&
 	    view->decor.titlebar.fullscreen_color == bar.fullscreen_color &&
+	    view->decor.titlebar.pin_color == bar.pin_color &&
+	    view->decor.titlebar.pinned == bar.pinned &&
 	    !memcmp(view->decor.titlebar.buttons, bar.buttons, sizeof(bar.buttons)) &&
 	    view->decor.text.enabled == text.enabled &&
 	    view->decor.text.edge == text.edge &&

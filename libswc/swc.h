@@ -256,6 +256,8 @@ enum swc_titlebar_action {
 	SWC_TITLEBAR_MINIMIZE,
 	SWC_TITLEBAR_FULLSCREEN,
 	SWC_TITLEBAR_CLOSE,
+	/* Toggles whether the window is kept above the others. */
+	SWC_TITLEBAR_PIN,
 };
 
 struct swc_window_handler {
@@ -361,6 +363,16 @@ swc_window_set_resizable(struct swc_window *window, bool enabled);
 /** Raise the window above other windows in the same compositor layer. */
 void
 swc_window_raise(struct swc_window *window);
+
+/**
+ * Keep the window above the others, fullscreen ones included.
+ *
+ * A pinned window sits in its own layer: raising anything else cannot cover
+ * it, and it stays pinned across mode changes. It remains below the overlay
+ * layer, so a lock screen still covers it.
+ */
+void
+swc_window_set_pinned(struct swc_window *window, bool pinned);
 
 /**
  * Request that the specified window close.
@@ -597,16 +609,18 @@ enum swc_titlebar_buttons_style {
 };
 
 /* An optional solid top bar. Buttons are ordered left to right on the chosen
- * edge; count is at most three. The top edge supplies the bar's height. */
+ * edge; count is at most four. The top edge supplies the bar's height. */
 struct swc_titlebar {
 	bool enabled;
 	uint32_t count;
-	enum swc_titlebar_action buttons[3];
+	enum swc_titlebar_action buttons[4];
 	/* Classic button backgrounds; zero derives a shade from the bar colors. */
 	uint32_t hover_color, pressed_color;
 	enum swc_titlebar_buttons_style buttons_style;
 	bool buttons_left;
-	uint32_t close_color, minimize_color, fullscreen_color;
+	uint32_t close_color, minimize_color, fullscreen_color, pin_color;
+	/* Whether this window is currently pinned, which the pin button shows. */
+	bool pinned;
 };
 
 struct swc_decor {

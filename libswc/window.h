@@ -57,6 +57,8 @@ struct window {
 	bool raise_on_click;
 	bool movable;
 	bool resizable;
+	/* Kept above other windows, fullscreen ones included. */
+	bool pinned;
 	unsigned mode;
 	/* The numbered workspace the window manager placed this window on, or
 	 * zero when it does not use numbered workspaces. swc never acts on it;

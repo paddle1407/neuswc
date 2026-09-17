@@ -106,6 +106,15 @@ button_icon(struct wld_renderer *renderer, enum swc_titlebar_action action,
 			wld_fill_rectangle(renderer, color, x + size - i - 1, y + i, 1, 1);
 		}
 		break;
+	case SWC_TITLEBAR_PIN: {
+		/* A letter P: stem, bowl top, bowl side, bowl bottom. */
+		int t = MAX(1, size / 5), w = MAX(3, size * 3 / 4), h = MAX(3, size / 2);
+		wld_fill_rectangle(renderer, color, x, y, t, size);
+		wld_fill_rectangle(renderer, color, x, y, w, t);
+		wld_fill_rectangle(renderer, color, x + w - t, y, t, h);
+		wld_fill_rectangle(renderer, color, x, y + h - t, w, t);
+		break;
+	}
 	default: break;
 	}
 }
@@ -173,7 +182,7 @@ circle_icon(struct wld_renderer *renderer, enum swc_titlebar_action action,
 		/* A compact plus keeps the green control legible at twelve pixels. */
 		wld_fill_rectangle(renderer, color, cx - 3, cy, 6, 1);
 		wld_fill_rectangle(renderer, color, cx, cy - 3, 1, 6);
-	} else if (action == SWC_TITLEBAR_CLOSE)
+	} else if (action == SWC_TITLEBAR_CLOSE || action == SWC_TITLEBAR_PIN)
 		button_icon(renderer, action, color, cx - 3, cy - 3, 6);
 }
 
@@ -248,9 +257,13 @@ paint_buffer(struct compositor_view *view, uint32_t width, uint32_t height)
 		int x = layout.button_start + i * bw;
 		bool hover = (int)i == view->decor.hover_button;
 		bool pressed = hover && (int)i == view->decor.pressed_button;
+		/* A pin that is holding shows it without being pointed at: it is
+		 * state, not a hover affordance like the other three. */
+		bool held = bar->pinned && bar->buttons[i] == SWC_TITLEBAR_PIN;
 		if (bar->buttons_style == SWC_TITLEBAR_BUTTONS_CIRCLES) {
 			uint32_t color = bar->buttons[i] == SWC_TITLEBAR_CLOSE ? bar->close_color :
 			                 bar->buttons[i] == SWC_TITLEBAR_MINIMIZE ? bar->minimize_color :
+			                 bar->buttons[i] == SWC_TITLEBAR_PIN ? bar->pin_color :
 			                 bar->fullscreen_color;
 			if (pressed) color = mix_color(color, 0xff000000, 50);
 			else if (hover) color = mix_color(color, 0xffffffff, 25);
@@ -258,13 +271,13 @@ paint_buffer(struct compositor_view *view, uint32_t width, uint32_t height)
 			int diameter = MIN(12, MIN(bw, (int)height) - 6);
 			int cx = x + (bw - diameter) / 2, cy = ((int)height - diameter) / 2;
 			circle_button(bar_renderer, cx, cy, diameter, color, view->decor.color);
-			if (hover)
+			if (hover || held)
 				circle_icon(bar_renderer, bar->buttons[i], mix_color(color, 0xff000000, 190),
 				            cx, cy, diameter);
 			continue;
 		}
 		uint32_t color = view->decor.color;
-		if (hover) {
+		if (hover || held) {
 			color = pressed ? bar->pressed_color : bar->hover_color;
 			if (!color) color = mix_color(view->decor.color, text->color, pressed ? 64 : 32);
 		}

@@ -301,6 +301,33 @@ EXPORT void swc_window_set_workspace(struct swc_window *base, uint32_t workspace
 	foreign_toplevel_window_workspace(window);
 }
 
+/* Pinning outranks the mode: a pinned window stays above a fullscreen one,
+ * and a pinned window that goes fullscreen itself stays above the rest. */
+static uint32_t
+window_stack_layer(const struct window *window)
+{
+	if (window->pinned)
+		return STACK_LAYER_PINNED;
+	return window->mode == WINDOW_MODE_FULLSCREEN ? STACK_LAYER_FULLSCREEN
+	                                              : STACK_LAYER_NORMAL;
+}
+
+EXPORT void
+swc_window_set_pinned(struct swc_window *base, bool pinned)
+{
+	struct window *window = INTERNAL(base);
+
+	if (!window || window->pinned == pinned)
+		return;
+	window->pinned = pinned;
+	/* Raise as well: pinning something buried should bring it out, and
+	 * unpinning should leave it on top of the layer it drops back into
+	 * rather than at the bottom of it. */
+	compositor_view_set_stack_layer(window->view, window_stack_layer(window),
+	                                true);
+	foreign_toplevel_window_state(window);
+}
+
 EXPORT void
 swc_window_set_stacked(struct swc_window *base)
 {
@@ -314,9 +341,10 @@ swc_window_set_stacked(struct swc_window *base)
 	if (window->impl->set_mode) {
 		window->impl->set_mode(window, WINDOW_MODE_STACKED);
 	}
-	if (window->mode == WINDOW_MODE_FULLSCREEN)
-		compositor_view_set_stack_layer(window->view, STACK_LAYER_NORMAL, true);
 	window->mode = WINDOW_MODE_STACKED;
+	if (window->view->stack_layer != window_stack_layer(window))
+		compositor_view_set_stack_layer(window->view,
+		                                window_stack_layer(window), true);
 	foreign_toplevel_window_state(window);
 }
 
@@ -330,9 +358,10 @@ swc_window_set_tiled(struct swc_window *base)
 	if (window->impl->set_mode) {
 		window->impl->set_mode(window, WINDOW_MODE_TILED);
 	}
-	if (window->mode == WINDOW_MODE_FULLSCREEN)
-		compositor_view_set_stack_layer(window->view, STACK_LAYER_NORMAL, true);
 	window->mode = WINDOW_MODE_TILED;
+	if (window->view->stack_layer != window_stack_layer(window))
+		compositor_view_set_stack_layer(window->view,
+		                                window_stack_layer(window), true);
 	foreign_toplevel_window_state(window);
 }
 
@@ -349,7 +378,8 @@ swc_window_set_fullscreen(struct swc_window *base, struct swc_screen *screen)
 	window->mode = WINDOW_MODE_FULLSCREEN;
 	/* Set the mode before sizing: fullscreen must ignore normal size hints. */
 	swc_window_set_geometry(base, &screen->geometry);
-	compositor_view_set_stack_layer(window->view, STACK_LAYER_FULLSCREEN, true);
+	compositor_view_set_stack_layer(window->view, window_stack_layer(window),
+	                                true);
 	foreign_toplevel_window_state(window);
 }
 
@@ -625,6 +655,7 @@ window_initialize(struct window *window, const struct window_impl *impl,
 	window->raise_on_click = true;
 	window->movable = true;
 	window->resizable = true;
+	window->pinned = false;
 	window->foreign_toplevel = NULL;
 	window->mode = WINDOW_MODE_STACKED;
 	window->move.pending = false;
