@@ -193,14 +193,46 @@ static struct {
 	int button;
 	int32_t offset_x, offset_y;
 	bool left_down;
+	/* The press landed on the draggable part of the bar and the window is
+	 * being moved, rather than one of its buttons being held. */
+	bool moving;
 } bar_grab;
 
 static void
-bar_forget(struct compositor_view *view)
+bar_move_notify(struct compositor_view *view, bool active)
 {
+	struct window *window = view ? view->window : NULL;
+
+	if (window && window->handler && window->handler->interactive_move)
+		window->handler->interactive_move(window->handler_data, active);
+}
+
+/*
+ * keep_drag: a window being dragged by its titlebar must survive being
+ * redecorated. Anything that re-applies a decoration mid-drag -- a title
+ * change, the window manager repainting the bar because focus moved to
+ * another monitor -- used to drop the grab here, which stranded the window
+ * halfway through the move with the button still held. A held *button* is
+ * dropped either way: the decoration that replaces it may not have that
+ * button at all.
+ */
+static void
+bar_forget(struct compositor_view *view, bool keep_drag)
+{
+	bool dragging = keep_drag && bar_grab.moving && bar_grab.pressed == view;
+	bool ended = false;
+
 	if (bar_grab.hover == view) bar_grab.hover = NULL;
-	if (bar_grab.pressed == view) bar_grab.pressed = NULL;
+	if (bar_grab.pressed == view && !dragging) {
+		ended = bar_grab.moving;
+		bar_grab.moving = false;
+		bar_grab.pressed = NULL;
+	}
 	titlebar_highlight(view, -1, -1);
+	/* Last: the window manager may hide or move windows from here, and must
+	 * not find a grab still pointing at a view it is finishing with. */
+	if (ended)
+		bar_move_notify(view, false);
 }
 
 static struct {
@@ -778,6 +810,34 @@ update_extents(struct compositor_view *view)
 	update_extents_for_buffer(view, view->base.buffer);
 }
 
+/*
+ * Borders and titlebars are painted outside the content rectangle, so a window
+ * pushed off the bottom of a screen can have nothing left on it but its
+ * titlebar. A screen mask taken from the content geometry alone is empty for
+ * such a window, and an empty mask drops it from that screen's frame entirely,
+ * decoration included: the titlebar simply stopped being drawn. The extents are
+ * what actually gets painted, so they are what decides which screens to paint.
+ */
+static void
+update_view_screens(struct compositor_view *view)
+{
+	const struct swc_rectangle extents = {
+		.x = view->extents.x1,
+		.y = view->extents.y1,
+		.width = span_u32(view->extents.x1, view->extents.x2),
+		.height = span_u32(view->extents.y1, view->extents.y2),
+	};
+	struct screen *screen;
+	uint32_t screens = 0;
+
+	wl_list_for_each(screen, &swc.screens, link) {
+		if (rectangle_overlap(&screen->base.geometry, &extents))
+			screens |= screen_mask(screen);
+	}
+
+	view_set_screens(&view->base, screens);
+}
+
 static void
 schedule_updates(uint32_t screens)
 {
@@ -1152,7 +1212,7 @@ update(struct view *base)
 	 * moved across it. Recomputing here is two rectangle tests, and
 	 * view_set_screens does nothing when the mask has not actually changed.
 	 */
-	view_update_screens(&view->base);
+	update_view_screens(view);
 	schedule_updates(view->base.screens);
 
 	return true;
@@ -1201,7 +1261,7 @@ attach(struct view *base, struct wld_buffer *buffer)
 			    old_extents.x1, old_extents.y1,
 			    span_u32(old_extents.x1, old_extents.x2), span_u32(old_extents.y1, old_extents.y2));
 			pixman_region32_clear(&view->clip);
-			view_update_screens(&view->base);
+			update_view_screens(view);
 			damage_view(view);
 			update(&view->base);
 		}
@@ -1237,7 +1297,7 @@ move(struct view *base, int32_t x, int32_t y)
 			 * case the surface gets moved again before that). */
 			pixman_region32_clear(&view->clip);
 
-			view_update_screens(&view->base);
+			update_view_screens(view);
 			damage_below_view(view);
 			update(&view->base);
 		}
@@ -1706,8 +1766,16 @@ compositor_view_restack(struct compositor_view *view,
 	damage_views(view, sibling);
 }
 
-void
-compositor_view_show(struct compositor_view *view)
+/*
+ * raise: a window being mapped for the first time belongs on top, but one that
+ * is merely coming back -- a workspace being switched to -- belongs exactly
+ * where its user left it. Raising those on the way back made the stacking
+ * order a function of the order they happen to be shown in, so whichever
+ * window was created last always won, and a window the user had deliberately
+ * raised sank again on every trip through another workspace.
+ */
+static void
+view_show(struct compositor_view *view, bool raise)
 {
 	struct compositor_view *other;
 	struct subsurface *subsurface;
@@ -1724,9 +1792,12 @@ compositor_view_show(struct compositor_view *view)
 	}
 
 	view->visible = true;
-	view_update_screens(&view->base);
+	/* The mask now follows the extents, so make sure they are not still the
+	 * zeroed ones a view that has never been painted starts with. */
+	update_extents(view);
+	update_view_screens(view);
 
-	if (view->window) {
+	if (view->window && raise) {
 		raise_window(view);
 	}
 
@@ -1739,16 +1810,28 @@ compositor_view_show(struct compositor_view *view)
 	wl_list_for_each(other, &compositor.views, link)
 	{
 		if (other->parent == view) {
-			compositor_view_show(other);
+			view_show(other, raise);
 		}
 	}
+}
+
+void
+compositor_view_show(struct compositor_view *view)
+{
+	view_show(view, true);
+}
+
+void
+compositor_view_show_in_place(struct compositor_view *view)
+{
+	view_show(view, false);
 }
 
 void
 compositor_view_hide(struct compositor_view *view)
 {
 	struct compositor_view *other;
-	bar_forget(view);
+	bar_forget(view, false);
 
 	if (!view->visible) {
 		return;
@@ -1822,7 +1905,7 @@ compositor_view_set_decor(struct compositor_view *view,
 		damage_below_view(view);
 	}
 
-	if (!decor || !decor->titlebar.enabled) bar_forget(view);
+	if (!decor || !decor->titlebar.enabled) bar_forget(view, false);
 	decor_view_set(view, decor);
 	update_extents(view);
 	update(&view->base);
@@ -1845,7 +1928,7 @@ compositor_view_apply_decor(struct compositor_view *view, struct swc_prepared_de
 {
 	if (view->visible) damage_below_view(view);
 	/* A new button order/side must not inherit an old hover or click index. */
-	bar_forget(view);
+	bar_forget(view, true);
 	struct compositor_view old = {0};
 	old.decor = view->decor;
 	view->decor = prepared->view->decor;
@@ -2126,7 +2209,11 @@ handle_motion(struct pointer_handler *handler, uint32_t time, wl_fixed_t fx,
 	if (bar_grab.left_down) {
 		struct compositor_view *view = bar_grab.pressed;
 		if (view) {
-			if (bar_grab.button == -1 && view->window->movable &&
+			/* Re-checked per motion: a client can go maximized or
+			 * fullscreen with the button still down, and a tiled window is
+			 * not ours to place. */
+			if (bar_grab.moving && view->window &&
+			    view->window->movable &&
 			    view->window->mode == WINDOW_MODE_STACKED)
 				view_move(&view->base, x - bar_grab.offset_x, y - bar_grab.offset_y);
 			else
@@ -2154,11 +2241,16 @@ handle_button(struct pointer_handler *handler, uint32_t time,
 			int pressed = bar_grab.button;
 			bool activate = view && pressed >= 0 && hit == pressed && view_at(x, y) == view;
 			enum swc_titlebar_action action = activate ? view->decor.titlebar.buttons[pressed] : SWC_TITLEBAR_FOCUS;
+			struct compositor_view *moved = bar_grab.moving ? view : NULL;
 			bar_grab.left_down = false;
+			bar_grab.moving = false;
 			bar_grab.pressed = NULL;
 			if (view) titlebar_highlight(view, hit, -1);
 			/* Clear the grab before the action, which can hide/destroy its view. */
 			if (activate) bar_action(view, action);
+			/* A button press is never a drag, so the view a finished move
+			 * reports back is one no action has just closed. */
+			if (moved) bar_move_notify(moved, false);
 		}
 		/* The releasing button is still in the array until we return. */
 		if (pointer->buttons.size == sizeof(struct button)) bar_pointer_at(x, y);
@@ -2179,7 +2271,11 @@ handle_button(struct pointer_handler *handler, uint32_t time,
 			bar_grab.button = hit;
 			bar_grab.offset_x = x - view->base.geometry.x;
 			bar_grab.offset_y = y - view->base.geometry.y;
+			bar_grab.moving = hit == -1 && view->window &&
+			                  view->window->movable &&
+			                  view->window->mode == WINDOW_MODE_STACKED;
 			titlebar_highlight(view, hit, hit);
+			if (bar_grab.moving) bar_move_notify(view, true);
 		}
 		return true;
 	}
@@ -2216,14 +2312,20 @@ handle_swc_event(struct wl_listener *listener, void *data)
 	case SWC_EVENT_ACTIVATED:
 		schedule_updates(-1);
 		break;
-	case SWC_EVENT_DEACTIVATED:
+	case SWC_EVENT_DEACTIVATED: {
+		struct compositor_view *moved = bar_grab.moving ? bar_grab.pressed : NULL;
+
 		if (bar_grab.pressed) titlebar_highlight(bar_grab.pressed, -1, -1);
 		if (bar_grab.hover) titlebar_highlight(bar_grab.hover, -1, -1);
 		bar_grab.hover = bar_grab.pressed = NULL;
 		bar_grab.left_down = false;
+		bar_grab.moving = false;
 		compositor.scheduled_updates = 0;
 		compositor.recover_updates = 0;
+		/* Switching away mid-drag drops the button, so the move is over. */
+		if (moved) bar_move_notify(moved, false);
 		break;
+	}
 	}
 }
 

@@ -244,6 +244,12 @@ swc_window_show(struct swc_window *window)
 }
 
 EXPORT void
+swc_window_show_in_place(struct swc_window *window)
+{
+	compositor_view_show_in_place(INTERNAL(window)->view);
+}
+
+EXPORT void
 swc_window_hide(struct swc_window *window)
 {
 	compositor_view_hide(INTERNAL(window)->view);

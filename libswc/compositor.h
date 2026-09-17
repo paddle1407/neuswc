@@ -146,6 +146,12 @@ compositor_view_restack(struct compositor_view *view,
 
 void
 compositor_view_show(struct compositor_view *view);
+
+/* Show without touching the stacking order, for a view that is coming back
+ * rather than appearing for the first time. */
+void
+compositor_view_show_in_place(struct compositor_view *view);
+
 void
 compositor_view_hide(struct compositor_view *view);
 

@@ -310,6 +310,15 @@ struct swc_window_handler {
 	/* A compositor-owned titlebar was clicked. */
 	void (*titlebar_action)(void *data, enum swc_titlebar_action action);
 
+	/*
+	 * An interactive move the compositor drives itself -- dragging a
+	 * compositor-owned titlebar -- began or ended. The window's position is
+	 * only final once it has ended, and the window manager is free to hold off
+	 * anything that would fight the drag, such as following the pointer onto
+	 * another monitor, until then.
+	 */
+	void (*interactive_move)(void *data, bool active);
+
 	/* Requests from desktop taskbars and docks. */
 	void (*request_activate)(void *data);
 	void (*request_minimized)(void *data, bool minimized);
@@ -364,6 +373,16 @@ swc_window_close(struct swc_window *window);
  */
 void
 swc_window_show(struct swc_window *window);
+
+/**
+ * Make the specified window visible without changing the stacking order.
+ *
+ * swc_window_show() raises the window, which is what a window being mapped
+ * wants. A window that is merely coming back into view -- the workspace it is
+ * on was switched to -- keeps the position in the stack it had when it left.
+ */
+void
+swc_window_show_in_place(struct swc_window *window);
 
 /**
  * Make the specified window hidden.
