@@ -495,6 +495,24 @@ void
 swc_window_set_tiled(struct swc_window *window);
 
 /**
+ * Tell a tiled window which of its edges it is tiled against.
+ *
+ * `edges` is a set of SWC_WINDOW_EDGE_* bits naming the sides where the window
+ * meets another window rather than the edge of the screen. A client is sent
+ * the matching xdg-shell tiled states, which is how it knows to square off
+ * those corners and drop the shadow it would otherwise draw outside its tile.
+ *
+ * Passing no edges -- a single window filling its workspace -- tells the
+ * client it is maximized instead, which is the nearest true thing and the only
+ * one a client older than xdg-shell version 2 understands.
+ *
+ * Has no visible effect until the window is in tiled mode, but is remembered,
+ * so it may be set in either order.
+ */
+void
+swc_window_set_tiled_edges(struct swc_window *window, uint32_t edges);
+
+/**
  * Sets the window to fullscreen mode.
  */
 void
@@ -795,6 +813,27 @@ bool swc_binding_batch_add(struct swc_binding_batch *, enum swc_binding_type,
                            uint32_t modifiers, uint32_t value, swc_binding_handler, void *);
 void swc_binding_batch_commit(struct swc_binding_batch *);
 void swc_binding_batch_discard(struct swc_binding_batch *);
+
+/**
+ * Follow the pointer for as long as a mouse binding is held.
+ *
+ * This is for a window manager driving something of its own from a drag --
+ * a tiling fence, a placement indicator -- where swc's own interactive move
+ * and resize do not apply, because the window's size is not the window's to
+ * choose. Motion is reported in compositor-global coordinates in the same
+ * 24.8 fixed point swc_cursor_position() uses, and is not passed on to clients
+ * while the grab is held.
+ *
+ * The grab is started from a button binding's press and ended from its
+ * release, which the binding still receives. Starting one while another is
+ * held replaces it. Returns false if there is no pointer to grab.
+ */
+typedef void (*swc_pointer_motion_handler)(void *data, uint32_t time,
+                                           int32_t x, int32_t y);
+bool
+swc_pointer_grab_begin(swc_pointer_motion_handler handler, void *data);
+void
+swc_pointer_grab_end(void);
 
 /**
  * register a new pointer axis binding

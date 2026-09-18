@@ -398,6 +398,20 @@ swc_window_set_tiled(struct swc_window *base)
 }
 
 EXPORT void
+swc_window_set_tiled_edges(struct swc_window *base, uint32_t edges)
+{
+	struct window *window = INTERNAL(base);
+
+	if (!window || window->tiled_edges == edges) {
+		return;
+	}
+	window->tiled_edges = edges;
+	if (window->mode == WINDOW_MODE_TILED && window->impl->set_tiled_edges) {
+		window->impl->set_tiled_edges(window, edges);
+	}
+}
+
+EXPORT void
 swc_window_set_fullscreen(struct swc_window *base, struct swc_screen *screen)
 {
 	struct window *window = INTERNAL(base);

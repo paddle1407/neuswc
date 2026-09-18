@@ -506,6 +506,62 @@ close_(struct window *window)
 	xdg_toplevel_send_close(toplevel->resource);
 }
 
+/*
+ * The tiled states, from the window manager's SWC_WINDOW_EDGE_* bits.
+ *
+ * A window whose size the window manager owns is told so with the four tiled
+ * states rather than with "maximized": a client that believes it is maximized
+ * offers to restore itself and, more visibly, a client drawing its own frame
+ * keeps its rounded corners and its drop shadow, which inside a tile looks
+ * like a mistake. The tiled states say which edges it is up against, and a
+ * client squares off exactly those. They arrived in version 2, so a client
+ * older than that falls back to being told it is maximized.
+ *
+ * With no edges named at all -- a lone window filling its workspace -- there
+ * is nothing to square off against, and maximized is both true and the only
+ * thing such a client would understand.
+ */
+static bool
+set_tiled_states(struct xdg_toplevel *toplevel, uint32_t edges)
+{
+	static const struct {
+		uint32_t edge, state;
+	} map[] = {
+		{ SWC_WINDOW_EDGE_LEFT, XDG_TOPLEVEL_STATE_TILED_LEFT },
+		{ SWC_WINDOW_EDGE_RIGHT, XDG_TOPLEVEL_STATE_TILED_RIGHT },
+		{ SWC_WINDOW_EDGE_TOP, XDG_TOPLEVEL_STATE_TILED_TOP },
+		{ SWC_WINDOW_EDGE_BOTTOM, XDG_TOPLEVEL_STATE_TILED_BOTTOM },
+	};
+	bool tiled = edges && wl_resource_get_version(toplevel->resource) >=
+	                          XDG_TOPLEVEL_STATE_TILED_LEFT_SINCE_VERSION;
+	bool changed = false;
+
+	for (unsigned i = 0; i < ARRAY_LENGTH(map); ++i) {
+		if (tiled && (edges & map[i].edge)) {
+			changed |= add_state(toplevel, map[i].state);
+		} else {
+			changed |= remove_state(toplevel, map[i].state);
+		}
+	}
+	/* Maximized stays for the clients that cannot be told anything else. */
+	if (tiled) {
+		changed |= remove_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	} else {
+		changed |= add_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	}
+	return changed;
+}
+
+static void
+clear_tiled_states(struct xdg_toplevel *toplevel)
+{
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_LEFT);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_RIGHT);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_TOP);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_BOTTOM);
+}
+
 static void
 set_mode(struct window *window, unsigned mode)
 {
@@ -513,7 +569,7 @@ set_mode(struct window *window, unsigned mode)
 
 	switch (window->mode) {
 	case WINDOW_MODE_TILED:
-		remove_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+		clear_tiled_states(toplevel);
 		break;
 	case WINDOW_MODE_FULLSCREEN:
 		remove_state(toplevel, XDG_TOPLEVEL_STATE_FULLSCREEN);
@@ -522,7 +578,7 @@ set_mode(struct window *window, unsigned mode)
 
 	switch (mode) {
 	case WINDOW_MODE_TILED:
-		add_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+		set_tiled_states(toplevel, window->tiled_edges);
 		break;
 	case WINDOW_MODE_FULLSCREEN:
 		add_state(toplevel, XDG_TOPLEVEL_STATE_FULLSCREEN);
@@ -534,12 +590,34 @@ set_mode(struct window *window, unsigned mode)
 	queue_configure(toplevel);
 }
 
+/*
+ * A tiled window's edges changed without its mode changing.
+ *
+ * Unlike set_mode this leaves the pending acknowledgement alone: the window is
+ * already tiled and only the states are being corrected, so there is no reason
+ * to throw away a configure the window manager is waiting on.
+ */
+static void
+set_tiled_edges(struct window *window, uint32_t edges)
+{
+	struct xdg_toplevel *toplevel = wl_container_of(window, toplevel, window);
+
+	if (window->mode != WINDOW_MODE_TILED) {
+		return;
+	}
+	if (set_tiled_states(toplevel, edges)) {
+		++toplevel->generation;
+		queue_configure(toplevel);
+	}
+}
+
 static const struct window_impl toplevel_window_impl = {
     .configure = configure,
     .focus = focus,
     .unfocus = unfocus,
     .close = close_,
     .set_mode = set_mode,
+    .set_tiled_edges = set_tiled_edges,
 };
 
 static void
