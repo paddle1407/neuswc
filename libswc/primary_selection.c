@@ -24,6 +24,7 @@
 #include "primary_selection.h"
 #include "event.h"
 #include "internal.h"
+#include "keyboard.h"
 #include "seat.h"
 #include "util.h"
 
@@ -306,11 +307,22 @@ get_device(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 	                               &remove_resource);
 	wl_list_insert(&device->resources, wl_resource_get_link(device_resource));
 
-	/* A client binding after a selection was already set still needs it.
-	 * Only send when one exists: an unsolicited selection(nil) arrives while
-	 * Qt is still inside QWaylandDisplay::initialize(), where its handler
-	 * dereferences a not-yet-assigned platform integration and crashes. */
-	if (device->selection) {
+	/* A client binding after a selection was already set still needs it, but
+	 * not here. Toolkits create this device from inside the registry handler
+	 * they run while opening the display, before the state their offer
+	 * handler reaches for exists: Qt is still in QWaylandDisplay::initialize()
+	 * and dereferences a not-yet-assigned platform integration, and GTK
+	 * 3.24.33 faults in libgdk inside gtk_init_check(). Withholding only an
+	 * empty selection is not enough -- a real one crashes the same clients at
+	 * the same point.
+	 *
+	 * So send only to a client that already holds the keyboard focus, which
+	 * it cannot do before mapping a surface, and so cannot do while it is
+	 * still initializing. Every other client is offered the selection when
+	 * focus reaches it, from handle_keyboard_focus_event() in seat.c -- the
+	 * same moment wl_data_device hands over the clipboard, which is why
+	 * get_data_device() needs no such dance. */
+	if (device->selection && seat->keyboard->focus.client == client) {
 		primary_selection_device_offer(device, client);
 	}
 }
