@@ -96,6 +96,10 @@ struct window {
 		bool pending, acknowledged;
 		uint32_t width, height;
 	} configure;
+
+	/* The edges a tiled window is tiled against, as SWC_WINDOW_EDGE_* bits.
+	 * Only meaningful in WINDOW_MODE_TILED. */
+	uint32_t tiled_edges;
 };
 
 struct window_impl {
@@ -105,6 +109,9 @@ struct window_impl {
 	void (*unfocus)(struct window *window);
 	void (*close)(struct window *window);
 	void (*set_mode)(struct window *window, enum window_mode mode);
+	/* Optional: the edges a tiled window is tiled against have changed,
+	 * without the mode itself changing. */
+	void (*set_tiled_edges)(struct window *window, uint32_t edges);
 };
 
 extern struct wl_listener window_enter_listener;

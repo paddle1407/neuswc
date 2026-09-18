@@ -235,7 +235,7 @@ static const struct xdg_positioner_interface positioner_impl = {
 };
 
 static struct swc_rectangle
-calculate_position(struct xdg_positioner *positioner)
+unadjusted_position(const struct xdg_positioner *positioner)
 {
 	/*
 	 * Every input here is a client-controlled int32. Accumulating in int64
@@ -307,6 +307,274 @@ calculate_position(struct xdg_positioner *positioner)
 	    .y = (int32_t)MIN(MAX(y, (int64_t)INT32_MIN), (int64_t)INT32_MAX),
 	    .width = positioner->width,
 	    .height = positioner->height,
+	};
+}
+
+/*
+ * Flipping is per axis: the anchor and the gravity both move to the opposite
+ * side and everything else in the positioner is left alone, so the popup ends
+ * up mirrored about the anchor rectangle.
+ */
+static enum xdg_positioner_anchor
+anchor_flip_x(enum xdg_positioner_anchor anchor)
+{
+	switch (anchor) {
+	case XDG_POSITIONER_ANCHOR_LEFT:
+		return XDG_POSITIONER_ANCHOR_RIGHT;
+	case XDG_POSITIONER_ANCHOR_RIGHT:
+		return XDG_POSITIONER_ANCHOR_LEFT;
+	case XDG_POSITIONER_ANCHOR_TOP_LEFT:
+		return XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+	case XDG_POSITIONER_ANCHOR_TOP_RIGHT:
+		return XDG_POSITIONER_ANCHOR_TOP_LEFT;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT:
+		return XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+		return XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+	default:
+		return anchor;
+	}
+}
+
+static enum xdg_positioner_anchor
+anchor_flip_y(enum xdg_positioner_anchor anchor)
+{
+	switch (anchor) {
+	case XDG_POSITIONER_ANCHOR_TOP:
+		return XDG_POSITIONER_ANCHOR_BOTTOM;
+	case XDG_POSITIONER_ANCHOR_BOTTOM:
+		return XDG_POSITIONER_ANCHOR_TOP;
+	case XDG_POSITIONER_ANCHOR_TOP_LEFT:
+		return XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_LEFT:
+		return XDG_POSITIONER_ANCHOR_TOP_LEFT;
+	case XDG_POSITIONER_ANCHOR_TOP_RIGHT:
+		return XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+	case XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT:
+		return XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+	default:
+		return anchor;
+	}
+}
+
+static enum xdg_positioner_gravity
+gravity_flip_x(enum xdg_positioner_gravity gravity)
+{
+	switch (gravity) {
+	case XDG_POSITIONER_GRAVITY_LEFT:
+		return XDG_POSITIONER_GRAVITY_RIGHT;
+	case XDG_POSITIONER_GRAVITY_RIGHT:
+		return XDG_POSITIONER_GRAVITY_LEFT;
+	case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+		return XDG_POSITIONER_GRAVITY_TOP_RIGHT;
+	case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+		return XDG_POSITIONER_GRAVITY_TOP_LEFT;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+		return XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
+		return XDG_POSITIONER_GRAVITY_BOTTOM_LEFT;
+	default:
+		return gravity;
+	}
+}
+
+static enum xdg_positioner_gravity
+gravity_flip_y(enum xdg_positioner_gravity gravity)
+{
+	switch (gravity) {
+	case XDG_POSITIONER_GRAVITY_TOP:
+		return XDG_POSITIONER_GRAVITY_BOTTOM;
+	case XDG_POSITIONER_GRAVITY_BOTTOM:
+		return XDG_POSITIONER_GRAVITY_TOP;
+	case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+		return XDG_POSITIONER_GRAVITY_BOTTOM_LEFT;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+		return XDG_POSITIONER_GRAVITY_TOP_LEFT;
+	case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+		return XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+	case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
+		return XDG_POSITIONER_GRAVITY_TOP_RIGHT;
+	default:
+		return gravity;
+	}
+}
+
+static int32_t
+clamp_i32(int64_t value)
+{
+	return (int32_t)MIN(MAX(value, (int64_t)INT32_MIN), (int64_t)INT32_MAX);
+}
+
+/*
+ * The area the popup has to fit inside: the usable part of the screen it is
+ * opening on. That is the screen under the middle of the anchor rectangle --
+ * the point the menu is being pulled out of -- falling back to a screen the
+ * parent is on, and finally to any screen at all. A window straddling two
+ * monitors would otherwise have its menus constrained to the wrong one.
+ */
+static bool
+constraint_box(const struct xdg_positioner *positioner,
+               struct compositor_view *parent, struct swc_rectangle *box)
+{
+	struct screen *screen, *found = NULL;
+	int32_t x, y;
+
+	x = clamp_i32((int64_t)parent->base.geometry.x + positioner->anchor_x
+	              + positioner->anchor_width / 2);
+	y = clamp_i32((int64_t)parent->base.geometry.y + positioner->anchor_y
+	              + positioner->anchor_height / 2);
+
+	wl_list_for_each(screen, &swc.screens, link) {
+		if (rectangle_contains_point(&screen->base.geometry, x, y)) {
+			found = screen;
+			break;
+		}
+	}
+	if (!found) {
+		wl_list_for_each(screen, &swc.screens, link) {
+			if (parent->base.screens & screen_mask(screen)) {
+				found = screen;
+				break;
+			}
+		}
+	}
+	if (!found && !wl_list_empty(&swc.screens))
+		found = wl_container_of(swc.screens.next, found, link);
+	if (!found)
+		return false;
+
+	*box = found->base.usable_geometry;
+	/* Before a panel has reported its exclusive zone there is nothing here. */
+	if (box->width == 0 || box->height == 0)
+		*box = found->base.geometry;
+
+	return box->width > 0 && box->height > 0;
+}
+
+static bool
+fits(int64_t position, int64_t size, int64_t min, int64_t max)
+{
+	return position >= min && position + size <= max;
+}
+
+/*
+ * Anchor and gravity say where the client would like the popup; they say
+ * nothing about the screen it has to land on, so a menu opened near an edge is
+ * placed partly outside it, where it can be neither seen nor clicked. What the
+ * client will accept instead is in set_constraint_adjustment, and xdg-shell
+ * applies those per axis in a fixed order: flip to the other side of the
+ * anchor, slide along the edge, then shrink.
+ *
+ * The returned rectangle stays in the parent's window-geometry coordinates,
+ * which is what xdg_popup.configure reports.
+ */
+static struct swc_rectangle
+calculate_position(const struct xdg_positioner *positioner,
+                   struct compositor_view *parent)
+{
+	struct swc_rectangle rect = unadjusted_position(positioner);
+	struct xdg_positioner flipped;
+	struct swc_rectangle box;
+	int64_t px, py, x, y, w, h, min, max, candidate;
+
+	if (!parent || rect.width == 0 || rect.height == 0
+	    || !constraint_box(positioner, parent, &box)) {
+		return rect;
+	}
+
+	px = parent->base.geometry.x;
+	py = parent->base.geometry.y;
+	x = px + rect.x;
+	y = py + rect.y;
+	w = rect.width;
+	h = rect.height;
+
+	min = box.x;
+	max = (int64_t)box.x + box.width;
+	if (!fits(x, w, min, max)
+	    && (positioner->constraint
+	        & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X)) {
+		flipped = *positioner;
+		flipped.anchor = anchor_flip_x(positioner->anchor);
+		flipped.gravity = gravity_flip_x(positioner->gravity);
+		candidate = px + unadjusted_position(&flipped).x;
+		/* A flip that is constrained too is no improvement; the protocol
+		 * says to keep the original in that case. */
+		if (fits(candidate, w, min, max))
+			x = candidate;
+	}
+	if (!fits(x, w, min, max)
+	    && (positioner->constraint
+	        & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X)) {
+		if (x + w > max)
+			x = max - w;
+		if (x < min)
+			x = min;
+	}
+	if (!fits(x, w, min, max)
+	    && (positioner->constraint
+	        & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X)) {
+		if (x < min) {
+			w -= min - x;
+			x = min;
+		}
+		if (x + w > max)
+			w = max - x;
+		if (w < 1)
+			w = 1;
+	}
+	/*
+	 * Whatever the client allowed, a popup off the edge of every screen is
+	 * one the user cannot reach, so the last step is to slide it back on
+	 * regardless. A popup wider than the screen keeps its left edge visible.
+	 */
+	if (x + w > max)
+		x = max - w;
+	if (x < min)
+		x = min;
+
+	min = box.y;
+	max = (int64_t)box.y + box.height;
+	if (!fits(y, h, min, max)
+	    && (positioner->constraint
+	        & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y)) {
+		flipped = *positioner;
+		flipped.anchor = anchor_flip_y(positioner->anchor);
+		flipped.gravity = gravity_flip_y(positioner->gravity);
+		candidate = py + unadjusted_position(&flipped).y;
+		if (fits(candidate, h, min, max))
+			y = candidate;
+	}
+	if (!fits(y, h, min, max)
+	    && (positioner->constraint
+	        & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y)) {
+		if (y + h > max)
+			y = max - h;
+		if (y < min)
+			y = min;
+	}
+	if (!fits(y, h, min, max)
+	    && (positioner->constraint
+	        & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y)) {
+		if (y < min) {
+			h -= min - y;
+			y = min;
+		}
+		if (y + h > max)
+			h = max - y;
+		if (h < 1)
+			h = 1;
+	}
+	if (y + h > max)
+		y = max - h;
+	if (y < min)
+		y = min;
+
+	return (struct swc_rectangle){
+	    .x = clamp_i32(x - px),
+	    .y = clamp_i32(y - py),
+	    .width = (uint32_t)w,
+	    .height = (uint32_t)h,
 	};
 }
 
@@ -506,6 +774,62 @@ close_(struct window *window)
 	xdg_toplevel_send_close(toplevel->resource);
 }
 
+/*
+ * The tiled states, from the window manager's SWC_WINDOW_EDGE_* bits.
+ *
+ * A window whose size the window manager owns is told so with the four tiled
+ * states rather than with "maximized": a client that believes it is maximized
+ * offers to restore itself and, more visibly, a client drawing its own frame
+ * keeps its rounded corners and its drop shadow, which inside a tile looks
+ * like a mistake. The tiled states say which edges it is up against, and a
+ * client squares off exactly those. They arrived in version 2, so a client
+ * older than that falls back to being told it is maximized.
+ *
+ * With no edges named at all -- a lone window filling its workspace -- there
+ * is nothing to square off against, and maximized is both true and the only
+ * thing such a client would understand.
+ */
+static bool
+set_tiled_states(struct xdg_toplevel *toplevel, uint32_t edges)
+{
+	static const struct {
+		uint32_t edge, state;
+	} map[] = {
+		{ SWC_WINDOW_EDGE_LEFT, XDG_TOPLEVEL_STATE_TILED_LEFT },
+		{ SWC_WINDOW_EDGE_RIGHT, XDG_TOPLEVEL_STATE_TILED_RIGHT },
+		{ SWC_WINDOW_EDGE_TOP, XDG_TOPLEVEL_STATE_TILED_TOP },
+		{ SWC_WINDOW_EDGE_BOTTOM, XDG_TOPLEVEL_STATE_TILED_BOTTOM },
+	};
+	bool tiled = edges && wl_resource_get_version(toplevel->resource) >=
+	                          XDG_TOPLEVEL_STATE_TILED_LEFT_SINCE_VERSION;
+	bool changed = false;
+
+	for (unsigned i = 0; i < ARRAY_LENGTH(map); ++i) {
+		if (tiled && (edges & map[i].edge)) {
+			changed |= add_state(toplevel, map[i].state);
+		} else {
+			changed |= remove_state(toplevel, map[i].state);
+		}
+	}
+	/* Maximized stays for the clients that cannot be told anything else. */
+	if (tiled) {
+		changed |= remove_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	} else {
+		changed |= add_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	}
+	return changed;
+}
+
+static void
+clear_tiled_states(struct xdg_toplevel *toplevel)
+{
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_LEFT);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_RIGHT);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_TOP);
+	remove_state(toplevel, XDG_TOPLEVEL_STATE_TILED_BOTTOM);
+}
+
 static void
 set_mode(struct window *window, unsigned mode)
 {
@@ -513,7 +837,7 @@ set_mode(struct window *window, unsigned mode)
 
 	switch (window->mode) {
 	case WINDOW_MODE_TILED:
-		remove_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+		clear_tiled_states(toplevel);
 		break;
 	case WINDOW_MODE_FULLSCREEN:
 		remove_state(toplevel, XDG_TOPLEVEL_STATE_FULLSCREEN);
@@ -522,7 +846,7 @@ set_mode(struct window *window, unsigned mode)
 
 	switch (mode) {
 	case WINDOW_MODE_TILED:
-		add_state(toplevel, XDG_TOPLEVEL_STATE_MAXIMIZED);
+		set_tiled_states(toplevel, window->tiled_edges);
 		break;
 	case WINDOW_MODE_FULLSCREEN:
 		add_state(toplevel, XDG_TOPLEVEL_STATE_FULLSCREEN);
@@ -534,12 +858,34 @@ set_mode(struct window *window, unsigned mode)
 	queue_configure(toplevel);
 }
 
+/*
+ * A tiled window's edges changed without its mode changing.
+ *
+ * Unlike set_mode this leaves the pending acknowledgement alone: the window is
+ * already tiled and only the states are being corrected, so there is no reason
+ * to throw away a configure the window manager is waiting on.
+ */
+static void
+set_tiled_edges(struct window *window, uint32_t edges)
+{
+	struct xdg_toplevel *toplevel = wl_container_of(window, toplevel, window);
+
+	if (window->mode != WINDOW_MODE_TILED) {
+		return;
+	}
+	if (set_tiled_states(toplevel, edges)) {
+		++toplevel->generation;
+		queue_configure(toplevel);
+	}
+}
+
 static const struct window_impl toplevel_window_impl = {
     .configure = configure,
     .focus = focus,
     .unfocus = unfocus,
     .close = close_,
     .set_mode = set_mode,
+    .set_tiled_edges = set_tiled_edges,
 };
 
 static void
@@ -855,7 +1201,7 @@ reposition(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	rect = calculate_position(&popup->positioner);
+	rect = calculate_position(&popup->positioner, popup->parent);
 	view_move(&popup->view->base, popup->parent->base.geometry.x + rect.x,
 	          popup->parent->base.geometry.y + rect.y);
 
@@ -896,7 +1242,7 @@ xdg_popup_set_parent(struct wl_resource *popup_resource,
 	popup->parent_destroy_listener.notify = handle_popup_parent_destroy;
 	wl_signal_add(&parent->destroy_signal, &popup->parent_destroy_listener);
 
-	rect = calculate_position(&popup->positioner);
+	rect = calculate_position(&popup->positioner, parent);
 	popup->view->always_top = parent->always_top;
 	compositor_view_set_stack_layer(popup->view, parent->stack_layer, true);
 	view_move(&popup->view->base, parent->base.geometry.x + rect.x,

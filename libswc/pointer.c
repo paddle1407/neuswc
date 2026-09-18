@@ -85,6 +85,74 @@ static struct {
 	bool active;
 } cursor_images[SWC_CURSOR_KIND_COUNT];
 
+/*
+ * A pointer grab the window manager owns.
+ *
+ * swc's own interactive move and resize are for windows whose size is theirs
+ * to choose. A tiled window's is not: dragging the fence between two of them
+ * resizes both, and only the window manager knows which two. So it gets the
+ * motion and decides, and while it is holding the pointer the clients under it
+ * hear nothing -- the same arrangement the built-in interactions already use,
+ * exposed.
+ *
+ * The release is left alone: the binding that started the grab still gets it,
+ * and ending the grab there is both simpler and one fewer thing to keep in
+ * step.
+ */
+static struct pointer_handler wm_grab_handler;
+static swc_pointer_motion_handler wm_grab_motion;
+static void *wm_grab_data;
+static bool wm_grab_active;
+
+static bool
+handle_wm_grab_motion(struct pointer_handler *handler, uint32_t time,
+                      wl_fixed_t fx, wl_fixed_t fy)
+{
+	if (!wm_grab_active) {
+		return false;
+	}
+	if (wm_grab_motion) {
+		wm_grab_motion(wm_grab_data, time, fx, fy);
+	}
+	return true;
+}
+
+EXPORT bool
+swc_pointer_grab_begin(swc_pointer_motion_handler handler, void *data)
+{
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+
+	if (!pointer || !handler) {
+		return false;
+	}
+	/* The handler node lives in the pointer's list once; starting a second
+	 * grab replaces the first rather than inserting it again. */
+	if (!wm_grab_active) {
+		wm_grab_handler.motion = handle_wm_grab_motion;
+		wm_grab_handler.button = NULL;
+		wm_grab_handler.axis = NULL;
+		wm_grab_handler.frame = NULL;
+		wm_grab_handler.pending = 0;
+		wl_list_insert(&pointer->handlers, &wm_grab_handler.link);
+		wm_grab_active = true;
+	}
+	wm_grab_motion = handler;
+	wm_grab_data = data;
+	return true;
+}
+
+EXPORT void
+swc_pointer_grab_end(void)
+{
+	if (!wm_grab_active) {
+		return;
+	}
+	wl_list_remove(&wm_grab_handler.link);
+	wm_grab_active = false;
+	wm_grab_motion = NULL;
+	wm_grab_data = NULL;
+}
+
 EXPORT void
 swc_pointer_send_button(uint32_t time, uint32_t button, uint32_t state)
 {
@@ -747,6 +815,8 @@ pointer_initialize(struct pointer *pointer)
 void
 pointer_finalize(struct pointer *pointer)
 {
+	/* The grab's handler node is linked into a list that is about to go. */
+	swc_pointer_grab_end();
 	wl_event_source_remove(pointer->cursor.frame_timer);
 	for (size_t i = 0; i < ARRAY_LENGTH(cursor_images); ++i) {
 		if (cursor_images[i].buffer) wld_buffer_unreference(cursor_images[i].buffer);
