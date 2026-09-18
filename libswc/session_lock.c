@@ -630,6 +630,9 @@ session_lock_finish(void)
 	    wl_resource_destroy(surface->resource);
 	clear_saved_focus();
 	lock.locked = false;
-	lock.resource = NULL;
+	if (lock.resource) {
+		wl_resource_destroy(lock.resource);
+		lock.resource = NULL;
+	}
 	initialized = false;
 }

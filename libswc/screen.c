@@ -224,6 +224,10 @@ void
 screen_destroy(struct screen *screen)
 {
 	struct output *output, *next;
+
+	/* Out of the list first: a later screen's destroy handlers walk
+	 * swc.screens, and this one is about to be freed. */
+	wl_list_remove(&screen->link);
 	wallpaper_screen_finish(screen);
 	workspace_screen_removed(screen);
 

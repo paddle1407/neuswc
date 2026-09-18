@@ -340,7 +340,7 @@ constraint_new(struct wl_client *client, struct wl_resource *resource,
 
 	if (lifetime != ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT &&
 	    lifetime != ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT) {
-		wl_resource_post_error(wl_client_get_object(client, 1), WL_DISPLAY_ERROR_INVALID_METHOD,
+		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_METHOD,
 		                       "invalid pointer constraint lifetime");
 		return;
 	}

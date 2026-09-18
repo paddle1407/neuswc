@@ -261,7 +261,7 @@ static void request_fullscreen(struct foreign_handle *handle, bool enabled,
 		return;
 	if (output_resource) {
 		struct output *output = wl_resource_get_user_data(output_resource);
-		if (output)
+		if (output && output->screen)
 			screen = &output->screen->base;
 	}
 	handle->toplevel->window->handler->request_fullscreen(
