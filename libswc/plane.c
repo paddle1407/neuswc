@@ -152,11 +152,14 @@ plane_new(uint32_t id)
 	drmModeFreePlane(drm_plane);
 	plane->type = -1;
 	props = drmModeObjectGetProperties(swc.drm->fd, id, DRM_MODE_OBJECT_PLANE);
-	for (i = 0; i < props->count_props; ++i, drmModeFreeProperty(prop)) {
-		prop = drmModeGetProperty(swc.drm->fd, props->props[i]);
-		if (prop && find_prop(prop->name) == PLANE_TYPE) {
-			plane->type = props->prop_values[i];
+	if (props) {
+		for (i = 0; i < props->count_props; ++i, drmModeFreeProperty(prop)) {
+			prop = drmModeGetProperty(swc.drm->fd, props->props[i]);
+			if (prop && find_prop(prop->name) == PLANE_TYPE) {
+				plane->type = props->prop_values[i];
+			}
 		}
+		drmModeFreeObjectProperties(props);
 	}
 	plane->swc_listener.notify = &handle_swc_event;
 	wl_signal_add(&swc.event_signal, &plane->swc_listener);

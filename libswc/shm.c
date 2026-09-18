@@ -203,7 +203,7 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 		                       "unsupported shm format");
 		return;
 	}
-	if (offset < 0 || width <= 0 || height <= 0 || stride <= 0 ||
+	if (offset < 0 || offset % 4 || width <= 0 || height <= 0 || stride <= 0 ||
 	    stride % 4 || (uint64_t)width * 4 > (uint32_t)stride ||
 	    (uint64_t)offset + (uint64_t)stride * height > pool->mapping->size) {
 		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_STRIDE,

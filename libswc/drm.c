@@ -208,6 +208,11 @@ find_primary_drm_device(char *path, size_t size)
 				free(card);
 				card = cards[index];
 				DEBUG("/dev/dri/%s is the primary GPU\n", card->d_name);
+				/* Leaving the loop early still leaves the rest of the
+				 * directory entries to release. */
+				while (++index < num_cards) {
+					free(cards[index]);
+				}
 				break;
 			}
 		}
@@ -417,6 +422,9 @@ drm_finalize(void)
 	if (drm.global) {
 		wl_global_destroy(drm.global);
 	}
+	if (drm.dmabuf) {
+		wl_global_destroy(drm.dmabuf);
+	}
 	wl_event_source_remove(drm.event_source);
 	wld_destroy_renderer(swc.drm->renderer);
 	wld_destroy_context(swc.drm->context);
@@ -462,6 +470,11 @@ drm_create_screens(struct wl_list *screens)
 	     ++i, drmModeFreeConnector(connector)) {
 		connector = drmModeGetConnector(swc.drm->fd, resources->connectors[i]);
 
+		/* A connector can disappear between the enumeration and this
+		 * query -- hotplug, or a GPU reset mid-startup. */
+		if (!connector) {
+			continue;
+		}
 		if (connector->connection == DRM_MODE_CONNECTED) {
 			int crtc_index;
 
@@ -475,7 +488,7 @@ drm_create_screens(struct wl_list *screens)
 			wl_list_for_each(plane, &planes, link)
 			{
 				if (plane->type == DRM_PLANE_TYPE_CURSOR &&
-				    plane->possible_crtcs & 1 << crtc_index) {
+				    plane->possible_crtcs & UINT32_C(1) << crtc_index) {
 					wl_list_remove(&plane->link);
 					cursor_plane = plane;
 					break;
