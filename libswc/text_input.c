@@ -56,8 +56,11 @@ struct text_input {
 	struct wl_client *client;
 	struct wl_list link;
 
-	/* The surface we last sent enter for, so leave goes to the right one. */
+	/* The surface we last sent enter for, so leave goes to the right one.
+	 * The listener drops it when the surface goes, so that a later focus
+	 * change cannot send leave through freed memory. */
 	struct surface *entered;
+	struct wl_listener entered_destroy_listener;
 
 	bool enabled;
 	uint32_t serial; /* counts the done events we have sent */
@@ -105,6 +108,8 @@ static struct wl_list text_inputs;
 /* The protocol allows one input method per seat, and swc has one seat. */
 static struct input_method *input_method;
 static struct text_input *focused_input;
+static void set_entered(struct text_input *ti, struct surface *surface);
+
 static struct keyboard_handler grab_handler;
 static bool grab_handler_linked;
 static bool initialized;
@@ -389,12 +394,54 @@ destroy_text_input(struct wl_resource *resource)
 		}
 		focused_input = NULL;
 	}
+	set_entered(ti, NULL);
 	free(ti->pending.surrounding_text);
 	wl_list_remove(&ti->link);
 	free(ti);
 }
 
 /* ----------------------------------------------------------- focus */
+
+static void handle_entered_destroy(struct wl_listener *listener, void *data);
+
+/* The entered surface is remembered only so that leave can name it. Nothing
+ * else keeps it alive, so the pointer has to be dropped when it dies. */
+static void
+set_entered(struct text_input *ti, struct surface *surface)
+{
+	if (ti->entered == surface) {
+		return;
+	}
+	if (ti->entered) {
+		wl_list_remove(&ti->entered_destroy_listener.link);
+	}
+	ti->entered = surface;
+	if (surface) {
+		ti->entered_destroy_listener.notify = handle_entered_destroy;
+		wl_signal_add(&surface->signal.destroy,
+		              &ti->entered_destroy_listener);
+	} else {
+		wl_list_init(&ti->entered_destroy_listener.link);
+	}
+}
+
+static void
+handle_entered_destroy(struct wl_listener *listener, void *data)
+{
+	struct text_input *ti =
+	    wl_container_of(listener, ti, entered_destroy_listener);
+
+	(void)data;
+	/* No leave: the surface it would name is going away, and the client
+	 * knows that already. */
+	wl_list_remove(&ti->entered_destroy_listener.link);
+	wl_list_init(&ti->entered_destroy_listener.link);
+	ti->entered = NULL;
+	if (ti == focused_input && ti->enabled) {
+		ti->enabled = false;
+		input_method_deactivate();
+	}
+}
 
 void
 text_input_handle_focus(struct compositor_view *view)
@@ -415,7 +462,7 @@ text_input_handle_focus(struct compositor_view *view)
 		if (ti->entered && ti->client != client) {
 			zwp_text_input_v3_send_leave(ti->resource,
 			                             ti->entered->resource);
-			ti->entered = NULL;
+			set_entered(ti, NULL);
 			if (ti == focused_input && ti->enabled) {
 				ti->enabled = false;
 				input_method_deactivate();
@@ -435,7 +482,7 @@ text_input_handle_focus(struct compositor_view *view)
 			continue;
 		}
 		if (ti->entered != surface) {
-			ti->entered = surface;
+			set_entered(ti, surface);
 			zwp_text_input_v3_send_enter(ti->resource, surface->resource);
 		}
 		if (!next_focus) {
@@ -479,9 +526,13 @@ grab_handle_modifiers(struct keyboard *keyboard,
 static void
 destroy_grab(struct wl_resource *resource)
 {
-	if (input_method && input_method->grab == resource) {
-		input_method->grab = NULL;
+	/* An input method that has gone away can leave its grab object behind.
+	 * Destroying that stale object must not take the keyboard away from the
+	 * input method holding the grab now. */
+	if (!input_method || input_method->grab != resource) {
+		return;
 	}
+	input_method->grab = NULL;
 	if (grab_handler_linked) {
 		wl_list_remove(&grab_handler.link);
 		grab_handler_linked = false;
@@ -586,6 +637,11 @@ input_method_get_popup_surface(struct wl_client *client,
 	if (!popup->resource) {
 		free(popup);
 		wl_client_post_no_memory(client);
+		return;
+	}
+	if (!surface_set_role(surface, popup->resource)) {
+		wl_resource_destroy(popup->resource);
+		free(popup);
 		return;
 	}
 	popup->surface = surface;
@@ -816,6 +872,7 @@ get_text_input(struct wl_client *client, struct wl_resource *manager,
 		return;
 	}
 	ti->client = client;
+	wl_list_init(&ti->entered_destroy_listener.link);
 	wl_list_insert(&text_inputs, &ti->link);
 	wl_resource_set_implementation(ti->resource, &text_input_impl, ti,
 	                               destroy_text_input);
@@ -826,7 +883,7 @@ get_text_input(struct wl_client *client, struct wl_resource *manager,
 	                                       : NULL;
 	if (focus && view_surface(focus) &&
 	    wl_resource_get_client(view_surface(focus)->resource) == client) {
-		ti->entered = view_surface(focus);
+		set_entered(ti, view_surface(focus));
 		zwp_text_input_v3_send_enter(ti->resource, ti->entered->resource);
 		if (!focused_input) {
 			focused_input = ti;
