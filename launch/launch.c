@@ -220,6 +220,32 @@ handle_signal(int sig)
 	errno = saved_errno;
 }
 
+/* The device classes the branches below are prepared to hand back. Checked
+ * before the device is really opened, so that nothing else is touched. */
+static bool
+device_is_allowed(dev_t rdev)
+{
+	if (device_is_input(rdev)) {
+		return true;
+	}
+#ifdef ENABLE_DRM
+	if (device_is_drm(rdev)) {
+		return true;
+	}
+#endif
+#ifdef ENABLE_FBDEV
+	if (device_is_fbdev(rdev)) {
+		return true;
+	}
+#endif
+#ifdef ENABLE_WSDISPLAY
+	if (device_is_tty(rdev)) {
+		return true;
+	}
+#endif
+	return false;
+}
+
 static void
 handle_socket_data(int socket)
 {
@@ -258,7 +284,48 @@ handle_socket_data(int socket)
 			goto fail;
 		}
 
-		fd = open(path, request.flags | O_CLOEXEC);
+		/*
+		 * The path is chosen by the unprivileged side, and this process is
+		 * root. Opening it outright runs the device's open handler and can
+		 * block indefinitely on a FIFO or a character device that waits on
+		 * carrier, wedging the launcher so it can no longer service a VT
+		 * switch. O_PATH does neither: it names the file without opening
+		 * it, so the device class can be checked first and only then is
+		 * the real open done, on the inode already inspected rather than
+		 * on the path again.
+		 */
+#ifdef O_PATH
+		{
+			int probe = open(path, O_PATH | O_CLOEXEC);
+			char proc[64];
+
+			if (probe == -1) {
+				fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+				goto fail;
+			}
+			if (fstat(probe, &st) == -1) {
+				fprintf(stderr, "stat %s: %s\n", path, strerror(errno));
+				close(probe);
+				goto fail;
+			}
+			if (!S_ISCHR(st.st_mode) || !device_is_allowed(st.st_rdev)) {
+				fprintf(stderr,
+				        "requested fd is not a video or input device\n");
+				close(probe);
+				goto fail;
+			}
+			snprintf(proc, sizeof(proc), "/proc/self/fd/%d", probe);
+			fd = open(proc, request.flags | O_CLOEXEC);
+			close(probe);
+			if (fd == -1) {
+				fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+				goto fail;
+			}
+		}
+#else
+		/* Without O_PATH, at least never block: the requested blocking
+		 * behaviour is restored once the device has been accepted. */
+		fd = open(path, (request.flags | O_CLOEXEC | O_NONBLOCK));
 		if (fd == -1) {
 			fprintf(stderr, "open %s: %s\n", path, strerror(errno));
 			goto fail;
@@ -267,6 +334,17 @@ handle_socket_data(int socket)
 			fprintf(stderr, "stat %s: %s\n", path, strerror(errno));
 			goto fail;
 		}
+		if (!S_ISCHR(st.st_mode) || !device_is_allowed(st.st_rdev)) {
+			fprintf(stderr, "requested fd is not a video or input device\n");
+			goto fail;
+		}
+		if (!(request.flags & O_NONBLOCK)) {
+			int flags = fcntl(fd, F_GETFL);
+			if (flags != -1) {
+				fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+			}
+		}
+#endif
 
 		if (device_is_input(st.st_rdev)) {
 			if (!active) {
@@ -322,8 +400,9 @@ handle_socket_data(int socket)
 		}
 
 		if (ioctl(tty_fd, VT_ACTIVATE, request.vt) == -1) {
-			fprintf(stderr, "failed to activate VT %d: %s\n", request.vt,
+			fprintf(stderr, "failed to activate VT %u: %s\n", request.vt,
 			        strerror(errno));
+			goto fail;
 		}
 		break;
 	default:
@@ -416,6 +495,23 @@ open_tty(const char *tty_name)
 	fd = open(tty_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
 	if (fd < 0) {
 		die("open %s:", tty_name);
+	}
+
+	/*
+	 * We are root here and the VT was named by whoever ran us. An idle VT
+	 * belongs to root; one somebody is logged in on belongs to them. Taking
+	 * over the latter would blank their screen and seize their keyboard, so
+	 * only our own and free ones are allowed.
+	 */
+	{
+		struct stat st;
+
+		if (fstat(fd, &st) < 0) {
+			die("stat %s:", tty_name);
+		}
+		if (st.st_uid != 0 && st.st_uid != getuid()) {
+			die("%s belongs to another user", tty_name);
+		}
 	}
 
 	return fd;
@@ -643,6 +739,9 @@ main(int argc, char *argv[])
 	if (pipe2(sigfd, O_CLOEXEC) == -1) {
 		die("pipe:");
 	}
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+		die("signal SIGPIPE:");
+	}
 	if (sigaction(SIGCHLD, &action, NULL) == -1) {
 		die("sigaction SIGCHLD:");
 	}
@@ -677,9 +776,30 @@ main(int argc, char *argv[])
 	/* make sure XDG_RUNTIME_DIR is set */
 	if (!getenv("XDG_RUNTIME_DIR")) {
 		uid_t uid = getuid();
+		struct stat st;
+
 		snprintf(buf, sizeof(buf), "/tmp/XDG_RUNTIME_DIR_%d", uid);
-		if (mkdir(buf, 0700) == -1 && errno != EEXIST) {
+		if (mkdir(buf, 0700) == 0) {
+			/* Created as root, so hand it to the user who will use it. */
+			if (chown(buf, uid, getgid()) == -1) {
+				die("chown %s:", buf);
+			}
+		} else if (errno != EEXIST) {
 			die("mkdir %s:", buf);
+		} else {
+			/*
+			 * /tmp is shared and the name is predictable, so an existing
+			 * path is not necessarily ours. Anyone else's would become the
+			 * directory this session puts its Wayland socket in.
+			 */
+			if (lstat(buf, &st) == -1) {
+				die("stat %s:", buf);
+			}
+			if (!S_ISDIR(st.st_mode) || st.st_uid != uid ||
+			    (st.st_mode & 0077)) {
+				die("%s is not a private directory belonging to uid %d", buf,
+				    (int)uid);
+			}
 		}
 		setenv("XDG_RUNTIME_DIR", buf, 1);
 		fprintf(stderr, "set XDG_RUNTIME_DIR=%s\n", buf);
@@ -689,12 +809,23 @@ main(int argc, char *argv[])
 		die("posix_spawnattr_init:");
 	}
 	if ((errno = posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS |
+	                                                 POSIX_SPAWN_SETSIGDEF |
 	                                                 POSIX_SPAWN_SETSIGMASK))) {
 		die("posix_spawnattr_setflags:");
 	}
 	sigemptyset(&set);
 	if ((errno = posix_spawnattr_setsigmask(&attr, &set))) {
 		die("posix_spawnattr_setsigmask:");
+	}
+	/* The handlers installed above stay in place until the child execs; a
+	 * signal arriving in that window would run ours in the child. */
+	sigemptyset(&set);
+	sigaddset(&set, SIGCHLD);
+	sigaddset(&set, SIGUSR1);
+	sigaddset(&set, SIGUSR2);
+	sigaddset(&set, SIGPIPE);
+	if ((errno = posix_spawnattr_setsigdefault(&attr, &set))) {
+		die("posix_spawnattr_setsigdefault:");
 	}
 	if ((errno = posix_spawnp(&pid, argv[optind], NULL, &attr, argv + optind,
 	                          environ))) {
