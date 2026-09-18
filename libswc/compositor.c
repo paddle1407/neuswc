@@ -38,6 +38,7 @@
 #include "drm.h"
 #endif
 #include "event.h"
+#include "foreign_toplevel.h"
 #include "internal.h"
 #include "layer_shell.h"
 #include "launch.h"
@@ -1521,8 +1522,10 @@ compositor_hide_for_lock(void)
 		if (!view->visible || view->stack_layer == STACK_LAYER_LOCK) {
 			continue;
 		}
-		view->hidden_by_lock = true;
+		/* After the hide: hiding clears the flag, because an explicit hide
+		 * means something other than the lock wants this view gone. */
 		compositor_view_hide(view);
+		view->hidden_by_lock = true;
 	}
 }
 
@@ -1735,8 +1738,12 @@ compositor_view_destroy(struct compositor_view *view)
 		if (other->parent != view)
 			continue;
 		other->parent = NULL;
-		if (other->window && view->window)
+		if (other->window && view->window) {
 			other->window->base.parent = NULL;
+			/* window_set_parent tells them when a parent changes the
+			 * ordinary way; a parent that is destroyed has to as well. */
+			foreign_toplevel_window_parent(other->window);
+		}
 	}
 	compositor_view_hide(view);
 	surface_set_view(view->surface, NULL);
@@ -1886,6 +1893,12 @@ compositor_view_hide(struct compositor_view *view)
 {
 	struct compositor_view *other;
 	bar_forget(view, false);
+
+	/* Whoever asked for this wants the view hidden for their own reason, so
+	 * the lock no longer owes it a restore. Cleared before the early return:
+	 * a view deferred by the lock is already invisible, and without this it
+	 * would come back on unlock after being minimized. */
+	view->hidden_by_lock = false;
 
 	if (!view->visible) {
 		return;

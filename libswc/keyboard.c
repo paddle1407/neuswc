@@ -28,6 +28,7 @@
 #include "keyboard.h"
 #include "compositor.h"
 #include "internal.h"
+#include "session_lock.h"
 #include "surface.h"
 #include "swc.h"
 #include "util.h"
@@ -348,6 +349,17 @@ keyboard_reset(struct keyboard *keyboard)
 void
 keyboard_set_focus(struct keyboard *keyboard, struct compositor_view *view)
 {
+	/*
+	 * While the session is locked the lock surfaces own the keyboard. A
+	 * window that maps behind the lock screen must not be able to take it,
+	 * or what the user types into the locker goes to that window instead.
+	 * Clearing the focus is still allowed; so is the lock surface itself,
+	 * and end_lock drops the lock before it restores the old focus.
+	 */
+	if (view && view->stack_layer != STACK_LAYER_LOCK &&
+	    session_lock_active()) {
+		return;
+	}
 	input_focus_set(&keyboard->focus, view);
 }
 

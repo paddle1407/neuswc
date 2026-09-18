@@ -151,8 +151,14 @@ static struct binding *
 find_key_binding(uint32_t modifiers, uint32_t key)
 {
 	struct binding *binding;
-	struct xkb *xkb = &swc.seat->keyboard->xkb;
+	struct xkb *xkb;
 	xkb_keysym_t keysym;
+
+	/* handle_binding guards these before reading the modifiers; so must we. */
+	if (!swc.seat || !swc.seat->keyboard) {
+		return NULL;
+	}
+	xkb = &swc.seat->keyboard->xkb;
 
 	/* First try the keysym the keymap generates in it's current state. */
 	keysym = xkb_state_key_get_one_sym(xkb->state, XKB_KEY(key));
@@ -257,8 +263,22 @@ bool
 handle_key(struct keyboard *keyboard, uint32_t time, struct key *key,
            uint32_t state)
 {
-	if (session_lock_active() && !binding_allowed_while_locked(key->press.value)) {
-		return false;
+	/*
+	 * Only presses are gated. A release has to reach the binding that took
+	 * the press, or its press count never comes back down and the entry can
+	 * never be freed; keyboard_handle_key only calls us for a release when
+	 * we accepted the press, so press->data is set.
+	 */
+	if (state == WL_KEYBOARD_KEY_STATE_PRESSED && session_lock_active()) {
+		/* press.value is an evdev keycode; the exception list is keysyms,
+		 * so it has to be translated before the comparison can mean
+		 * anything. Comparing the two directly never matched, which left
+		 * VT switching -- the way out of a crashed locker -- dead too. */
+		xkb_keysym_t keysym = xkb_state_key_get_one_sym(
+		    keyboard->xkb.state, XKB_KEY(key->press.value));
+		if (!binding_allowed_while_locked(keysym)) {
+			return false;
+		}
 	}
 	return handle_binding(time, &key->press, state, &find_key_binding);
 }
