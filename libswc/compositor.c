@@ -47,6 +47,7 @@
 #include "screen.h"
 #include "screencopy.h"
 #include "seat.h"
+#include "session_lock.h"
 #include "shm.h"
 #include "subsurface.h"
 #include "surface.h"
@@ -1724,7 +1725,19 @@ compositor_create_view(struct surface *surface)
 void
 compositor_view_destroy(struct compositor_view *view)
 {
+	struct compositor_view *other;
+
 	wl_signal_emit(&view->destroy_signal, NULL);
+	/* Nothing may keep pointing at a view that is going away: view_descends_from
+	 * walks these chains on every restack. Popups and subsurfaces drop their own
+	 * edge through a destroy listener, but xdg_toplevel.set_parent has none. */
+	wl_list_for_each(other, &compositor.views, link) {
+		if (other->parent != view)
+			continue;
+		other->parent = NULL;
+		if (other->window && view->window)
+			other->window->base.parent = NULL;
+	}
 	compositor_view_hide(view);
 	surface_set_view(view->surface, NULL);
 	/* The renderer's upload proxy owns a separate reference from the
@@ -1822,6 +1835,14 @@ view_show(struct compositor_view *view, bool raise)
 		if (!subsurface->added || !view->base.buffer) {
 			return;
 		}
+	}
+
+	/* Mapping something while the screen is locked must not put it on the
+	 * screen. compositor_hide_for_lock only covers what was already visible
+	 * when the lock came up. */
+	if (session_lock_active() && view->stack_layer < STACK_LAYER_LOCK) {
+		view->hidden_by_lock = true;
+		return;
 	}
 
 	view->visible = true;
