@@ -55,7 +55,7 @@ libswc_src = files(
   input_backend == 'libinput' ? 'seat.c' : [],
   input_backend == 'wscons' ? 'seat-ws.c' : [],
 
-  xwayland.found() ? ['xserver.c', 'xwm.c'] : [],  
+  xwayland.found() ? ['xserver.c', 'xwm.c', 'xselection.c'] : [],  
 
   video_backend == 'drm' ? ['dmabuf.c', 'drm.c', 'drm_syncobj.c', 'plane.c'] : [],
   framebuffer_backend == 'fbdev' ? ['fb.c', 'fb_fbdev.c'] : [],

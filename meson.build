@@ -86,6 +86,7 @@ xwayland = video_backend == 'drm' \
 xwayland_deps = [
   'xcb',
   'xcb-composite',
+  'xcb-xfixes',
   'xcb-ewmh',
   'xcb-icccm',
 ]
@@ -95,6 +96,14 @@ if xwayland.found()
   foreach dep : xwayland_deps
     requires_private += dependency(dep, required: xwayland.found())
 	endforeach
+  # Only used to give the X root window a cursor from the configured theme,
+  # so that X clients which set none of their own do not fall back to the
+  # core X shape. Optional: without it they keep that shape.
+  xcb_cursor = dependency('xcb-cursor', required: false)
+  if xcb_cursor.found()
+    add_project_arguments('-DENABLE_XCB_CURSOR', language: 'c')
+    requires_private += xcb_cursor
+  endif
 endif
 
 input_backend = get_option('input')

@@ -27,11 +27,16 @@
 #include <stdbool.h>
 #include <wayland-server.h>
 
+struct data;
+
 enum { DATA_DEVICE_EVENT_SELECTION_CHANGED };
 
 struct data_device {
-	/* The data source corresponding to the current selection. */
+	/* The data source corresponding to the current selection. NULL when the
+	 * selection belongs to the compositor rather than to a client. */
 	struct wl_resource *selection;
+	/* The selection either way, client-owned or not. */
+	struct data *selection_data;
 	struct wl_listener selection_destroy_listener;
 
 	struct wl_signal event_signal;
@@ -48,5 +53,13 @@ data_device_bind(struct data_device *data_device, struct wl_client *client,
 void
 data_device_offer_selection(struct data_device *data_device,
                             struct wl_client *client);
+/* Make a compositor-owned source the selection, for the X11 clipboard
+ * bridge. Passing NULL clears a selection this owner had set. */
+void
+data_device_set_internal_selection(struct data_device *data_device,
+                                   struct data *data);
+/* The current selection, client-owned or not, or NULL. */
+struct data *
+data_device_selection(struct data_device *data_device);
 
 #endif

@@ -41,6 +41,27 @@ start_drag(struct wl_client *client, struct wl_resource *resource,
 	           icon_resource, serial);
 }
 
+/* Let go of whichever kind of selection is current. */
+static void
+drop_selection(struct data_device *data_device)
+{
+	if (data_device->selection) {
+		wl_data_source_send_cancelled(data_device->selection);
+		wl_list_remove(&data_device->selection_destroy_listener.link);
+	} else if (data_device->selection_data) {
+		const struct data_source_impl *impl;
+		void *user;
+
+		/* Tell the compositor-side owner before forgetting it, so it can
+		 * release whatever it was holding. */
+		if (data_internal_owner(data_device->selection_data, &impl, &user)) {
+			impl->cancelled(user);
+		}
+	}
+	data_device->selection = NULL;
+	data_device->selection_data = NULL;
+}
+
 static void
 set_selection(struct wl_client *client, struct wl_resource *resource,
               struct wl_resource *data_source, uint32_t serial)
@@ -52,12 +73,10 @@ set_selection(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	if (data_device->selection) {
-		wl_data_source_send_cancelled(data_device->selection);
-		wl_list_remove(&data_device->selection_destroy_listener.link);
-	}
+	drop_selection(data_device);
 
 	data_device->selection = data_source;
+	data_device->selection_data = data_from_source(data_source);
 
 	if (data_source) {
 		wl_resource_add_destroy_listener(
@@ -81,6 +100,7 @@ handle_selection_destroy(struct wl_listener *listener, void *data)
 	    wl_container_of(listener, data_device, selection_destroy_listener);
 
 	data_device->selection = NULL;
+	data_device->selection_data = NULL;
 	send_event(&data_device->event_signal, DATA_DEVICE_EVENT_SELECTION_CHANGED,
 	           NULL);
 }
@@ -95,6 +115,7 @@ data_device_create(void)
 		return NULL;
 	}
 	data_device->selection = NULL;
+	data_device->selection_data = NULL;
 	data_device->selection_destroy_listener.notify = &handle_selection_destroy;
 	wl_signal_init(&data_device->event_signal);
 	wl_list_init(&data_device->resources);
@@ -113,6 +134,25 @@ data_device_destroy(struct data_device *data_device)
 		wl_list_remove(&data_device->selection_destroy_listener.link);
 	}
 	free(data_device);
+}
+
+struct data *
+data_device_selection(struct data_device *data_device)
+{
+	return data_device->selection_data;
+}
+
+void
+data_device_set_internal_selection(struct data_device *data_device,
+                                   struct data *data)
+{
+	if (data_device->selection_data == data) {
+		return;
+	}
+	drop_selection(data_device);
+	data_device->selection_data = data;
+	send_event(&data_device->event_signal, DATA_DEVICE_EVENT_SELECTION_CHANGED,
+	           NULL);
 }
 
 struct wl_resource *
@@ -135,16 +175,16 @@ data_device_bind(struct data_device *data_device, struct wl_client *client,
 
 static struct wl_resource *
 new_offer(struct wl_resource *resource, struct wl_client *client,
-          struct wl_resource *source)
+          struct data *source)
 {
 	struct wl_resource *offer;
 
-	offer = data_offer_new(client, source, wl_resource_get_version(resource));
+	offer = data_offer_new_for(client, source, wl_resource_get_version(resource));
 	if (!offer) {
 		return NULL;
 	}
 	wl_data_device_send_data_offer(resource, offer);
-	data_send_mime_types(source, offer);
+	data_send_mime_types_for(source, offer);
 
 	return offer;
 }
@@ -165,8 +205,8 @@ data_device_offer_selection(struct data_device *data_device,
 	}
 
 	/* If we have a selection, create a new offer for the client. */
-	if (data_device->selection) {
-		offer = new_offer(resource, client, data_device->selection);
+	if (data_device->selection_data) {
+		offer = new_offer(resource, client, data_device->selection_data);
 	}
 
 	wl_data_device_send_selection(resource, offer);

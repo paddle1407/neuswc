@@ -31,6 +31,9 @@
 #include "launch.h"
 #include "pointer.h"
 #include "primary_selection.h"
+#ifdef ENABLE_XWAYLAND
+#include "xselection.h"
+#endif
 #include "relative_pointer.h"
 #include "screen.h"
 #include "surface.h"
@@ -122,6 +125,11 @@ handle_data_device_event(struct wl_listener *listener, void *data)
 		data_device_offer_selection(seat->base.data_device,
 		                            seat->base.keyboard->focus.client);
 	}
+#ifdef ENABLE_XWAYLAND
+	/* X clients cannot see a Wayland selection unless the window manager
+	 * claims CLIPBOARD on its behalf. */
+	xselection_wayland_selection_changed();
+#endif
 }
 
 static void

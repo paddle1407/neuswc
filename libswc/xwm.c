@@ -22,6 +22,11 @@
  */
 
 #include "xwm.h"
+#include "xselection.h"
+
+#ifdef ENABLE_XCB_CURSOR
+#include <xcb/xcb_cursor.h>
+#endif
 #include "compositor.h"
 #include "internal.h"
 #include "surface.h"
@@ -66,6 +71,7 @@ static struct {
 	struct xwl_window *focus;
 	struct wl_event_source *source;
 	struct wl_list windows, unpaired_windows;
+	xcb_cursor_t root_cursor;
 	union {
 		const char *name;
 		xcb_intern_atom_cookie_t cookie;
@@ -77,6 +83,38 @@ static struct {
              [ATOM_WM_PROTOCOLS] = {"WM_PROTOCOLS"},
              [ATOM_WM_S0] = {"WM_S0"},
          }};
+
+/*
+ * An X window that never sets a cursor inherits the one on the root window,
+ * and X gives the root the core "X" shape. Xwayland then hands that shape to
+ * the compositor as the client's cursor, so those windows ignore the theme
+ * entirely. Naming a themed cursor on the root fixes them all at once.
+ */
+static void
+set_root_cursor(void)
+{
+#ifdef ENABLE_XCB_CURSOR
+	xcb_cursor_context_t *context;
+
+	/* Reads the theme from the X resource database, then XCURSOR_THEME,
+	 * which the compositor exports before it starts anything. */
+	if (xcb_cursor_context_new(xwm.connection, xwm.screen, &context) < 0) {
+		WARNING("xwm: no cursor context; X windows keep the core cursor\n");
+		return;
+	}
+	xwm.root_cursor = xcb_cursor_load_cursor(context, "left_ptr");
+	xcb_cursor_context_free(context);
+
+	if (xwm.root_cursor == XCB_CURSOR_NONE) {
+		WARNING("xwm: theme has no left_ptr; X windows keep the core "
+		        "cursor\n");
+		return;
+	}
+	/* The cursor has to outlive this call: it is freed in xwm_finalize. */
+	xcb_change_window_attributes(xwm.connection, xwm.screen->root,
+	                             XCB_CW_CURSOR, &xwm.root_cursor);
+#endif
+}
 
 static void
 update_name(struct xwl_window *xwl_window)
@@ -524,10 +562,16 @@ connection_data(int fd, uint32_t mask, void *data)
 			configure_request((xcb_configure_request_event_t *)event);
 			break;
 		case XCB_PROPERTY_NOTIFY:
-			property_notify((xcb_property_notify_event_t *)event);
+			/* Also how the pieces of an INCR selection transfer arrive. */
+			if (!xselection_handle_event(event)) {
+				property_notify((xcb_property_notify_event_t *)event);
+			}
 			break;
 		case XCB_CLIENT_MESSAGE:
 			client_message((xcb_client_message_event_t *)event);
+			break;
+		default:
+			xselection_handle_event(event);
 			break;
 		}
 
@@ -658,7 +702,18 @@ xwm_initialize(int fd)
 	xcb_ewmh_set_wm_name(&xwm.ewmh, xwm.window, sizeof(WM_NAME) - 1, WM_NAME);
 	xcb_set_selection_owner(xwm.connection, xwm.window,
 	                        xwm.atoms[ATOM_WM_S0].value, XCB_CURRENT_TIME);
+	/* Selection transfers land on this window as property changes. */
+	values[0] = XCB_EVENT_MASK_PROPERTY_CHANGE;
+	xcb_change_window_attributes(xwm.connection, xwm.window, XCB_CW_EVENT_MASK,
+	                             values);
+	set_root_cursor();
 	xcb_flush(xwm.connection);
+
+	/* Not fatal: without it X and Wayland clients simply cannot share a
+	 * clipboard, which is how this worked before. */
+	if (!xselection_initialize(xwm.connection, xwm.window)) {
+		WARNING("xwm: the X11 clipboard bridge is unavailable\n");
+	}
 
 	wl_signal_add(&swc.compositor->signal.new_surface, &new_surface_listener);
 
@@ -679,6 +734,11 @@ xwm_finalize(void)
 {
 	struct xwl_window *window, *next;
 
+	xselection_finalize();
+	if (xwm.root_cursor != XCB_CURSOR_NONE) {
+		xcb_free_cursor(xwm.connection, xwm.root_cursor);
+		xwm.root_cursor = XCB_CURSOR_NONE;
+	}
 	wl_list_remove(&new_surface_listener.link);
 	wl_list_for_each_safe(window, next, &xwm.windows, link)
 	{
