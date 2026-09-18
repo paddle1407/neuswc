@@ -25,6 +25,7 @@
 #include "compositor.h"
 #include "internal.h"
 #include "keyboard.h"
+#include "output.h"
 #include "pointer.h"
 #include "screen.h"
 #include "seat.h"
@@ -416,6 +417,7 @@ get_lock_surface(struct wl_client *client, struct wl_resource *resource,
 {
 	struct lock_surface *lock_surface = NULL;
 	struct surface *surface;
+	struct output *output;
 	struct screen *screen;
 
 	if (resource != lock.resource) {
@@ -437,7 +439,10 @@ get_lock_surface(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	screen = wl_resource_get_user_data(output_resource);
+	/* A wl_output resource carries the struct output, not the screen behind
+	 * it; every other user of one goes through ->screen the same way. */
+	output = wl_resource_get_user_data(output_resource);
+	screen = output ? output->screen : NULL;
 	/* One lock surface per output. A second would leave the compositor
 	 * picking between them, which the protocol forbids outright. */
 	wl_list_for_each(lock_surface, &lock.surfaces, link)
