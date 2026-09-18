@@ -60,8 +60,11 @@ offer_receive(struct wl_client *client, struct wl_resource *offer,
 {
 	struct data *data = wl_resource_get_user_data(offer);
 
-	/* Protect against expired data_offers being used. */
+	/* Protect against expired data_offers being used. The fd is ours once it
+	 * arrives, so it has to be closed even when there is nowhere to send it;
+	 * primary_selection's offer_receive already does this. */
 	if (!data) {
+		close(fd);
 		return;
 	}
 

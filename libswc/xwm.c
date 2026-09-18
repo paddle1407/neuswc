@@ -36,6 +36,8 @@
 #include <xcb/xcb_ewmh.h>
 #include <xcb/xcb_icccm.h>
 
+#define WM_NAME "charaWC"
+
 struct xwl_window {
 	xcb_window_t id;
 	uint32_t surface_id;
@@ -557,7 +559,8 @@ xwm_initialize(int fd)
 
 	if (xcb_connection_has_error(xwm.connection)) {
 		ERROR("xwm: Could not connect to X server\n");
-		goto error0;
+		/* Even an errored connection owns fd, so it still has to go. */
+		goto error1;
 	}
 
 	xcb_prefetch_extension_data(xwm.connection, &xcb_composite_id);
@@ -652,7 +655,7 @@ xwm_initialize(int fd)
 	xcb_ewmh_set_supported(&xwm.ewmh, 0, ARRAY_LENGTH(supported), supported);
 	xcb_ewmh_set_supporting_wm_check(&xwm.ewmh, xwm.screen->root, xwm.window);
 	xcb_ewmh_set_supporting_wm_check(&xwm.ewmh, xwm.window, xwm.window);
-	xcb_ewmh_set_wm_name(&xwm.ewmh, xwm.window, 4, "charaWC");
+	xcb_ewmh_set_wm_name(&xwm.ewmh, xwm.window, sizeof(WM_NAME) - 1, WM_NAME);
 	xcb_set_selection_owner(xwm.connection, xwm.window,
 	                        xwm.atoms[ATOM_WM_S0].value, XCB_CURRENT_TIME);
 	xcb_flush(xwm.connection);

@@ -132,6 +132,9 @@ begin:
 			close(lock_fd);
 			goto retry0;
 		}
+		/* /tmp is world-writable, so the contents are not ours. Without a
+		 * terminator strtol runs off the end of an all-digit lock file. */
+		pid[sizeof(pid) - 1] = '\0';
 
 		owner = strtol(pid, &end, 10);
 
@@ -200,11 +203,15 @@ close_display(void)
 	}
 
 	#ifdef __linux__
-	close(xserver.abstract_fd);
-	xserver.abstract_fd = -1;
+	if (xserver.abstract_fd >= 0) {
+		close(xserver.abstract_fd);
+		xserver.abstract_fd = -1;
+	}
 	#endif
-	close(xserver.unix_fd);
-	xserver.unix_fd = -1;
+	if (xserver.unix_fd >= 0) {
+		close(xserver.unix_fd);
+		xserver.unix_fd = -1;
+	}
 
 	snprintf(path, sizeof(path), SOCKET_FMT, xserver.display);
 	unlink(path);
@@ -364,6 +371,19 @@ xserver_initialize(void)
 
 	close(wl[1]);
 	close(wm[1]);
+	/* Xwayland owns the listening sockets now. Holding a copy here keeps the
+	 * display socket bound and connectable after Xwayland exits, so a client
+	 * that connects in that window blocks in a backlog nothing will accept. */
+	#ifdef __linux__
+	if (xserver.abstract_fd >= 0) {
+		close(xserver.abstract_fd);
+		xserver.abstract_fd = -1;
+	}
+	#endif
+	if (xserver.unix_fd >= 0) {
+		close(xserver.unix_fd);
+		xserver.unix_fd = -1;
+	}
 	xserver.initializing = false;
 
 	return true;
