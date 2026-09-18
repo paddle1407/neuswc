@@ -166,6 +166,38 @@ remove:
 	wl_list_remove(&interaction->handler.link);
 }
 
+/*
+ * Drop an interaction whose window is going away. Unlike end_interaction()
+ * this does not replay the release to the handler the press came from: there
+ * is no window left for it to act on. Both places the handler is reachable
+ * from have to be cleared -- the seat's handler list, and the held button,
+ * which keeps a bare pointer to whichever handler claimed it -- or the next
+ * pointer event walks into the freed window.
+ */
+static void
+cancel_interaction(struct window_pointer_interaction *interaction)
+{
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+	struct button *button;
+
+	if (!interaction->active) {
+		return;
+	}
+
+	if (pointer) {
+		wl_array_for_each(button, &pointer->buttons)
+		{
+			if (button->handler == &interaction->handler) {
+				button->handler = interaction->original_handler;
+			}
+		}
+	}
+
+	interaction->active = false;
+	interaction->original_handler = NULL;
+	wl_list_remove(&interaction->handler.link);
+}
+
 static void
 flush(struct window *window)
 {
@@ -687,6 +719,11 @@ window_finalize(struct window *window)
 	DEBUG("Finalizing window, %p\n", window);
 
 	window_unmanage(window);
+	/* Before the view goes: a window destroyed mid-move or mid-resize leaves
+	 * its interaction handler linked into the seat, and the button held on
+	 * it pointing at memory that is about to be freed. */
+	cancel_interaction(&window->move.interaction);
+	cancel_interaction(&window->resize.interaction);
 	compositor_view_destroy(window->view);
 	free(window->base.title);
 	free(window->base.app_id);

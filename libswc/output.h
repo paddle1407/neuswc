@@ -11,7 +11,6 @@
 struct wl_display;
 
 struct output {
-	struct wl_resource *resource;
 	struct screen *screen;
 
 	char name[24];
@@ -29,6 +28,10 @@ struct output {
 #endif
 
 	struct wl_global *global;
+	/* One per client that has bound this output; found with
+	 * wl_resource_find_for_client(). There is no single resource to keep:
+	 * a bare pointer to the last one to bind goes stale as soon as that
+	 * client unbinds, and every event here is addressed to one client. */
 	struct wl_list resources;
 	struct wl_list link;
 };

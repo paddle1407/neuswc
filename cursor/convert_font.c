@@ -511,6 +511,12 @@ output_interesting_cursors(FILE *file)
 	}
 
 	write_output_file(file, glyphs, n);
+
+	/* Nothing below this needs them, and a build tool that leaks trips the
+	 * leak checker when the tree is built with sanitizers. */
+	for (i = 0; i < n; ++i)
+		free(glyphs[i].name);
+	free(glyphs);
 }
 
 int

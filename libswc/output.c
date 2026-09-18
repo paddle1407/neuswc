@@ -37,7 +37,6 @@ bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 		return;
 	}
 
-	output->resource = resource;
 	wl_resource_set_implementation(resource, &output_impl, output,
 	                               &remove_resource);
 	wl_list_insert(&output->resources, wl_resource_get_link(resource));
