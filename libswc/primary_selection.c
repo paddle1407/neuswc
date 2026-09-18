@@ -306,8 +306,13 @@ get_device(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 	                               &remove_resource);
 	wl_list_insert(&device->resources, wl_resource_get_link(device_resource));
 
-	/* A client binding after a selection was already set still needs it. */
-	primary_selection_device_offer(device, client);
+	/* A client binding after a selection was already set still needs it.
+	 * Only send when one exists: an unsolicited selection(nil) arrives while
+	 * Qt is still inside QWaylandDisplay::initialize(), where its handler
+	 * dereferences a not-yet-assigned platform integration and crashes. */
+	if (device->selection) {
+		primary_selection_device_offer(device, client);
+	}
 }
 
 static const struct zwp_primary_selection_device_manager_v1_interface
