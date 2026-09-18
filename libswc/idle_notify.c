@@ -28,6 +28,7 @@
 
 #include "ext-idle-notify-v1-server-protocol.h"
 
+#include <limits.h>
 #include <stdlib.h>
 
 /*
@@ -84,8 +85,13 @@ arm(struct idle_notification *notification)
 	}
 
 	set_idle(notification, false);
-	wl_event_source_timer_update(notification->timer,
-	                             (int)notification->timeout_ms);
+	/* The timer takes an int. A client-supplied timeout past INT_MAX would
+	 * come out negative and disarm the source instead of arming it. */
+	wl_event_source_timer_update(
+	    notification->timer,
+	    notification->timeout_ms > (uint32_t)INT_MAX
+	        ? INT_MAX
+	        : (int)notification->timeout_ms);
 }
 
 static int
