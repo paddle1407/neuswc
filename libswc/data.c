@@ -22,6 +22,7 @@
  */
 
 #include "data.h"
+#include "drag.h"
 #include "util.h"
 
 #include <stdlib.h>
@@ -33,6 +34,9 @@ struct data {
 	struct wl_array mime_types;
 	struct wl_resource *source;
 	struct wl_list offers;
+	/* The drag-and-drop actions this source will take part in. Meaningless
+	 * for a selection, where nothing ever asks. */
+	uint32_t dnd_actions;
 };
 
 static void
@@ -47,6 +51,7 @@ offer_accept(struct wl_client *client, struct wl_resource *offer,
 	}
 
 	wl_data_source_send_target(data->source, mime_type);
+	drag_offer_accept(offer, mime_type);
 }
 
 static void
@@ -68,18 +73,16 @@ static void
 offer_finish(struct wl_client *client, struct wl_resource *offer)
 {
 	(void)client;
-	(void)offer;
-	/* TODO: Implement */
+
+	drag_offer_finish(offer);
 }
 
 static void
 offer_set_actions(struct wl_client *client, struct wl_resource *offer, uint32_t dnd_actions, uint32_t preferred_action)
 {
 	(void)client;
-	(void)offer;
-	(void)dnd_actions;
-	(void)preferred_action;
-	/* TODO: Implement */
+
+	drag_offer_set_actions(offer, dnd_actions, preferred_action);
 }
 
 static const struct wl_data_offer_interface data_offer_impl = {
@@ -117,10 +120,22 @@ error0:
 static void
 source_set_actions(struct wl_client *client, struct wl_resource *resource, uint32_t dnd_actions)
 {
+	struct data *data = wl_resource_get_user_data(resource);
+
 	(void)client;
-	(void)resource;
-	(void)dnd_actions;
-	/* TODO: Implement */
+
+	data->dnd_actions = dnd_actions & DATA_DND_ACTION_ALL;
+	/* A source may narrow its actions mid-drag, which changes what the drop
+	 * would do. */
+	drag_source_actions_changed(resource);
+}
+
+uint32_t
+data_source_actions(struct wl_resource *source)
+{
+	struct data *data = wl_resource_get_user_data(source);
+
+	return data ? data->dnd_actions : 0;
 }
 
 static const struct wl_data_source_interface data_source_impl = {
@@ -167,6 +182,7 @@ data_source_new(struct wl_client *client, uint32_t version, uint32_t id)
 	}
 	wl_array_init(&data->mime_types);
 	wl_list_init(&data->offers);
+	data->dnd_actions = 0;
 
 	data->source =
 	    wl_resource_create(client, &wl_data_source_interface, version, id);

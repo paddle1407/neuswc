@@ -142,6 +142,22 @@ compositor_view_destroy(struct compositor_view *view);
 struct compositor_view *
 compositor_view(struct view *view);
 
+/**
+ * Returns the topmost visible view accepting input at the given position, or
+ * NULL if there is none.
+ */
+struct compositor_view *
+compositor_view_at(int32_t x, int32_t y);
+
+/**
+ * Point the pointer at whatever is under it now.
+ *
+ * For a grab that took the pointer away from the clients -- a drag, say -- and
+ * has finished with it.
+ */
+void
+compositor_refocus_pointer(void);
+
 void
 compositor_view_set_parent(struct compositor_view *view,
                            struct compositor_view *parent);

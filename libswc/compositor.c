@@ -2234,6 +2234,23 @@ bar_pointer_at(int32_t x, int32_t y)
 	if (entered) bar_action(hover, SWC_TITLEBAR_FOCUS);
 }
 
+struct compositor_view *
+compositor_view_at(int32_t x, int32_t y)
+{
+	return view_at(x, y);
+}
+
+void
+compositor_refocus_pointer(void)
+{
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+
+	if (!pointer) {
+		return;
+	}
+	bar_pointer_at(wl_fixed_to_int(pointer->x), wl_fixed_to_int(pointer->y));
+}
+
 bool
 handle_motion(struct pointer_handler *handler, uint32_t time, wl_fixed_t fx,
               wl_fixed_t fy)

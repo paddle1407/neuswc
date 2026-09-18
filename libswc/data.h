@@ -25,8 +25,14 @@
 #define SWC_DATA_H
 
 #include <stdint.h>
+#include <wayland-server.h>
 
 struct wl_client;
+
+#define DATA_DND_ACTION_ALL                   \
+	(WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY   \
+	 | WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE \
+	 | WL_DATA_DEVICE_MANAGER_DND_ACTION_ASK)
 
 struct wl_resource *
 data_source_new(struct wl_client *client, uint32_t version, uint32_t id);
@@ -35,5 +41,8 @@ data_offer_new(struct wl_client *client, struct wl_resource *source,
                uint32_t version);
 void
 data_send_mime_types(struct wl_resource *source, struct wl_resource *offer);
+/* The drag-and-drop actions the source said it would take part in. */
+uint32_t
+data_source_actions(struct wl_resource *source);
 
 #endif

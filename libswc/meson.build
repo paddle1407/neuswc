@@ -8,6 +8,7 @@ libswc_src = files(
   'data_device.c',
   'data_device_manager.c',
   'decor.c',
+  'drag.c',
   'foreign_toplevel.c',
   'idle_inhibit.c',
   'idle_notify.c',

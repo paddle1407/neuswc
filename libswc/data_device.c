@@ -23,6 +23,7 @@
 
 #include "data_device.h"
 #include "data.h"
+#include "drag.h"
 #include "event.h"
 #include "util.h"
 
@@ -32,7 +33,12 @@ start_drag(struct wl_client *client, struct wl_resource *resource,
            struct wl_resource *origin_resource,
            struct wl_resource *icon_resource, uint32_t serial)
 {
-	/* XXX: Implement */
+	struct data_device *data_device = wl_resource_get_user_data(resource);
+
+	(void)client;
+
+	drag_start(data_device, resource, source_resource, origin_resource,
+	           icon_resource, serial);
 }
 
 static void
