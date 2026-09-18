@@ -26,6 +26,7 @@
 #include "keyboard.h"
 #include "pointer.h"
 #include "seat.h"
+#include "session_lock.h"
 #include "swc.h"
 #include "util.h"
 
@@ -236,10 +237,29 @@ handle_binding(uint32_t time, struct press *press, uint32_t state,
 	return true;
 }
 
+/*
+ * While the session is locked, compositor bindings are dead: otherwise the
+ * quit, close and workspace keys would all still work from the lock screen,
+ * which would make the lock decorative.
+ *
+ * VT switching is the deliberate exception. It is the only way back into a
+ * session whose locker has crashed, and it drops to the kernel console rather
+ * than exposing anything the lock is hiding.
+ */
+static bool
+binding_allowed_while_locked(uint32_t keysym)
+{
+	return keysym >= XKB_KEY_XF86Switch_VT_1 &&
+	       keysym <= XKB_KEY_XF86Switch_VT_12;
+}
+
 bool
 handle_key(struct keyboard *keyboard, uint32_t time, struct key *key,
            uint32_t state)
 {
+	if (session_lock_active() && !binding_allowed_while_locked(key->press.value)) {
+		return false;
+	}
 	return handle_binding(time, &key->press, state, &find_key_binding);
 }
 
@@ -247,6 +267,9 @@ bool
 handle_button(struct pointer_handler *handler, uint32_t time,
               struct button *button, uint32_t state)
 {
+	if (session_lock_active()) {
+		return false;
+	}
 	return handle_binding(time, &button->press, state, &find_button_binding);
 }
 
@@ -257,6 +280,10 @@ handle_axis(struct pointer_handler *handler, uint32_t time,
 {
 	(void)handler;
 	(void)source;
+
+	if (session_lock_active()) {
+		return false;
+	}
 
 	uint32_t modifiers =
 	    swc.seat && swc.seat->keyboard ? swc.seat->keyboard->modifiers : 0;

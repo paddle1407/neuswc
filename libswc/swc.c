@@ -24,6 +24,7 @@
 #include "swc.h"
 #include "bindings.h"
 #include "compositor.h"
+#include "cursor_shape.h"
 #include "data_device_manager.h"
 #ifdef ENABLE_DRM
 #include "drm.h"
@@ -33,6 +34,7 @@
 #include "event.h"
 #include "foreign_toplevel.h"
 #include "idle_inhibit.h"
+#include "idle_notify.h"
 #include "internal.h"
 #include "kde_decoration.h"
 #include "keyboard.h"
@@ -46,13 +48,17 @@
 #include "shell.h"
 #include "shm.h"
 #include "pointer_constraints.h"
+#include "primary_selection.h"
 #include "relative_pointer.h"
 #include "screencopy.h"
+#include "session_lock.h"
 #include "snap.h"
 #include "subcompositor.h"
+#include "text_input.h"
 #include "util.h"
 #include "window.h"
 #include "workspace.h"
+#include "xdg_activation.h"
 #include "xdg_decoration.h"
 #include "xdg_output.h"
 #include "xdg_shell.h"
@@ -335,10 +341,71 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
 		goto error23;
 	}
 
+	swc.primary_selection_device_manager =
+	    primary_selection_device_manager_create(display);
+	if (!swc.primary_selection_device_manager) {
+		ERROR("Could not initialize primary selection device manager\n");
+		goto error24;
+	}
+
+	swc.idle_notifier = idle_notifier_create(display);
+	if (!swc.idle_notifier) {
+		ERROR("Could not initialize idle notifier\n");
+		goto error25;
+	}
+
+	swc.xdg_activation = xdg_activation_create(display);
+	if (!swc.xdg_activation) {
+		ERROR("Could not initialize XDG activation\n");
+		goto error26;
+	}
+
+	swc.cursor_shape_manager = cursor_shape_manager_create(display);
+	if (!swc.cursor_shape_manager) {
+		ERROR("Could not initialize cursor shape manager\n");
+		goto error27;
+	}
+
+	swc.session_lock_manager = session_lock_manager_create(display);
+	if (!swc.session_lock_manager) {
+		ERROR("Could not initialize session lock manager\n");
+		goto error28;
+	}
+
+	swc.text_input_manager = text_input_manager_create(display);
+	if (!swc.text_input_manager) {
+		ERROR("Could not initialize text input manager\n");
+		goto error29;
+	}
+
+	swc.input_method_manager = input_method_manager_create(display);
+	if (!swc.input_method_manager) {
+		ERROR("Could not initialize input method manager\n");
+		goto error30;
+	}
+
 	setup_compositor();
 
 	return true;
 
+error30:
+	text_input_finish();
+	wl_global_destroy(swc.text_input_manager);
+error29:
+	wl_global_destroy(swc.session_lock_manager);
+error28:
+	wl_global_destroy(swc.cursor_shape_manager);
+error27:
+	xdg_activation_finish();
+	wl_global_destroy(swc.xdg_activation);
+error26:
+	idle_notifier_finish();
+	wl_global_destroy(swc.idle_notifier);
+error25:
+	wl_global_destroy(swc.primary_selection_device_manager);
+error24:
+	foreign_toplevel_manager_finish();
+	wl_global_destroy(swc.foreign_toplevel_manager);
 error23:
 	workspace_manager_finish();
 	wl_global_destroy(swc.workspace_manager);
@@ -410,6 +477,17 @@ swc_finalize(void)
 	foreign_toplevel_manager_finish();
 	workspace_manager_finish();
 	idle_inhibit_manager_finish();
+	idle_notifier_finish();
+	xdg_activation_finish();
+	session_lock_finish();
+	text_input_finish();
+	wl_global_destroy(swc.input_method_manager);
+	wl_global_destroy(swc.text_input_manager);
+	wl_global_destroy(swc.session_lock_manager);
+	wl_global_destroy(swc.cursor_shape_manager);
+	wl_global_destroy(swc.xdg_activation);
+	wl_global_destroy(swc.idle_notifier);
+	wl_global_destroy(swc.primary_selection_device_manager);
 	wl_global_destroy(swc.foreign_toplevel_manager);
 	wl_global_destroy(swc.workspace_manager);
 	wl_global_destroy(swc.idle_inhibit_manager);

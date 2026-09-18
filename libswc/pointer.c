@@ -49,6 +49,15 @@
 static enum swc_cursor_kind cursor_override = SWC_CURSOR_DEFAULT;
 static enum swc_cursor_mode cursor_mode = SWC_CURSOR_MODE_CLIENT;
 
+/*
+ * A shape the focused client asked for through cursor-shape-v1. It behaves
+ * like a client cursor surface -- it belongs to whichever client the pointer
+ * is over, and is dropped when the pointer leaves -- but the pixels come from
+ * the window manager's theme rather than from the client.
+ */
+static enum swc_cursor_kind client_shape = SWC_CURSOR_DEFAULT;
+static bool client_shape_set;
+
 static bool profile_input;
 static struct input_profile {
 	uint64_t total;
@@ -74,7 +83,7 @@ static struct {
 	uint32_t width, height;
 	int32_t hotspot_x, hotspot_y;
 	bool active;
-} cursor_images[6];
+} cursor_images[SWC_CURSOR_KIND_COUNT];
 
 EXPORT void
 swc_pointer_send_button(uint32_t time, uint32_t button, uint32_t state)
@@ -154,6 +163,10 @@ enter(struct input_focus_handler *handler, struct wl_list *resources,
 	uint32_t serial;
 	wl_fixed_t surface_x, surface_y;
 	int32_t origin_x, origin_y;
+
+	/* Each client starts from the theme default; a shape lasts only as long
+	 * as the pointer stays inside the surface that asked for it. */
+	pointer_clear_shape(pointer);
 
 	if (wl_list_empty(resources)) {
 		pointer_set_cursor(pointer, cursor_left_ptr);
@@ -447,6 +460,36 @@ swc_clear_cursor_image(enum swc_cursor_kind kind)
 	apply_cursor_override(pointer);
 }
 
+void
+pointer_set_shape(struct pointer *pointer, enum swc_cursor_kind kind)
+{
+	if (!pointer) {
+		return;
+	}
+	if (kind < 0 || kind >= SWC_CURSOR_KIND_COUNT) {
+		return;
+	}
+	/* Asking for a shape replaces any cursor surface the same client set,
+	 * which is what wl_pointer.set_cursor would have done. */
+	drop_client_cursor_surface(pointer);
+	client_shape = kind;
+	client_shape_set = true;
+	pointer_set_cursor(pointer, cursor_left_ptr);
+}
+
+void
+pointer_clear_shape(struct pointer *pointer)
+{
+	if (!client_shape_set) {
+		return;
+	}
+	client_shape_set = false;
+	client_shape = SWC_CURSOR_DEFAULT;
+	if (pointer && !pointer->cursor.surface) {
+		pointer_set_cursor(pointer, cursor_left_ptr);
+	}
+}
+
 EXPORT bool
 swc_pointer_has_buttons(void)
 {
@@ -461,7 +504,12 @@ pointer_set_cursor(struct pointer *pointer, uint32_t id)
 	struct wld_buffer *buffer;
 
 	if (id == cursor_left_ptr) {
-		enum swc_cursor_kind kind = cursor_override;
+		/* A window manager override is a mode cursor -- move, resize, select
+		 * -- and outranks whatever the client underneath would prefer. */
+		enum swc_cursor_kind kind =
+		    (cursor_override == SWC_CURSOR_DEFAULT && client_shape_set)
+		        ? client_shape
+		        : cursor_override;
 		if (kind < 0 || kind >= (int)ARRAY_LENGTH(cursor_images)) {
 			kind = SWC_CURSOR_DEFAULT;
 		}
@@ -615,9 +663,11 @@ handle_focus_changed(struct wl_listener *listener, void *data)
 	pointer_constraints_update_focus(pointer);
 	/* Destruction clears input focus without calling enter(NULL). Restore the
 	 * desktop cursor here too, including a client that last hid its cursor. */
-	if (!pointer->focus.view &&
-	    (pointer->cursor.surface || !pointer->cursor.view.buffer))
-		pointer_set_cursor(pointer, cursor_left_ptr);
+	if (!pointer->focus.view) {
+		pointer_clear_shape(pointer);
+		if (pointer->cursor.surface || !pointer->cursor.view.buffer)
+			pointer_set_cursor(pointer, cursor_left_ptr);
+	}
 }
 
 static void

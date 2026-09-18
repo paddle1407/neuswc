@@ -1,4 +1,5 @@
 #include "idle_inhibit.h"
+#include "idle_notify.h"
 #include "surface.h"
 #include "util.h"
 
@@ -13,6 +14,13 @@ struct inhibitor {
 };
 
 static struct wl_list inhibitors;
+static bool inhibitors_ready;
+
+bool
+idle_inhibit_active(void)
+{
+	return inhibitors_ready && !wl_list_empty(&inhibitors);
+}
 
 static void inhibitor_resource_destroy(struct wl_resource *resource)
 {
@@ -22,6 +30,7 @@ static void inhibitor_resource_destroy(struct wl_resource *resource)
 	wl_list_remove(&inhibitor->surface_destroy.link);
 	wl_list_remove(&inhibitor->link);
 	free(inhibitor);
+	idle_notify_inhibit_changed();
 }
 
 static void inhibitor_destroy(struct wl_client *client,
@@ -69,6 +78,7 @@ static void create_inhibitor(struct wl_client *client,
 	wl_list_insert(&inhibitors, &inhibitor->link);
 	wl_resource_set_implementation(resource, &inhibitor_impl, inhibitor,
 	                               inhibitor_resource_destroy);
+	idle_notify_inhibit_changed();
 }
 
 static const struct zwp_idle_inhibit_manager_v1_interface manager_impl = {
@@ -92,6 +102,7 @@ static void bind_manager(struct wl_client *client, void *data, uint32_t version,
 struct wl_global *idle_inhibit_manager_create(struct wl_display *display)
 {
 	wl_list_init(&inhibitors);
+	inhibitors_ready = true;
 	return wl_global_create(display, &zwp_idle_inhibit_manager_v1_interface, 1,
 	                        NULL, bind_manager);
 }

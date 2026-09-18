@@ -1,3 +1,4 @@
+#include "session_lock.h"
 #include "wallpaper.h"
 #include "backend.h"
 #include "compositor.h"
@@ -193,6 +194,14 @@ wallpaper_repaint(struct screen *screen, struct wld_renderer *renderer,
                   pixman_region32_t *damage)
 {
 	struct wallpaper_output *output = screen->wallpaper;
+
+	/* A locked session shows nothing of the desktop, the wallpaper least of
+	 * all: it is the one thing guaranteed to be under every window. */
+	if (session_lock_active()) {
+		wld_fill_region(renderer, 0xff000000, damage);
+		return;
+	}
+
 	if (output && output->native->width == screen->base.geometry.width &&
 	    output->native->height == screen->base.geometry.height) {
 		struct wld_buffer *buffer = renderer == swc.shm->renderer ?

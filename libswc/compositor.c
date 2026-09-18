@@ -1511,6 +1511,38 @@ raise_window_top(struct compositor_view *view)
 }
 
 void
+compositor_hide_for_lock(void)
+{
+	struct compositor_view *view;
+
+	wl_list_for_each(view, &compositor.views, link)
+	{
+		if (!view->visible || view->stack_layer == STACK_LAYER_LOCK) {
+			continue;
+		}
+		view->hidden_by_lock = true;
+		compositor_view_hide(view);
+	}
+}
+
+void
+compositor_restore_after_lock(void)
+{
+	struct compositor_view *view;
+
+	wl_list_for_each(view, &compositor.views, link)
+	{
+		if (!view->hidden_by_lock) {
+			continue;
+		}
+		view->hidden_by_lock = false;
+		/* The window manager's stacking order survived the lock, so come
+		 * back where we were rather than on top. */
+		compositor_view_show_in_place(view);
+	}
+}
+
+void
 compositor_view_set_stack_layer(struct compositor_view *view, uint32_t layer,
 	                            bool raise)
 {
@@ -1662,6 +1694,7 @@ compositor_create_view(struct surface *surface)
 	view->visible = false;
 	view->always_top = false;
 	view->stack_layer = STACK_LAYER_NORMAL;
+	view->hidden_by_lock = false;
 	view->extents.x1 = 0;
 	view->extents.y1 = 0;
 	view->extents.x2 = 0;

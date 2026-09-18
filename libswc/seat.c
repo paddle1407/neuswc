@@ -25,13 +25,16 @@
 #include "compositor.h"
 #include "data_device.h"
 #include "event.h"
+#include "idle_notify.h"
 #include "internal.h"
 #include "keyboard.h"
 #include "launch.h"
 #include "pointer.h"
+#include "primary_selection.h"
 #include "relative_pointer.h"
 #include "screen.h"
 #include "surface.h"
+#include "text_input.h"
 #include "util.h"
 
 #include <dirent.h>
@@ -73,6 +76,7 @@ struct seat {
 	struct wl_listener keyboard_focus_listener;
 	struct pointer pointer;
 	struct wl_listener data_device_listener;
+	struct wl_listener primary_selection_listener;
 
 	struct wl_global *global;
 	struct wl_list resources;
@@ -90,12 +94,17 @@ handle_keyboard_focus_event(struct wl_listener *listener, void *data)
 		return;
 	}
 
+	/* Text inputs follow the keyboard: the field that has focus is the one
+	 * an input method composes into. */
+	text_input_handle_focus(event_data->new);
+
 	if (event_data->new) {
 		struct wl_client *client =
 		    wl_resource_get_client(event_data->new->surface->resource);
 
-		/* Offer the selection to the new focus. */
+		/* Offer both selections to the new focus. */
 		data_device_offer_selection(seat->base.data_device, client);
+		primary_selection_device_offer(seat->base.primary_selection, client);
 	}
 }
 
@@ -112,6 +121,23 @@ handle_data_device_event(struct wl_listener *listener, void *data)
 	if (seat->base.keyboard->focus.client) {
 		data_device_offer_selection(seat->base.data_device,
 		                            seat->base.keyboard->focus.client);
+	}
+}
+
+static void
+handle_primary_selection_event(struct wl_listener *listener, void *data)
+{
+	struct seat *seat =
+	    wl_container_of(listener, seat, primary_selection_listener);
+	struct event *ev = data;
+
+	if (ev->type != PRIMARY_SELECTION_EVENT_SELECTION_CHANGED) {
+		return;
+	}
+
+	if (seat->base.keyboard->focus.client) {
+		primary_selection_device_offer(seat->base.primary_selection,
+		                               seat->base.keyboard->focus.client);
 	}
 }
 
@@ -266,6 +292,23 @@ handle_libinput_data(int fd, uint32_t mask, void *data)
 	}
 
 	while ((generic_event = libinput_get_event(seat->libinput))) {
+		/* Anything the user did in person counts as activity, whether or not
+		 * it reaches a client: a key caught by a compositor binding still
+		 * means they are at the keyboard. Device hotplug does not count. */
+		switch (libinput_event_get_type(generic_event)) {
+		case LIBINPUT_EVENT_KEYBOARD_KEY:
+		case LIBINPUT_EVENT_POINTER_MOTION:
+		case LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE:
+		case LIBINPUT_EVENT_POINTER_BUTTON:
+		case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+		case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+		case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+			idle_notify_activity();
+			break;
+		default:
+			break;
+		}
+
 		switch (libinput_event_get_type(generic_event)) {
 		case LIBINPUT_EVENT_DEVICE_ADDED:
 			device = libinput_event_get_device(generic_event);
@@ -478,6 +521,15 @@ seat_create(struct wl_display *display, const char *seat_name)
 	wl_signal_add(&seat->base.data_device->event_signal,
 	              &seat->data_device_listener);
 
+	seat->base.primary_selection = primary_selection_device_create();
+	if (!seat->base.primary_selection) {
+		ERROR("Could not initialize primary selection device\n");
+		goto error3a;
+	}
+	seat->primary_selection_listener.notify = &handle_primary_selection_event;
+	wl_signal_add(&seat->base.primary_selection->event_signal,
+	              &seat->primary_selection_listener);
+
 	seat->base.keyboard = keyboard_create(NULL);
 	if (!seat->base.keyboard) {
 		ERROR("Could not initialize keyboard\n");
@@ -504,6 +556,8 @@ error6:
 error5:
 	keyboard_destroy(seat->base.keyboard);
 error4:
+	primary_selection_device_destroy(seat->base.primary_selection);
+error3a:
 	data_device_destroy(seat->base.data_device);
 error3:
 	wl_global_destroy(seat->global);
@@ -528,6 +582,7 @@ seat_destroy(struct swc_seat *seat_base)
 
 	pointer_finalize(&seat->pointer);
 	keyboard_destroy(seat->base.keyboard);
+	primary_selection_device_destroy(seat->base.primary_selection);
 	data_device_destroy(seat->base.data_device);
 
 	wl_list_remove(&seat->swc_listener.link);

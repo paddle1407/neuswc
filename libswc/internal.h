@@ -48,19 +48,26 @@ struct swc {
 	struct swc_drm *const drm;
 #endif
 	struct swc_backend *backend;
+	struct wl_global *cursor_shape_manager;
 	struct wl_global *data_device_manager;
 	struct wl_global *foreign_toplevel_manager;
 	struct wl_global *idle_inhibit_manager;
+	struct wl_global *idle_notifier;
 	struct wl_global *kde_decoration_manager;
 	struct wl_global *layer_shell;
 	struct wl_global *panel_manager;
 	struct wl_global *pointer_constraints;
+	struct wl_global *primary_selection_device_manager;
 	struct wl_global *relative_pointer_manager;
 	struct wl_global *screencopy_manager;
+	struct wl_global *session_lock_manager;
 	struct wl_global *shell;
 	struct wl_global *snap_manager;
 	struct wl_global *select_manager;
 	struct wl_global *subcompositor;
+	struct wl_global *text_input_manager;
+	struct wl_global *input_method_manager;
+	struct wl_global *xdg_activation;
 	struct wl_global *xdg_decoration_manager;
 	struct wl_global *xdg_output_manager;
 	struct wl_global *xdg_shell;

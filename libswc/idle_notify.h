@@ -1,6 +1,6 @@
-/* swc: libswc/seat.h
+/* swc: libswc/idle_notify.h
  *
- * Copyright (c) 2013-2019 Michael Forney
+ * Copyright (c) 2025 charaWC contributors
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,21 +21,29 @@
  * SOFTWARE.
  */
 
-#ifndef SWC_SEAT_H
-#define SWC_SEAT_H
+#ifndef SWC_IDLE_NOTIFY_H
+#define SWC_IDLE_NOTIFY_H
 
-struct wl_display;
+#include <wayland-server.h>
 
-struct swc_seat {
-	struct pointer *pointer;
-	struct keyboard *keyboard;
-	struct data_device *data_device;
-	struct primary_selection_device *primary_selection;
-};
-
-struct swc_seat *
-seat_create(struct wl_display *display, const char *name);
+struct wl_global *
+idle_notifier_create(struct wl_display *display);
 void
-seat_destroy(struct swc_seat *seat);
+idle_notifier_finish(void);
+
+/*
+ * Report user input. Every notification that had gone idle is told the user is
+ * back, and every timer starts counting again from now.
+ *
+ * This is called from the input path, so it is on the hot path for pointer
+ * motion: it does no work beyond walking the notification list, which is empty
+ * unless something has actually asked to be told about idling.
+ */
+void
+idle_notify_activity(void);
+
+/* Called by idle_inhibit when an inhibitor appears or goes away. */
+void
+idle_notify_inhibit_changed(void);
 
 #endif

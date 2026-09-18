@@ -82,6 +82,11 @@ struct compositor_view {
 	/* Whether or not to make it always be on top of other windows */
 	bool always_top;
 
+	/* Hidden because the session is locked, and to be shown again when it
+	 * is unlocked. Kept here rather than in a list so that a view destroyed
+	 * while locked needs no bookkeeping. */
+	bool hidden_by_lock;
+
 	/* Global stacking layer for this view */
 	uint32_t stack_layer;
 
@@ -201,10 +206,24 @@ enum compositor_stack_layer {
 	 * pinning, but below the overlay layer a lock screen uses. */
 	STACK_LAYER_PINNED = 5,
 	STACK_LAYER_OVERLAY = 6,
+	/* Session lock surfaces, above everything else there is. Nothing a
+	 * client can ask for reaches this layer; only ext-session-lock does. */
+	STACK_LAYER_LOCK = 7,
 };
 
 void
 compositor_view_set_stack_layer(struct compositor_view *view, uint32_t layer,
 	                            bool raise);
+
+/*
+ * Hide every mapped view below the lock layer, and put them back afterwards.
+ * This is what keeps window contents off a locked screen: relying on the lock
+ * surfaces being opaque would leave anything they fail to cover -- an output
+ * the locker never got to, a surface that is not fully opaque -- on show.
+ */
+void
+compositor_hide_for_lock(void);
+void
+compositor_restore_after_lock(void);
 
 #endif

@@ -7,6 +7,7 @@
 #include "pointer.h"
 #include "screen.h"
 #include "seat.h"
+#include "session_lock.h"
 #include "surface.h"
 #include "util.h"
 #include "view.h"
@@ -436,7 +437,15 @@ exclusive_keyboard_surface(void)
 static void
 update_keyboard_focus(void)
 {
-	struct layer_surface *exclusive = exclusive_keyboard_surface();
+	struct layer_surface *exclusive;
+
+	/* A lock surface owns the keyboard outright. A panel that maps or
+	 * changes while locked must not pull focus out of the lock screen. */
+	if (session_lock_active()) {
+		return;
+	}
+
+	exclusive = exclusive_keyboard_surface();
 	struct compositor_view *current = swc.seat->keyboard->focus.view;
 	struct layer_surface *current_layer = layer_surface_from_view(current);
 
@@ -469,6 +478,10 @@ layer_shell_handle_pointer_press(struct compositor_view *view)
 	struct layer_surface *surface = layer_surface_from_view(view);
 	struct layer_surface *exclusive;
 	struct compositor_view *current;
+
+	if (session_lock_active()) {
+		return;
+	}
 
 	if (!surface || !surface->mapped ||
 	    surface->current.keyboard_interactivity ==

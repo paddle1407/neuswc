@@ -57,6 +57,16 @@ struct xdg_positioner {
 	enum xdg_positioner_gravity gravity;
 	enum xdg_positioner_constraint_adjustment constraint;
 	int32_t offset_x, offset_y;
+
+	/* Version 3. The parent size and the configure it belongs to let a
+	 * client describe the geometry it positioned against, so that a
+	 * compositor constraining the popup knows what it was aiming at. A
+	 * reactive popup expects to be repositioned when that geometry moves. */
+	bool reactive;
+	bool has_parent_size;
+	int32_t parent_width, parent_height;
+	bool has_parent_configure;
+	uint32_t parent_configure;
 };
 
 struct toplevel_configure {
@@ -94,6 +104,7 @@ struct xdg_popup {
 };
 
 static void queue_configure(struct xdg_toplevel *toplevel);
+static void send_wm_capabilities(struct xdg_toplevel *toplevel);
 
 /* xdg_positioner */
 static void
@@ -173,6 +184,43 @@ set_offset(struct wl_client *client, struct wl_resource *resource, int32_t x,
 	positioner->offset_y = y;
 }
 
+static void
+set_reactive(struct wl_client *client, struct wl_resource *resource)
+{
+	struct xdg_positioner *positioner = wl_resource_get_user_data(resource);
+
+	(void)client;
+	positioner->reactive = true;
+}
+
+static void
+set_parent_size(struct wl_client *client, struct wl_resource *resource,
+                int32_t width, int32_t height)
+{
+	struct xdg_positioner *positioner = wl_resource_get_user_data(resource);
+
+	(void)client;
+	if (width < 0 || height < 0) {
+		wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT,
+		                       "invalid parent size");
+		return;
+	}
+	positioner->has_parent_size = true;
+	positioner->parent_width = width;
+	positioner->parent_height = height;
+}
+
+static void
+set_parent_configure(struct wl_client *client, struct wl_resource *resource,
+                     uint32_t serial)
+{
+	struct xdg_positioner *positioner = wl_resource_get_user_data(resource);
+
+	(void)client;
+	positioner->has_parent_configure = true;
+	positioner->parent_configure = serial;
+}
+
 static const struct xdg_positioner_interface positioner_impl = {
     .destroy = destroy_resource,
     .set_size = set_size,
@@ -181,6 +229,9 @@ static const struct xdg_positioner_interface positioner_impl = {
     .set_gravity = set_gravity,
     .set_constraint_adjustment = set_constraint_adjustment,
     .set_offset = set_offset,
+    .set_reactive = set_reactive,
+    .set_parent_size = set_parent_size,
+    .set_parent_configure = set_parent_configure,
 };
 
 static struct swc_rectangle
@@ -356,6 +407,39 @@ remove_state(struct xdg_toplevel *toplevel, uint32_t state)
 	return false;
 }
 
+/*
+ * Tell the client how large it can usefully be before it picks a size of its
+ * own -- the usable area of the monitor it is on, so a window that wants to
+ * open "as big as sensible" does not pick something taller than the screen
+ * minus the bar. Sent before the configure it belongs to, as the protocol
+ * requires.
+ */
+static void
+send_configure_bounds(struct xdg_toplevel *toplevel)
+{
+	struct screen *screen;
+	const struct swc_rectangle *geom;
+	uint32_t screens;
+
+	if (wl_resource_get_version(toplevel->resource) <
+	    XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION) {
+		return;
+	}
+
+	screens = toplevel->window.view ? toplevel->window.view->base.screens : 0;
+	wl_list_for_each(screen, &swc.screens, link)
+	{
+		if (screens && !(screens & screen_mask(screen))) {
+			continue;
+		}
+		geom = &screen->base.usable_geometry;
+		xdg_toplevel_send_configure_bounds(toplevel->resource,
+		                                   (int32_t)geom->width,
+		                                   (int32_t)geom->height);
+		return;
+	}
+}
+
 static void
 send_configure(void *data)
 {
@@ -375,6 +459,7 @@ send_configure(void *data)
 	++toplevel->configure_count;
 	uint32_t width = window->configure.pending ? window->configure.width : window->view->base.geometry.width;
 	uint32_t height = window->configure.pending ? window->configure.height : window->view->base.geometry.height;
+	send_configure_bounds(toplevel);
 	xdg_toplevel_send_configure(toplevel->resource, width, height, &toplevel->states);
 	xdg_surface_send_configure(toplevel->xdg_surface->resource, c->serial);
 }
@@ -660,6 +745,7 @@ xdg_toplevel_new(struct wl_client *client, uint32_t version, uint32_t id,
 	              &toplevel->surface_commit_listener);
 	wl_resource_set_implementation(toplevel->resource, &toplevel_impl, toplevel,
 	                               &destroy_toplevel);
+	send_wm_capabilities(toplevel);
 	window_manage(&toplevel->window);
 
 	return toplevel;
@@ -670,6 +756,36 @@ error1:
 	free(toplevel);
 error0:
 	return NULL;
+}
+
+/*
+ * Version 5 lets the compositor say which window-management actions exist, so
+ * a client can leave out buttons that would do nothing. charaWC maximizes,
+ * minimizes and fullscreens; it has no window menu, so that one is absent
+ * rather than advertised and ignored.
+ */
+static void
+send_wm_capabilities(struct xdg_toplevel *toplevel)
+{
+	static const uint32_t capabilities[] = {
+		XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE,
+		XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE,
+		XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN,
+	};
+	struct wl_array array;
+
+	if (wl_resource_get_version(toplevel->resource) <
+	    XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) {
+		return;
+	}
+
+	/* wl_array_init plus a borrowed buffer: the array is only read while
+	 * the event is marshalled, so there is nothing to allocate or free. */
+	wl_array_init(&array);
+	array.data = (void *)capabilities;
+	array.size = sizeof(capabilities);
+	array.alloc = 0;
+	xdg_toplevel_send_wm_capabilities(toplevel->resource, &array);
 }
 
 /* xdg_popup */
@@ -707,9 +823,54 @@ grab(struct wl_client *client, struct wl_resource *resource,
 {
 }
 
+/*
+ * Version 3 lets a client move an already-mapped popup -- a submenu that has
+ * to flip to the other side of its parent, say -- without tearing it down and
+ * building a new one. The token comes back in 'repositioned' so the client can
+ * tell which of several requests it is seeing the answer to.
+ */
+static void
+reposition(struct wl_client *client, struct wl_resource *resource,
+           struct wl_resource *positioner_resource, uint32_t token)
+{
+	struct xdg_popup *popup = wl_resource_get_user_data(resource);
+	struct xdg_positioner *positioner;
+	struct swc_rectangle rect;
+	uint32_t serial;
+
+	(void)client;
+	if (!popup || !positioner_resource) {
+		return;
+	}
+	positioner = wl_resource_get_user_data(positioner_resource);
+	if (!positioner) {
+		return;
+	}
+
+	popup->positioner = *positioner;
+
+	if (!popup->parent) {
+		/* Nothing to position against yet; the geometry is applied when the
+		 * parent arrives. */
+		return;
+	}
+
+	rect = calculate_position(&popup->positioner);
+	view_move(&popup->view->base, popup->parent->base.geometry.x + rect.x,
+	          popup->parent->base.geometry.y + rect.y);
+
+	serial = wl_display_next_serial(swc.display);
+	popup->xdg_surface->configure_serial = serial;
+	xdg_popup_send_repositioned(popup->resource, token);
+	xdg_popup_send_configure(popup->resource, rect.x, rect.y, rect.width,
+	                         rect.height);
+	xdg_surface_send_configure(popup->xdg_surface->resource, serial);
+}
+
 static const struct xdg_popup_interface popup_impl = {
     .destroy = destroy_resource,
     .grab = grab,
+    .reposition = reposition,
 };
 
 bool
@@ -1078,6 +1239,6 @@ bind_wm_base(struct wl_client *client, void *data, uint32_t version,
 struct wl_global *
 xdg_shell_create(struct wl_display *display)
 {
-	return wl_global_create(display, &xdg_wm_base_interface, 1, NULL,
+	return wl_global_create(display, &xdg_wm_base_interface, 5, NULL,
 	                        &bind_wm_base);
 }

@@ -1,6 +1,6 @@
-/* swc: libswc/seat.h
+/* swc: libswc/xdg_activation.h
  *
- * Copyright (c) 2013-2019 Michael Forney
+ * Copyright (c) 2025 charaWC contributors
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,21 +21,14 @@
  * SOFTWARE.
  */
 
-#ifndef SWC_SEAT_H
-#define SWC_SEAT_H
+#ifndef SWC_XDG_ACTIVATION_H
+#define SWC_XDG_ACTIVATION_H
 
-struct wl_display;
+#include <wayland-server.h>
 
-struct swc_seat {
-	struct pointer *pointer;
-	struct keyboard *keyboard;
-	struct data_device *data_device;
-	struct primary_selection_device *primary_selection;
-};
-
-struct swc_seat *
-seat_create(struct wl_display *display, const char *name);
+struct wl_global *
+xdg_activation_create(struct wl_display *display);
 void
-seat_destroy(struct swc_seat *seat);
+xdg_activation_finish(void);
 
 #endif

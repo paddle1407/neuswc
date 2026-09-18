@@ -1,6 +1,6 @@
-/* swc: libswc/seat.h
+/* swc: libswc/session_lock.h
  *
- * Copyright (c) 2013-2019 Michael Forney
+ * Copyright (c) 2025 charaWC contributors
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -21,21 +21,23 @@
  * SOFTWARE.
  */
 
-#ifndef SWC_SEAT_H
-#define SWC_SEAT_H
+#ifndef SWC_SESSION_LOCK_H
+#define SWC_SESSION_LOCK_H
 
-struct wl_display;
+#include <stdbool.h>
+#include <wayland-server.h>
 
-struct swc_seat {
-	struct pointer *pointer;
-	struct keyboard *keyboard;
-	struct data_device *data_device;
-	struct primary_selection_device *primary_selection;
-};
-
-struct swc_seat *
-seat_create(struct wl_display *display, const char *name);
+struct wl_global *
+session_lock_manager_create(struct wl_display *display);
 void
-seat_destroy(struct swc_seat *seat);
+session_lock_finish(void);
+
+/*
+ * Whether the session is locked. Once true this stays true until the locker
+ * unlocks deliberately -- a locker that crashes leaves the session locked, on
+ * purpose, because the alternative is that killing it unlocks the screen.
+ */
+bool
+session_lock_active(void);
 
 #endif

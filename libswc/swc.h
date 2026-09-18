@@ -97,6 +97,12 @@ void
 swc_pointer_send_axis(uint32_t time, uint32_t axis, int32_t value120);
 
 /* Cursor control (compositor-internal cursor) */
+/*
+ * The first six are swc's own window-manager cursors. The rest mirror the
+ * shapes in cursor-shape-v1 one for one, so that a client asking for, say, a
+ * text cursor gets the themed image the window manager loaded rather than
+ * having to ship its own. Existing values keep their numbers.
+ */
 enum swc_cursor_kind {
 	SWC_CURSOR_DEFAULT = 0,
 	SWC_CURSOR_BOX = 1,
@@ -104,6 +110,44 @@ enum swc_cursor_kind {
 	SWC_CURSOR_SIGHT = 3,
 	SWC_CURSOR_UP = 4,
 	SWC_CURSOR_DOWN = 5,
+
+	SWC_CURSOR_CONTEXT_MENU = 6,
+	SWC_CURSOR_HELP = 7,
+	SWC_CURSOR_POINTER = 8,
+	SWC_CURSOR_PROGRESS = 9,
+	SWC_CURSOR_WAIT = 10,
+	SWC_CURSOR_CELL = 11,
+	SWC_CURSOR_CROSSHAIR = 12,
+	SWC_CURSOR_TEXT = 13,
+	SWC_CURSOR_VERTICAL_TEXT = 14,
+	SWC_CURSOR_ALIAS = 15,
+	SWC_CURSOR_COPY = 16,
+	SWC_CURSOR_MOVE = 17,
+	SWC_CURSOR_NO_DROP = 18,
+	SWC_CURSOR_NOT_ALLOWED = 19,
+	SWC_CURSOR_GRAB = 20,
+	SWC_CURSOR_GRABBING = 21,
+	SWC_CURSOR_E_RESIZE = 22,
+	SWC_CURSOR_N_RESIZE = 23,
+	SWC_CURSOR_NE_RESIZE = 24,
+	SWC_CURSOR_NW_RESIZE = 25,
+	SWC_CURSOR_S_RESIZE = 26,
+	SWC_CURSOR_SE_RESIZE = 27,
+	SWC_CURSOR_SW_RESIZE = 28,
+	SWC_CURSOR_W_RESIZE = 29,
+	SWC_CURSOR_EW_RESIZE = 30,
+	SWC_CURSOR_NS_RESIZE = 31,
+	SWC_CURSOR_NESW_RESIZE = 32,
+	SWC_CURSOR_NWSE_RESIZE = 33,
+	SWC_CURSOR_COL_RESIZE = 34,
+	SWC_CURSOR_ROW_RESIZE = 35,
+	SWC_CURSOR_ALL_SCROLL = 36,
+	SWC_CURSOR_ZOOM_IN = 37,
+	SWC_CURSOR_ZOOM_OUT = 38,
+	SWC_CURSOR_DND_ASK = 39,
+	SWC_CURSOR_ALL_RESIZE = 40,
+
+	SWC_CURSOR_KIND_COUNT
 };
 
 enum swc_cursor_mode {

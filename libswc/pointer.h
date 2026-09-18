@@ -91,6 +91,11 @@ void
 pointer_set_region(struct pointer *pointer, pixman_region32_t *region);
 void
 pointer_set_cursor(struct pointer *pointer, uint32_t id);
+/* cursor-shape-v1: the client under the pointer picks a themed cursor. */
+void
+pointer_set_shape(struct pointer *pointer, enum swc_cursor_kind kind);
+void
+pointer_clear_shape(struct pointer *pointer);
 /* Restore a lock-release hint without dispatching physical motion or focus. */
 void
 pointer_warp(struct pointer *pointer, wl_fixed_t x, wl_fixed_t y);
