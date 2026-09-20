@@ -14,6 +14,7 @@ libswc_src = files(
   'idle_notify.c',
   'titlebar.c',
   'input.c',
+  'input_mode.c',
   'kde_decoration.c',
   'keyboard.c',
   'layer_shell.c',

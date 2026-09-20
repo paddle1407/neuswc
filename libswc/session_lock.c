@@ -220,6 +220,8 @@ maybe_send_locked(void)
 static void
 begin_lock(void)
 {
+	input_mode_cancel();
+	swc_overview_end();
 	lock.locked = true;
 	lock.sent_locked = false;
 

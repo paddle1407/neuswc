@@ -61,6 +61,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -185,7 +186,9 @@ static struct {
 
 	/* zoom level (1.0 = normal, >1 = zoomed in, <1 = zoomed out) */
 	float zoom;
-	struct wld_buffer *zoom_buffer;
+	struct swc_screen *overview_screen;
+	struct swc_overview_item *overview_items;
+	unsigned overview_count;
 } compositor;
 
 /* The static handler retains ownership of a claimed button even if the window
@@ -255,6 +258,10 @@ handle_screen_destroy(struct wl_listener *listener, void *data)
 	struct target *target =
 	    wl_container_of(listener, target, screen_destroy_listener);
 
+	if (compositor.overview_screen && screen_mask((struct screen *)compositor.overview_screen) == target->mask) {
+		input_mode_cancel();
+		swc_overview_end();
+	}
 	wl_list_remove(&target->view_handler.link);
 	wl_list_remove(&target->screen_destroy_listener.link);
 	wld_destroy_surface(target->surface);
@@ -869,6 +876,12 @@ schedule_updates(uint32_t screens)
 		}
 	}
 
+	if (compositor.overview_screen) {
+		const struct swc_rectangle *g = &compositor.overview_screen->geometry;
+		pixman_region32_union_rect(&compositor.damage, &compositor.damage,
+		    g->x, g->y, g->width, g->height);
+		screens |= screen_mask((struct screen *)compositor.overview_screen);
+	}
 	compositor.scheduled_updates |= screens;
 }
 
@@ -957,12 +970,6 @@ swc_set_zoom(float level)
 
 	if (compositor.zoom != level) {
 		compositor.zoom = level;
-		if (level == 1.0f) {
-			if (compositor.zoom_buffer) {
-				wld_buffer_unreference(compositor.zoom_buffer);
-				compositor.zoom_buffer = NULL;
-			}
-		}
 		/* damage entire screen to force full repaint */
 		schedule_updates(-1);
 	}
@@ -974,224 +981,337 @@ swc_get_zoom(void)
 	return compositor.zoom;
 }
 
-static pixman_format_code_t
-wld_to_pixman_format(enum wld_format format)
+/*
+ * Draw the screen's scene, scaled about the screen's centre, into whatever
+ * target `renderer` already has.
+ *
+ * This used to composite into an shm buffer with pixman and blit the result.
+ * That could only draw a window whose buffer it could map, and a buffer
+ * imported from a GPU client is not CPU accessible, so every
+ * hardware-accelerated window was silently left out of the zoomed picture.
+ * Drawing with the backend's own renderer through wld_blend_scaled() has no
+ * such restriction, and costs one quad per window instead of a full-screen
+ * readback and upload per frame.
+ *
+ * Views that are always on top -- a panel, a status bar -- are drawn at their
+ * real size and position: zooming the desktop should not shrink the furniture
+ * around it.
+ */
+static void
+fill_ring(struct wld_renderer *renderer, uint32_t color,
+          double x, double y, double w, double h, double thickness)
 {
-	switch (format) {
-	case WLD_FORMAT_XRGB8888:
-		return PIXMAN_x8r8g8b8;
-	case WLD_FORMAT_ARGB8888:
-		return PIXMAN_a8r8g8b8;
-	default:
-		return PIXMAN_x8r8g8b8;
-	}
+	int32_t bx = (int32_t)(x - thickness), by = (int32_t)(y - thickness);
+	int32_t bw = (int32_t)(w + 2 * thickness), bh = (int32_t)(h + 2 * thickness);
+	int32_t bt = (int32_t)thickness;
+
+	if (bt <= 0 || bw <= 2 * bt || bh <= 2 * bt)
+		return;
+
+	wld_fill_rectangle(renderer, color, bx, by, bw, bt);
+	wld_fill_rectangle(renderer, color, bx, by + bh - bt, bw, bt);
+	wld_fill_rectangle(renderer, color, bx, by + bt, bt, bh - 2 * bt);
+	wld_fill_rectangle(renderer, color, bx + bw - bt, by + bt, bt, bh - 2 * bt);
 }
 
-static struct wld_buffer *
-zoom_buffer_for_screen(struct screen *screen)
+static void
+render_zoomed(struct screen *screen, struct wld_renderer *renderer, float zoom)
 {
-	uint32_t width = screen->base.geometry.width;
-	uint32_t height = screen->base.geometry.height;
-
-	if (compositor.zoom_buffer &&
-	    (compositor.zoom_buffer->width != width ||
-	     compositor.zoom_buffer->height != height ||
-	     compositor.zoom_buffer->format != WLD_FORMAT_ARGB8888)) {
-		wld_buffer_unreference(compositor.zoom_buffer);
-		compositor.zoom_buffer = NULL;
-	}
-
-	if (!compositor.zoom_buffer) {
-		compositor.zoom_buffer =
-		    wld_create_buffer(swc.shm->context, width, height,
-		                      WLD_FORMAT_ARGB8888, WLD_FLAG_MAP);
-		if (!compositor.zoom_buffer) {
-			return NULL;
-		}
-	}
-
-	wld_buffer_reference(compositor.zoom_buffer);
-	return compositor.zoom_buffer;
-}
-
-/* render zoomed view to shm      wallpaper unscaled, windows scaled */
-static struct wld_buffer *
-render_zoomed_to_shm(struct screen *screen, float zoom)
-{
-	uint32_t width = screen->base.geometry.width;
-	uint32_t height = screen->base.geometry.height;
-	int32_t screen_x = screen->base.geometry.x;
-	int32_t screen_y = screen->base.geometry.y;
-	int32_t cx = screen_x + width / 2;
-	int32_t cy = screen_y + height / 2;
+	const struct swc_rectangle *geom = &screen->base.geometry;
+	double cx = geom->x + geom->width / 2.0;
+	double cy = geom->y + geom->height / 2.0;
 	struct compositor_view *view;
-	struct wld_buffer *buffer = zoom_buffer_for_screen(screen);
-	if (!buffer) {
-		return NULL;
-	}
-
-	if (!wld_set_target_buffer(swc.shm->renderer, buffer)) {
-		wld_buffer_unreference(buffer);
-		return NULL;
-	}
-
 	pixman_region32_t full;
-	pixman_region32_init_rect(&full, 0, 0, width, height);
-	wallpaper_repaint(screen, swc.shm->renderer, &full);
+
+	pixman_region32_init_rect(&full, 0, 0, geom->width, geom->height);
+	wallpaper_repaint(screen, renderer, &full);
 	pixman_region32_fini(&full);
-	wld_flush(swc.shm->renderer);
 
-	if (!wld_map(buffer)) {
-		wld_buffer_unreference(buffer);
-		return NULL;
+	wl_list_for_each_reverse(view, &compositor.views, link) {
+		struct wld_buffer *src = view->buffer, *bar;
+		const struct swc_rectangle *vg = &view->base.geometry;
+		struct swc_rectangle bar_rect;
+		struct wld_rect dst;
+		struct wld_frect area;
+		double scale, x, y, w, h, out, in, border;
+		double sx, sy, sw, sh;
+
+		/*
+		 * Hidden means not on screen, and that includes everything a session
+		 * lock put away. The pixman implementation walked the list without
+		 * asking, so a lock that had just hidden the desktop still had it
+		 * drawn underneath while the screen was zoomed.
+		 */
+		if (!view->visible || !src)
+			continue;
+		if (!(wld_capabilities(renderer, src) & WLD_CAPABILITY_READ))
+			continue;
+
+		scale = view->always_top ? 1.0 : zoom;
+		x = (vg->x - cx) * scale + geom->width / 2.0;
+		y = (vg->y - cy) * scale + geom->height / 2.0;
+		w = vg->width * scale;
+		h = vg->height * scale;
+		out = view->border.outwidth * scale;
+		in = view->border.inwidth * scale;
+		border = out + in;
+
+		if (x + w + border < 0 || x - border >= geom->width ||
+		    y + h + border < 0 || y - border >= geom->height)
+			continue;
+
+		if (view->border.outwidth > 0)
+			fill_ring(renderer, view->border.outcolor, x, y, w, h, border);
+		if (view->border.inwidth > 0)
+			fill_ring(renderer, view->border.incolor, x, y, w, h, in);
+
+		/*
+		 * A window's geometry can be a sub-rectangle of its buffer -- the
+		 * client's own margin for the shadow it is not drawing -- so the
+		 * source is the window geometry, not the whole buffer.
+		 */
+		sx = view->window ? view->buffer_offset_x : 0;
+		sy = view->window ? view->buffer_offset_y : 0;
+		sw = vg->width;
+		sh = vg->height;
+
+		/* Clamp to what the buffer actually holds, and move the destination
+		 * with it so the clamp crops rather than stretches. */
+		if (sx < 0) { sw += sx; x -= sx * scale; sx = 0; }
+		if (sy < 0) { sh += sy; y -= sy * scale; sy = 0; }
+		if (sx + sw > src->width)
+			sw = src->width - sx;
+		if (sy + sh > src->height)
+			sh = src->height - sy;
+		if (sw <= 0 || sh <= 0)
+			continue;
+
+		dst = (struct wld_rect){ (int32_t)(x + 0.5), (int32_t)(y + 0.5),
+		                         (uint32_t)(sw * scale + 0.5),
+		                         (uint32_t)(sh * scale + 0.5) };
+		area = (struct wld_frect){ sx, sy, sw, sh };
+		if (dst.width == 0 || dst.height == 0)
+			continue;
+
+		wld_blend_scaled(renderer, src, &dst, &area);
+
+		/*
+		 * The titlebar is a compositor-drawn buffer of its own, sitting above
+		 * the window's geometry. The pixman implementation never drew it, so
+		 * every window lost its bar the moment the screen was zoomed.
+		 */
+		if ((bar = titlebar_content(view, &bar_rect))) {
+			struct wld_rect bdst = {
+				(int32_t)((bar_rect.x - cx) * scale + geom->width / 2.0 + 0.5),
+				(int32_t)((bar_rect.y - cy) * scale + geom->height / 2.0 + 0.5),
+				(uint32_t)(bar_rect.width * scale + 0.5),
+				(uint32_t)(bar_rect.height * scale + 0.5),
+			};
+			struct wld_frect barea = { 0, 0, bar->width, bar->height };
+
+			if (bdst.width > 0 && bdst.height > 0 &&
+			    (wld_capabilities(renderer, bar) & WLD_CAPABILITY_READ))
+				wld_blend_scaled(renderer, bar, &bdst, &barea);
+		}
 	}
+}
 
-	pixman_image_t *dst_img = pixman_image_create_bits(
-	    wld_to_pixman_format(buffer->format), buffer->width, buffer->height,
-	    buffer->map, buffer->pitch);
+/* Return the nearest managed toplevel. Transient toplevels get their own card;
+ * subsurfaces and popups belong to their first window ancestor. */
+static struct compositor_view *overview_owner(struct compositor_view *view)
+{
+	while (view && !view->window) view = view->parent;
+	return view;
+}
 
-	if (!dst_img) {
-		wld_unmap(buffer);
-		wld_buffer_unreference(buffer);
-		return NULL;
+EXPORT bool swc_window_overview_geometry(struct swc_window *base, struct swc_rectangle *rect)
+{
+	struct window *window = (struct window *)base;
+	if (!window || !window->view || !rect) return false;
+	struct compositor_view *view = window->view;
+	*rect = frame_geometry(view);
+	int border = view->border.inwidth + view->border.outwidth;
+	rect->x -= border; rect->y -= border;
+	rect->width += 2 * border; rect->height += 2 * border;
+	/* Include child surfaces outside the frame, so popups remain visible
+	 * without overlapping another card. Transient toplevels have own cards. */
+	int64_t x1 = rect->x, y1 = rect->y;
+	int64_t x2 = x1 + rect->width, y2 = y1 + rect->height;
+	struct compositor_view *child;
+	wl_list_for_each(child, &compositor.views, link) {
+		if (child == view || !child->buffer || overview_owner(child) != view) continue;
+		const struct swc_rectangle *g = &child->base.geometry;
+		x1 = MIN(x1, g->x); y1 = MIN(y1, g->y);
+		x2 = MAX(x2, (int64_t)g->x + g->width);
+		y2 = MAX(y2, (int64_t)g->y + g->height);
 	}
+	rect->x = clamp_i32(x1); rect->y = clamp_i32(y1);
+	rect->width = span_u32(rect->x, clamp_i32(x2));
+	rect->height = span_u32(rect->y, clamp_i32(y2));
+	return rect->width && rect->height;
+}
 
-	/* render each view with scaling */
-	wl_list_for_each_reverse(view, &compositor.views, link)
-	{
-		struct wld_buffer *src = view->buffer;
-		const struct swc_rectangle *geom = &view->base.geometry;
+static void overview_child_changed(struct compositor_view *view)
+{
+	struct compositor_view *owner = overview_owner(view);
+	if (compositor.overview_screen && owner && owner != view && owner->window->managed &&
+	    owner->window->handler && owner->window->handler->geometry_changed)
+		owner->window->handler->geometry_changed(owner->window->handler_data);
+}
 
-		if (!src) {
-			continue;
-		}
-
-		if (!(wld_capabilities(swc.shm->renderer, src) & WLD_CAPABILITY_READ)) {
-			src = view->base.buffer;
-		}
-		if (!src) {
-			continue;
-		}
-
-		/* maths     zoom position and size */
-		float zoomed_x, zoomed_y, zoomed_w, zoomed_h;
-		float border_out, border_in, total_border;
-
-		if (view->always_top) {
-			zoomed_x = geom->x - screen_x;
-			zoomed_y = geom->y - screen_y;
-			zoomed_w = geom->width;
-			zoomed_h = geom->height;
-
-			border_out = view->border.outwidth;
-			border_in = view->border.inwidth;
-		} else {
-			zoomed_x = (geom->x - cx) * zoom + width / 2.0f;
-			zoomed_y = (geom->y - cy) * zoom + height / 2.0f;
-			zoomed_w = geom->width * zoom;
-			zoomed_h = geom->height * zoom;
-
-			border_out = view->border.outwidth * zoom;
-			border_in = view->border.inwidth * zoom;
-		}
-
-		total_border = border_out + border_in;
-
-		if (zoomed_x + zoomed_w + total_border < 0 ||
-		    zoomed_x - total_border >= (int32_t)width ||
-		    zoomed_y + zoomed_h + total_border < 0 ||
-		    zoomed_y - total_border >= (int32_t)height) {
-			continue;
-		}
-
-		if (view->border.outwidth > 0 && border_out >= 1) {
-			int32_t bx = (int32_t)(zoomed_x - total_border);
-			int32_t by = (int32_t)(zoomed_y - total_border);
-			int32_t bw = (int32_t)(zoomed_w + 2 * total_border);
-			int32_t bh = (int32_t)(zoomed_h + 2 * total_border);
-			int32_t bo = (int32_t)border_out;
-
-			pixman_color_t color = {
-			    .red = ((view->border.outcolor >> 16) & 0xff) * 257,
-			    .green = ((view->border.outcolor >> 8) & 0xff) * 257,
-			    .blue = (view->border.outcolor & 0xff) * 257,
-			    .alpha = 0xffff};
-			pixman_image_t *fill = pixman_image_create_solid_fill(&color);
-			if (fill) {
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx, by, bw, bo);
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx, by + bh - bo, bw, bo);
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx, by + bo, bo, bh - 2 * bo);
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx + bw - bo, by + bo, bo,
-				                         bh - 2 * bo);
-				pixman_image_unref(fill);
-			}
-		}
-
-		if (view->border.inwidth > 0 && border_in >= 1) {
-			int32_t bx = (int32_t)(zoomed_x - border_in);
-			int32_t by = (int32_t)(zoomed_y - border_in);
-			int32_t bw = (int32_t)(zoomed_w + 2 * border_in);
-			int32_t bh = (int32_t)(zoomed_h + 2 * border_in);
-			int32_t bi = (int32_t)border_in;
-
-			pixman_color_t color = {
-			    .red = ((view->border.incolor >> 16) & 0xff) * 257,
-			    .green = ((view->border.incolor >> 8) & 0xff) * 257,
-			    .blue = (view->border.incolor & 0xff) * 257,
-			    .alpha = 0xffff};
-			pixman_image_t *fill = pixman_image_create_solid_fill(&color);
-			if (fill) {
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx, by, bw, bi);
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx, by + bh - bi, bw, bi);
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx, by + bi, bi, bh - 2 * bi);
-				pixman_image_composite32(PIXMAN_OP_OVER, fill, NULL, dst_img, 0,
-				                         0, 0, 0, bx + bw - bi, by + bi, bi,
-				                         bh - 2 * bi);
-				pixman_image_unref(fill);
-			}
-		}
-
-		if (!wld_map(src)) {
-			continue;
-		}
-
-		pixman_image_t *src_img = pixman_image_create_bits(
-		    wld_to_pixman_format(src->format), src->width, src->height,
-		    src->map, src->pitch);
-
-		if (src_img) {
-			if (!view->always_top) {
-				pixman_transform_t transform;
-				pixman_transform_init_identity(&transform);
-				pixman_fixed_t scale = pixman_double_to_fixed(1.0 / zoom);
-				pixman_transform_scale(&transform, NULL, scale, scale);
-				pixman_image_set_transform(src_img, &transform);
-				pixman_image_set_filter(src_img, PIXMAN_FILTER_BILINEAR, NULL,
-				                        0);
-			}
-
-			pixman_image_composite32(PIXMAN_OP_OVER, src_img, NULL, dst_img, 0,
-			                         0, 0, 0, (int32_t)zoomed_x,
-			                         (int32_t)zoomed_y, (int32_t)(zoomed_w + 1),
-			                         (int32_t)(zoomed_h + 1));
-
-			pixman_image_unref(src_img);
-		}
-
-		wld_unmap(src);
+EXPORT bool swc_overview_begin(struct swc_screen *screen,
+                              const struct swc_overview_item *items, unsigned n)
+{
+	if (!compositor.initialized || !swc.active || session_lock_active() || !screen || !n || !items)
+		return false;
+	struct swc_overview_item *copy = calloc(n, sizeof(*copy));
+	if (!copy) return false;
+	for (unsigned i = 0; i < n; ++i) {
+		if (!items[i].source.width || !items[i].source.height || !items[i].rect.width ||
+		    !items[i].rect.height) { free(copy); return false; }
+		copy[i] = items[i];
 	}
+	free(compositor.overview_items);
+	compositor.overview_items = copy;
+	compositor.overview_count = n;
+	compositor.overview_screen = screen;
+	compositor_damage_all();
+	return true;
+}
+EXPORT void swc_overview_end(void)
+{
+	if (!compositor.overview_screen) return;
+	compositor.overview_screen = NULL;
+	free(compositor.overview_items);
+	compositor.overview_items = NULL;
+	compositor.overview_count = 0;
+	compositor_damage_all();
+}
 
-	pixman_image_unref(dst_img);
-	wld_unmap(buffer);
+/* Clip in destination space, then adjust the source by the same fraction.
+ * This keeps popups, negative buffer insets, and offscreen panels in bounds. */
+static void overview_blit(struct wld_renderer *renderer, struct wld_buffer *buffer,
+                          double sx, double sy, double width, double height,
+                          double x, double y, double scale_x, double scale_y,
+                          struct swc_rectangle clip)
+{
+	if (!buffer || !(wld_capabilities(renderer, buffer) & WLD_CAPABILITY_READ)) return;
+	if (sx < 0) { width += sx; x -= sx * scale_x; sx = 0; }
+	if (sy < 0) { height += sy; y -= sy * scale_y; sy = 0; }
+	width = fmin(width, buffer->width - sx);
+	height = fmin(height, buffer->height - sy);
+	double right = fmin(x + width * scale_x, (double)clip.x + clip.width);
+	double bottom = fmin(y + height * scale_y, (double)clip.y + clip.height);
+	double left = fmax(x, clip.x), top = fmax(y, clip.y);
+	if (left >= right || top >= bottom) return;
+	struct wld_rect dst = { (int32_t)lround(left), (int32_t)lround(top), 0, 0 };
+	int32_t x2 = lround(right), y2 = lround(bottom);
+	if (x2 <= dst.x || y2 <= dst.y) return;
+	dst.width = x2 - dst.x; dst.height = y2 - dst.y;
+	struct wld_frect src = { sx + (left - x) / scale_x, sy + (top - y) / scale_y,
+	                        (right - left) / scale_x, (bottom - top) / scale_y };
+	wld_blend_scaled(renderer, buffer, &dst, &src);
+}
 
-	return buffer;
+static void overview_view(struct wld_renderer *renderer, struct compositor_view *view,
+                          struct swc_rectangle source, struct swc_rectangle dest,
+                          struct swc_rectangle clip)
+{
+	double sx = (double)dest.width / source.width, sy = (double)dest.height / source.height;
+	struct swc_rectangle g = view->base.geometry, bar_rect;
+	struct wld_buffer *bar;
+	struct swc_rectangle frame = frame_geometry(view);
+	double x = dest.x + (frame.x - (double)source.x) * sx;
+	double y = dest.y + (frame.y - (double)source.y) * sy;
+	double in = view->border.inwidth * sx;
+	double out = view->border.outwidth * sx;
+	if (out) fill_ring(renderer, view->border.outcolor, x, y,
+	                   frame.width * sx, frame.height * sy, in + out);
+	if (in) fill_ring(renderer, view->border.incolor, x, y,
+	                  frame.width * sx, frame.height * sy, in);
+	overview_blit(renderer, view->buffer,
+	    view->window ? view->buffer_offset_x : 0, view->window ? view->buffer_offset_y : 0,
+	    g.width, g.height, dest.x + (g.x - (double)source.x) * sx,
+	    dest.y + (g.y - (double)source.y) * sy, sx, sy, clip);
+	/* titlebar_content may change the GL target while rebuilding its cache. */
+	if ((bar = titlebar_content(view, &bar_rect))) {
+		wld_set_target_buffer(renderer, renderer->target);
+		overview_blit(renderer, bar, 0, 0, bar->width, bar->height,
+		    dest.x + (bar_rect.x - (double)source.x) * sx,
+		    dest.y + (bar_rect.y - (double)source.y) * sy,
+		    sx, sy, clip);
+	}
+}
+
+static void overview_label(struct wld_renderer *renderer, struct compositor_view *view,
+                           const struct swc_overview_item *item, struct swc_rectangle rect)
+{
+	uint32_t height = item->label_height;
+	if (!height) return;
+	wld_fill_rectangle(renderer, 0xff202020, rect.x, rect.y + rect.height, rect.width, height);
+	struct wld_font *font = view->decor.font;
+	if (!font || font->height > height || rect.width < 12) return;
+	char title[1024];
+	snprintf(title, sizeof(title), "%s%s", item->minimized ? "[minimized] " : "",
+	         view->window->base.title ? view->window->base.title : "Untitled");
+	unsigned len = 0;
+	struct wld_extents ext;
+	while (title[len]) {
+		unsigned next = len + 1;
+		while ((title[next] & 0xc0) == 0x80) ++next;
+		wld_font_text_extents_n(font, title, next, &ext);
+		if (ext.advance > rect.width - 12) break;
+		len = next;
+	}
+	if (len) wld_draw_text(renderer, font, 0xffeeeeee, rect.x + 6,
+	    rect.y + rect.height + (height - font->height) / 2 + font->ascent, title, len, NULL);
+}
+
+static void render_overview(struct screen *screen, struct wld_renderer *renderer)
+{
+	const struct swc_rectangle *g = &screen->base.geometry;
+	struct swc_rectangle full = {0, 0, g->width, g->height};
+	pixman_region32_t region;
+	pixman_region32_init_rect(&region, 0, 0, g->width, g->height);
+	wallpaper_repaint(screen, renderer, &region);
+	pixman_region32_fini(&region);
+	struct compositor_view *view;
+	/* Keep shell backgrounds below the cards, panels and overlays above. */
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		if (pass) for (unsigned i = 0; i < compositor.overview_count; ++i) {
+			const struct swc_overview_item *item = &compositor.overview_items[i];
+			struct compositor_view *root = NULL;
+			wl_list_for_each(view, &compositor.views, link)
+				if (view->window && &view->window->base == item->window) { root = view; break; }
+			if (!root) continue;
+			struct swc_rectangle r = item->rect;
+			r.x -= g->x; r.y -= g->y;
+			/* A retained window without a buffer still has a selectable card. */
+			wld_fill_rectangle(renderer, 0xff303030, r.x, r.y, r.width, r.height);
+			wl_list_for_each_reverse(view, &compositor.views, link)
+				if (overview_owner(view) == root)
+					overview_view(renderer, view, item->source, r, r);
+			overview_label(renderer, root, item, r);
+			/* Draw the selection inside the card, independent of window borders. */
+			uint32_t h = r.height + item->label_height;
+			unsigned border = MIN(2u, MIN(r.width, h));
+			uint32_t color = item->highlighted ? item->color : 0xff606060;
+			wld_fill_rectangle(renderer, color, r.x, r.y, r.width, border);
+			wld_fill_rectangle(renderer, color, r.x, r.y + h - border, r.width, border);
+			wld_fill_rectangle(renderer, color, r.x, r.y, border, h);
+			wld_fill_rectangle(renderer, color, r.x + r.width - border, r.y, border, h);
+			if (item->minimized && !item->label_height)
+				wld_fill_rectangle(renderer, item->color, r.x, r.y + r.height - border, r.width / 2, border);
+		}
+		wl_list_for_each_reverse(view, &compositor.views, link) {
+			if (!view->visible || overview_owner(view) ||
+			    (view->stack_layer >= STACK_LAYER_NORMAL) != (pass != 0)) continue;
+			struct swc_rectangle dest = view->base.geometry;
+			dest.x -= g->x; dest.y -= g->y;
+			if (dest.width && dest.height)
+				overview_view(renderer, view, view->base.geometry, dest, full);
+		}
+	}
 }
 
 static bool
@@ -1199,8 +1319,12 @@ update(struct view *base)
 {
 	struct compositor_view *view = (void *)base;
 
-	if (!swc.active || !view->visible) {
-		return false;
+	if (!swc.active) return false;
+	if (!view->visible) {
+		/* Hidden views retain their zero output mask and receive no synthetic
+		 * frame callbacks. A new buffer may still refresh its thumbnail. */
+		if (compositor.overview_screen) schedule_updates(0);
+		return compositor.overview_screen != NULL;
 	}
 
 	/*
@@ -1269,6 +1393,8 @@ attach(struct view *base, struct wld_buffer *buffer)
 		}
 	}
 
+	if (resized || buffer_resized || (!buffer != !view->base.buffer))
+		overview_child_changed(view);
 	return 0;
 }
 
@@ -1316,6 +1442,7 @@ move(struct view *base, int32_t x, int32_t y)
 		}
 	}
 
+	overview_child_changed(view);
 	return true;
 }
 
@@ -1402,6 +1529,10 @@ view_at(int32_t x, int32_t y)
 	wl_list_for_each(view, &compositor.views, link)
 	{
 		if (!view->visible) {
+			if (compositor.overview_screen && view->buffer && view->base.buffer) {
+				renderer_flush_view(view);
+				pixman_region32_clear(&view->surface->state.damage);
+			}
 			continue;
 		}
 
@@ -1515,6 +1646,7 @@ raise_window_top(struct compositor_view *view)
 void
 compositor_hide_for_lock(void)
 {
+	swc_overview_end();
 	struct compositor_view *view;
 
 	wl_list_for_each(view, &compositor.views, link)
@@ -1755,6 +1887,7 @@ compositor_view_destroy(struct compositor_view *view)
 	decor_view_finalize(view);
 	pixman_region32_fini(&view->clip);
 	wl_list_remove(&view->link);
+	overview_child_changed(view);
 	free(view);
 	log_view_memory("destroy");
 }
@@ -2135,25 +2268,25 @@ update_screen(struct screen *screen)
 
 	/* check if zoom */
 	if (profile_render) frame_draw = frame_finish = 0;
-	if (compositor.zoom != 1.0f) {
+	if (compositor.overview_screen == &screen->base && !session_lock_active()) {
+		if (!wld_set_target_surface(swc.backend->renderer, target->surface)) {
+			pixman_region32_fini(&damage); return;
+		}
+		render_overview(screen, swc.backend->renderer);
+		wld_flush(swc.backend->renderer);
+		/* Screencopy consumes global damage, including on a second monitor. */
+		pixman_region32_clear(&damage);
+		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
+	} else if (compositor.zoom != 1.0f) {
 		pixman_region32_clear(&damage);
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 
-		struct wld_buffer *zoomed =
-		    render_zoomed_to_shm(screen, compositor.zoom);
-		if (!zoomed) {
+		if (!wld_set_target_surface(swc.backend->renderer, target->surface)) {
 			pixman_region32_fini(&damage);
 			return;
 		}
-
-		pixman_region32_t full;
-		pixman_region32_init_rect(&full, 0, 0, geom->width, geom->height);
-		wld_set_target_surface(swc.backend->renderer, target->surface);
-		wld_copy_region(swc.backend->renderer, zoomed, 0, 0, &full);
+		render_zoomed(screen, swc.backend->renderer, compositor.zoom);
 		wld_flush(swc.backend->renderer);
-		pixman_region32_fini(&full);
-
-		wld_buffer_unreference(zoomed);
 	} else {
 		pixman_region32_t base_damage;
 		pixman_region32_copy(&damage, total_damage);
@@ -2482,7 +2615,6 @@ compositor_initialize(void)
 	compositor.pending_flips = 0;
 	compositor.updating = false;
 	compositor.zoom = 1.0f;
-	compositor.zoom_buffer = NULL;
 	if (!decor_initialize()) {
 		return false;
 	}
@@ -2520,10 +2652,6 @@ compositor_finalize(void)
 	compositor_release_capture_cache();
 	compositor.initialized = false;
 
-	if (compositor.zoom_buffer) {
-		wld_buffer_unreference(compositor.zoom_buffer);
-		compositor.zoom_buffer = NULL;
-	}
 	decor_finalize();
 	pixman_region32_fini(&compositor.damage);
 	pixman_region32_fini(&compositor.opaque);
@@ -2591,18 +2719,128 @@ compositor_release_capture_cache(void)
 	capture_cache_reset(0, 0);
 }
 
+/*
+ * Draw the screen's views at their own geometry, for a capture. The live path
+ * is renderer_repaint(), which works from accumulated damage; this one is
+ * handed the whole screen and has no target surface to swap.
+ */
+static void
+render_scene(struct screen *screen, struct wld_renderer *renderer,
+             pixman_region32_t *region, pixman_region32_t *damage)
+{
+	struct compositor_view *view;
+
+	/* background */
+	wallpaper_repaint(screen, renderer, region);
+
+	wl_list_for_each_reverse(view, &compositor.views, link)
+	{
+		struct wld_buffer *src = view->buffer;
+
+		if (!view->visible) {
+			continue;
+		}
+
+		if (src &&
+		    !(wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
+			src = view->base.buffer;
+		}
+
+		if (src &&
+		    (wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
+			const struct swc_rectangle *geom = &view->base.geometry;
+			int32_t src_x = view->window ? view->buffer_offset_x : 0;
+			int32_t src_y = view->window ? view->buffer_offset_y : 0;
+			int32_t dst_x = geom->x - src_x - screen->base.geometry.x;
+			int32_t dst_y = geom->y - src_y - screen->base.geometry.y;
+			pixman_region32_t source_region;
+
+			pixman_region32_init_rect(&source_region, src_x, src_y, geom->width,
+			                          geom->height);
+			pixman_region32_intersect_rect(&source_region, &source_region, 0, 0,
+			                               src->width, src->height);
+			if (src->format == WLD_FORMAT_ARGB8888) {
+				wld_blend_region(renderer, src, dst_x, dst_y,
+				                 &source_region);
+			} else {
+				wld_copy_region(renderer, src, dst_x, dst_y,
+				                &source_region);
+			}
+			pixman_region32_fini(&source_region);
+		}
+
+		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
+		    view->base.buffer) {
+			pixman_region32_t view_region, view_damage, border_damage;
+			const struct swc_rectangle frame = frame_geometry(view);
+			const struct swc_rectangle *target_geom = &screen->base.geometry;
+
+			pixman_region32_init_rect(&view_region, frame.x, frame.y,
+			                          frame.width, frame.height);
+			pixman_region32_init_with_extents(&view_damage, &view->extents);
+			pixman_region32_init(&border_damage);
+
+			pixman_region32_intersect(&view_damage, &view_damage, damage);
+			pixman_region32_subtract(&view_damage, &view_damage, &view->clip);
+			pixman_region32_subtract(&border_damage, &view_damage,
+			                         &view_region);
+
+			pixman_region32_t in_rect;
+			pixman_region32_init_rect(&in_rect,
+			                          frame.x - view->border.inwidth,
+			                          frame.y - view->border.inwidth,
+			                          frame.width + (2 * view->border.inwidth),
+			                          frame.height +
+			                              (2 * view->border.inwidth));
+
+			pixman_region32_t out_border;
+			pixman_region32_init(&out_border);
+			pixman_region32_subtract(&out_border, &border_damage, &in_rect);
+
+			pixman_region32_t in_border;
+			pixman_region32_init(&in_border);
+			pixman_region32_subtract(&in_border, &in_rect, &view_region);
+			pixman_region32_intersect(&in_border, &in_border, &border_damage);
+
+			if (view->border.outwidth > 0 &&
+			    pixman_region32_not_empty(&out_border)) {
+				pixman_region32_translate(&out_border, -target_geom->x,
+				                          -target_geom->y);
+				wld_fill_region(renderer, view->border.outcolor,
+				                &out_border);
+			}
+
+			if (view->border.inwidth > 0 &&
+			    pixman_region32_not_empty(&in_border)) {
+				pixman_region32_translate(&in_border, -target_geom->x,
+				                          -target_geom->y);
+				wld_fill_region(renderer, view->border.incolor,
+				                &in_border);
+			}
+
+			pixman_region32_fini(&border_damage);
+			pixman_region32_fini(&view_region);
+			pixman_region32_fini(&view_damage);
+			pixman_region32_fini(&in_rect);
+			pixman_region32_fini(&out_border);
+			pixman_region32_fini(&in_border);
+		}
+
+		if (view->decor.top || view->decor.right || view->decor.bottom ||
+		    view->decor.left) {
+			const struct swc_rectangle *target_geom = &screen->base.geometry;
+			decor_repaint(renderer, target_geom, view, damage);
+		}
+	}
+}
+
 struct wld_buffer *
 compositor_render_to_shm(struct screen *screen)
 {
-	if (compositor.zoom != 1.0f) {
-		return render_zoomed_to_shm(screen, compositor.zoom);
-	}
-
 	uint32_t width = screen->base.geometry.width;
 	uint32_t height = screen->base.geometry.height;
 	struct wld_buffer *buffer, *scratch = NULL;
 	struct wld_renderer *renderer = swc.shm->renderer;
-	struct compositor_view *view;
 	pixman_region32_t region;
 	pixman_region32_t damage;
 	uint32_t caps;
@@ -2657,107 +2895,17 @@ compositor_render_to_shm(struct screen *screen)
 	pixman_region32_init_rect(&damage, screen->base.geometry.x,
 	                          screen->base.geometry.y, width, height);
 
-	/* background */
-	wallpaper_repaint(screen, renderer, &region);
-
-	wl_list_for_each_reverse(view, &compositor.views, link)
-	{
-		struct wld_buffer *src = view->buffer;
-
-		if (!view->visible) {
-			continue;
-		}
-
-		if (src &&
-		    !(wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
-			src = view->base.buffer;
-		}
-
-		if (src &&
-		    (wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
-			const struct swc_rectangle *geom = &view->base.geometry;
-			int32_t src_x = view->window ? view->buffer_offset_x : 0;
-			int32_t src_y = view->window ? view->buffer_offset_y : 0;
-			int32_t dst_x = geom->x - src_x - screen->base.geometry.x;
-			int32_t dst_y = geom->y - src_y - screen->base.geometry.y;
-			pixman_region32_t source_region;
-
-			pixman_region32_init_rect(&source_region, src_x, src_y, geom->width,
-			                          geom->height);
-			pixman_region32_intersect_rect(&source_region, &source_region, 0, 0,
-			                               src->width, src->height);
-			if (src->format == WLD_FORMAT_ARGB8888) {
-				wld_blend_region(renderer, src, dst_x, dst_y,
-				                 &source_region);
-			} else {
-				wld_copy_region(renderer, src, dst_x, dst_y,
-				                &source_region);
-			}
-			pixman_region32_fini(&source_region);
-		}
-
-		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
-		    view->base.buffer) {
-			pixman_region32_t view_region, view_damage, border_damage;
-			const struct swc_rectangle frame = frame_geometry(view);
-			const struct swc_rectangle *target_geom = &screen->base.geometry;
-
-			pixman_region32_init_rect(&view_region, frame.x, frame.y,
-			                          frame.width, frame.height);
-			pixman_region32_init_with_extents(&view_damage, &view->extents);
-			pixman_region32_init(&border_damage);
-
-			pixman_region32_intersect(&view_damage, &view_damage, &damage);
-			pixman_region32_subtract(&view_damage, &view_damage, &view->clip);
-			pixman_region32_subtract(&border_damage, &view_damage,
-			                         &view_region);
-
-			pixman_region32_t in_rect;
-			pixman_region32_init_rect(&in_rect,
-			                          frame.x - view->border.inwidth,
-			                          frame.y - view->border.inwidth,
-			                          frame.width + (2 * view->border.inwidth),
-			                          frame.height +
-			                              (2 * view->border.inwidth));
-
-			pixman_region32_t out_border;
-			pixman_region32_init(&out_border);
-			pixman_region32_subtract(&out_border, &border_damage, &in_rect);
-
-			pixman_region32_t in_border;
-			pixman_region32_init(&in_border);
-			pixman_region32_subtract(&in_border, &in_rect, &view_region);
-			pixman_region32_intersect(&in_border, &in_border, &border_damage);
-
-			if (view->border.outwidth > 0 &&
-			    pixman_region32_not_empty(&out_border)) {
-				pixman_region32_translate(&out_border, -target_geom->x,
-				                          -target_geom->y);
-				wld_fill_region(renderer, view->border.outcolor,
-				                &out_border);
-			}
-
-			if (view->border.inwidth > 0 &&
-			    pixman_region32_not_empty(&in_border)) {
-				pixman_region32_translate(&in_border, -target_geom->x,
-				                          -target_geom->y);
-				wld_fill_region(renderer, view->border.incolor,
-				                &in_border);
-			}
-
-			pixman_region32_fini(&border_damage);
-			pixman_region32_fini(&view_region);
-			pixman_region32_fini(&view_damage);
-			pixman_region32_fini(&in_rect);
-			pixman_region32_fini(&out_border);
-			pixman_region32_fini(&in_border);
-		}
-
-		if (view->decor.top || view->decor.right || view->decor.bottom ||
-		    view->decor.left) {
-			const struct swc_rectangle *target_geom = &screen->base.geometry;
-			decor_repaint(renderer, target_geom, view, &damage);
-		}
+	if (compositor.overview_screen == &screen->base && !session_lock_active()) {
+		render_overview(screen, renderer);
+	} else if (compositor.zoom != 1.0f) {
+		/*
+		 * The zoomed scene is drawn whole and its views land somewhere other
+		 * than their own geometry, so it has its own pass rather than sharing
+		 * the one above.
+		 */
+		render_zoomed(screen, renderer, compositor.zoom);
+	} else {
+		render_scene(screen, renderer, &region, &damage);
 	}
 
 	draw_overlays(renderer, &screen->base.geometry);

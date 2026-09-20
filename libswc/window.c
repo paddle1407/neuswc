@@ -290,6 +290,7 @@ swc_window_hide(struct swc_window *window)
 EXPORT void
 swc_window_focus(struct swc_window *base)
 {
+	if (base && input_mode_active()) return;
 	struct window *window = INTERNAL(base);
 	struct compositor_view *new = window ? window->view : NULL,
 	                       *old = swc.seat->keyboard->focus.view;
@@ -651,6 +652,8 @@ handle_resize(struct view_handler *handler, uint32_t old_width,
 
 		view_move(&window->view->base, x, y);
 	}
+	if (window->managed && window->handler->geometry_changed)
+		window->handler->geometry_changed(window->handler_data);
 }
 
 static void handle_screens(struct view_handler *handler, uint32_t entered,

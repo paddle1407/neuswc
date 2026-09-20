@@ -133,6 +133,8 @@ swc_activate(void)
 void
 swc_deactivate(void)
 {
+	input_mode_cancel();
+	swc_overview_end();
 	swc.active = false;
 	send_event(&swc.event_signal, SWC_EVENT_DEACTIVATED, NULL);
 	if (swc.manager->deactivate) {
@@ -471,6 +473,8 @@ error0:
 EXPORT void
 swc_finalize(void)
 {
+	input_mode_cancel();
+	swc_overview_end();
 #ifdef ENABLE_XWAYLAND
 	xserver_finalize();
 #endif

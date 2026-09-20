@@ -853,6 +853,7 @@ pointer_finalize(struct pointer *pointer)
 void
 pointer_set_focus(struct pointer *pointer, struct compositor_view *view)
 {
+	if (view && input_mode_active()) return;
 	input_focus_set(&pointer->focus, view);
 	pointer_constraints_update_focus(pointer);
 }

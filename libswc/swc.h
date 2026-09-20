@@ -365,6 +365,9 @@ struct swc_window_handler {
 	 */
 	void (*interactive_move)(void *data, bool active);
 
+	/* The committed client size or child-surface footprint changed. */
+	void (*geometry_changed)(void *data);
+
 	/* Requests from desktop taskbars and docks. */
 	void (*request_activate)(void *data);
 	void (*request_minimized)(void *data, bool minimized);
@@ -778,6 +781,33 @@ enum {
 	SWC_MOD_SHIFT = 1 << 3,
 	SWC_MOD_ANY = ~0
 };
+
+/* WM input scoped to one screen, with keysyms and global 24.8 coordinates.
+ * Keys, buttons, and axes outside that screen follow normal dispatch. Motion
+ * callbacks also receive crossings so the WM can restore focus elsewhere.
+ * Callbacks receive presses only. Releases remain consumed after end().
+ * cancel is called on session lock, deactivate, and shutdown. */
+struct swc_input_mode_handler {
+    void (*key)(void *, uint32_t keysym, uint32_t modifiers);
+    void (*motion)(void *, int32_t x, int32_t y);
+    void (*button)(void *, uint32_t button);
+    void (*cancel)(void *);
+};
+bool swc_input_mode_begin(struct swc_screen *, const struct swc_input_mode_handler *, void *);
+void swc_input_mode_end(void);
+
+/* Drawing only: the WM owns layout and hit testing. Rectangles are global.
+ * source includes the window frame, destination reserves label_height below.
+ * Items are copied. Window pointers are never dereferenced after submission. */
+struct swc_overview_item {
+    struct swc_window *window;
+    struct swc_rectangle source, rect;
+    bool highlighted, minimized;
+    uint32_t label_height, color;
+};
+bool swc_window_overview_geometry(struct swc_window *, struct swc_rectangle *);
+bool swc_overview_begin(struct swc_screen *, const struct swc_overview_item *, unsigned n);
+void swc_overview_end(void);
 
 enum swc_binding_type {
 	SWC_BINDING_KEY,

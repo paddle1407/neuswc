@@ -321,6 +321,29 @@ titlebar_repaint(struct wld_renderer *renderer, const struct swc_rectangle *targ
 	pixman_region32_fini(&region);
 }
 
+struct wld_buffer *
+titlebar_content(struct compositor_view *view, struct swc_rectangle *rect)
+{
+	struct swc_rectangle r = bar_geometry(view);
+
+	if (!view->decor.titlebar.enabled || !r.width || !r.height)
+		return NULL;
+
+	/*
+	 * Whatever was painted last, and no repainting: painting retargets the
+	 * renderer, and a caller part way through drawing a scene cannot have
+	 * its target taken out from under it. titlebar_prepare() keeps the cache
+	 * current as decorations are applied, so this is only empty before the
+	 * first one has been.
+	 */
+	if (!view->decor.bar_buffer || view->decor.bar_buffer->width != r.width ||
+	    view->decor.bar_buffer->height != r.height)
+		return NULL;
+
+	*rect = r;
+	return view->decor.bar_buffer;
+}
+
 bool
 titlebar_prepare(struct compositor_view *view)
 {

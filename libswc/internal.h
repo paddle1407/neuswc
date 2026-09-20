@@ -84,5 +84,7 @@ void
 swc_activate(void);
 void
 swc_deactivate(void);
+void input_mode_cancel(void);
+bool input_mode_active(void);
 
 #endif

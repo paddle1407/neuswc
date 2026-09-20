@@ -349,6 +349,7 @@ keyboard_reset(struct keyboard *keyboard)
 void
 keyboard_set_focus(struct keyboard *keyboard, struct compositor_view *view)
 {
+	if (view && input_mode_active()) return;
 	/*
 	 * While the session is locked the lock surfaces own the keyboard. A
 	 * window that maps behind the lock screen must not be able to take it,
