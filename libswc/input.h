@@ -77,6 +77,16 @@ struct press {
 	void *data;
 };
 
+/*
+ * The serials of the last few button and key events sent to clients, press or
+ * release. Requests that must answer a user action -- an xdg_popup grab --
+ * name one of these, and a serial the client was never sent is refused.
+ */
+void
+input_record_serial(struct wl_client *client, uint32_t serial);
+bool
+input_serial_is_recent(struct wl_client *client, uint32_t serial);
+
 /* }}} */
 
 #endif

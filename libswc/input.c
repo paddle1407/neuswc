@@ -157,3 +157,38 @@ input_focus_set(struct input_focus *input_focus, struct compositor_view *view)
 
 	send_event(&input_focus->event_signal, INPUT_FOCUS_EVENT_CHANGED, &data);
 }
+
+/* Enough to cover a press, its release and a key or two typed while a menu
+ * was on its way, without accepting serials from long ago. */
+#define RECENT_SERIALS 8
+
+static struct {
+	struct wl_client *client;
+	uint32_t serial;
+} recent_serials[RECENT_SERIALS];
+static unsigned recent_serial_next;
+
+void
+input_record_serial(struct wl_client *client, uint32_t serial)
+{
+	recent_serials[recent_serial_next].client = client;
+	recent_serials[recent_serial_next].serial = serial;
+	recent_serial_next = (recent_serial_next + 1) % RECENT_SERIALS;
+}
+
+bool
+input_serial_is_recent(struct wl_client *client, uint32_t serial)
+{
+	unsigned i;
+
+	/* The client pointer is only compared, never followed. A new client that
+	 * reuses a dead one's address would also have to guess the serial. */
+	for (i = 0; i < RECENT_SERIALS; ++i) {
+		if (recent_serials[i].client == client &&
+		    recent_serials[i].serial == serial) {
+			return true;
+		}
+	}
+
+	return false;
+}

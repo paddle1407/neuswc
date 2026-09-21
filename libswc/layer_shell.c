@@ -393,6 +393,8 @@ static void
 save_keyboard_focus(struct compositor_view *view)
 {
 	clear_saved_keyboard_focus();
+	/* Taking the keyboard ends a menu's grab; remember what it was over. */
+	view = xdg_popup_grab_focus_owner(view);
 	if (!view) {
 		return;
 	}

@@ -7,6 +7,7 @@
 #include "seat.h"
 #include "util.h"
 #include "window.h"
+#include "xdg_shell.h"
 
 #include "wlr-foreign-toplevel-management-unstable-v1-server-protocol.h"
 
@@ -113,7 +114,8 @@ static void send_state(struct foreign_handle *handle)
 	if (window->minimized)
 		ADD_STATE(ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED);
 	if (swc.seat && swc.seat->keyboard &&
-	    swc.seat->keyboard->focus.view == window->view)
+	    xdg_popup_grab_focus_owner(swc.seat->keyboard->focus.view) ==
+	        window->view)
 		ADD_STATE(ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED);
 	if (window->mode == WINDOW_MODE_FULLSCREEN &&
 	    wl_resource_get_version(handle->resource) >= 2)

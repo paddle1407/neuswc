@@ -165,6 +165,7 @@ swc_pointer_send_button(uint32_t time, uint32_t button, uint32_t state)
 	}
 
 	serial = wl_display_next_serial(swc.display);
+	input_record_serial(pointer->focus.client, serial);
 	wl_resource_for_each(resource, &pointer->focus.active)
 	    wl_pointer_send_button(resource, serial, time, button, state);
 	wl_resource_for_each(resource, &pointer->focus.active)
@@ -659,6 +660,7 @@ client_handle_button(struct pointer_handler *handler, uint32_t time,
 		return false;
 	}
 
+	input_record_serial(pointer->focus.client, button->press.serial);
 	wl_resource_for_each(resource, &pointer->focus.active)
 	    wl_pointer_send_button(resource, button->press.serial, time,
 	                           button->press.value, state);

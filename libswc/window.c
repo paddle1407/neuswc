@@ -32,6 +32,7 @@
 #include "swc.h"
 #include "util.h"
 #include "view.h"
+#include "xdg_shell.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -293,8 +294,14 @@ swc_window_focus(struct swc_window *base)
 	if (base && input_mode_active()) return;
 	struct window *window = INTERNAL(base);
 	struct compositor_view *new = window ? window->view : NULL,
-	                       *old = swc.seat->keyboard->focus.view;
+	                       *old;
 
+	/* A menu holding a popup grab keeps the keyboard; the window gets it
+	 * when the menu is done. */
+	if (xdg_popup_grab_defer_window_focus(new)) {
+		return;
+	}
+	old = swc.seat->keyboard->focus.view;
 	if (new == old) {
 		return;
 	}
