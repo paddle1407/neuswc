@@ -2434,7 +2434,13 @@ perform_update(void *data)
 	struct screen *screen;
 	uint32_t updates = compositor.scheduled_updates & ~compositor.pending_flips;
 
-	if (!swc.active || !updates) {
+	/* Forget what was scheduled while switched away: left set, it would stop
+	 * schedule_updates adding the idle, and activation would repaint nothing. */
+	if (!swc.active) {
+		compositor.scheduled_updates = 0;
+		return;
+	}
+	if (!updates) {
 		return;
 	}
 
