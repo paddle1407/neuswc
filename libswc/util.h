@@ -71,6 +71,27 @@ void
 destroy_resource(struct wl_client *client, struct wl_resource *resource);
 
 /*
+ * Unlink every resource in a list and clear its user data, for when the object
+ * they refer to goes away while the clients still hold them. Destroying them
+ * instead would leave each client holding an id the server no longer knows,
+ * and its next request on it -- a release, say -- is a fatal protocol error.
+ */
+void
+orphan_resources(struct wl_list *resources);
+
+struct wl_global;
+
+/*
+ * Withdraw a global whose object is going away at runtime. Clients are told at
+ * once; the global itself is destroyed a few seconds later, and until then it
+ * binds with NULL user data. retired_globals_finish destroys any still waiting.
+ */
+void
+global_retire(struct wl_global *global);
+void
+retired_globals_finish(void);
+
+/*
  * Descriptor accounting. Running out of descriptors does not fail in one
  * place: client buffers stop arriving, dmabuf feedback stops being sent and
  * explicit-synchronization fences stop being exported, each reported as its

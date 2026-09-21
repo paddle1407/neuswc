@@ -28,6 +28,7 @@
 #else
 #include "fb.h"
 #endif
+#include "compositor.h"
 #include "event.h"
 #include "internal.h"
 #include "mode.h"
@@ -36,6 +37,7 @@
 #include "plane.h"
 #endif
 #include "pointer.h"
+#include "seat.h"
 #include "util.h"
 #include "workspace.h"
 
@@ -122,6 +124,7 @@ screens_finalize(void)
 
 	wl_list_for_each_safe(screen, tmp, &swc.screens, link)
 	    screen_destroy(screen);
+	retired_globals_finish();
 }
 
 static void
@@ -138,7 +141,10 @@ bind_screen(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	}
 
 	wl_resource_set_implementation(resource, NULL, screen, &remove_resource);
-	wl_list_insert(&screen->resources, wl_resource_get_link(resource));
+	/* A bind that raced the screen's removal; see global_retire. */
+	if (screen) {
+		wl_list_insert(&screen->resources, wl_resource_get_link(resource));
+	}
 }
 
 struct screen *
@@ -240,6 +246,10 @@ screen_destroy(struct screen *screen)
 	wl_signal_emit(&screen->destroy_signal, NULL);
 	wl_list_for_each_safe(output, next, &screen->outputs, link)
 	    output_destroy(output);
+	/* Clients keep their swc_screen objects until they see the global go;
+	 * a panel docking to one by then finds NULL instead of this screen. */
+	orphan_resources(&screen->resources);
+	global_retire(screen->global);
 	primary_plane_finalize(&screen->planes.primary);
 #ifdef ENABLE_DRM
 	if (screen->planes.cursor) {
@@ -247,6 +257,64 @@ screen_destroy(struct screen *screen)
 	}
 #endif
 	free(screen);
+}
+
+void
+screens_update_pointer_region(void)
+{
+	pixman_region32_t region;
+	struct pointer *pointer;
+	struct screen *screen;
+	struct swc_rectangle *geom;
+
+	if (!swc.seat || !swc.seat->pointer || wl_list_empty(&swc.screens)) {
+		return;
+	}
+	pointer = swc.seat->pointer;
+
+	pixman_region32_init(&region);
+	wl_list_for_each(screen, &swc.screens, link)
+	{
+		geom = &screen->base.geometry;
+		pixman_region32_union_rect(&region, &region, geom->x, geom->y,
+		                           geom->width, geom->height);
+	}
+
+	/* A pointer that was on a monitor which has just gone is outside the
+	 * new region, and clipping would send it to 0,0, which need not be on
+	 * any screen. Put it in the middle of the first one instead. */
+	if (!pixman_region32_contains_point(&region, wl_fixed_to_int(pointer->x),
+	                                    wl_fixed_to_int(pointer->y), NULL)) {
+		screen = wl_container_of(swc.screens.next, screen, link);
+		geom = &screen->base.geometry;
+		pointer->x = wl_fixed_from_int(geom->x + (int32_t)geom->width / 2);
+		pointer->y = wl_fixed_from_int(geom->y + (int32_t)geom->height / 2);
+	}
+	pointer_set_region(pointer, &region);
+	pixman_region32_fini(&region);
+	pointer_warp(pointer, pointer->x, pointer->y);
+}
+
+void
+screen_added(struct screen *screen)
+{
+#ifdef ENABLE_DRM
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+
+	/* pointer_initialize gave the screens of the time the cursor image;
+	 * this one has to be caught up by hand. */
+	if (screen->planes.cursor && pointer) {
+		struct view *cursor = &screen->planes.cursor->view;
+
+		view_attach(cursor,
+		            pointer->cursor.view.buffer ? pointer->cursor.buffer : NULL);
+		view_move(cursor, pointer->cursor.view.geometry.x,
+		          pointer->cursor.view.geometry.y);
+		view_update(cursor);
+	}
+#endif
+	compositor_screen_added(screen);
+	workspace_screen_added(screen);
 }
 
 void

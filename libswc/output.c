@@ -25,8 +25,8 @@ static void
 bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 {
 	struct output *output = data;
-	struct screen *screen = output->screen;
-	struct mode *mode = &screen->planes.primary.mode;
+	struct screen *screen;
+	struct mode *mode;
 	struct wl_resource *resource;
 	uint32_t flags;
 
@@ -36,6 +36,15 @@ bind_output(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 		wl_client_post_no_memory(client);
 		return;
 	}
+
+	/* Bound after its monitor was unplugged, in the window global_retire
+	 * leaves: the client gets an output that describes nothing, and the
+	 * global_remove it is about to read. */
+	if (!output) {
+		wl_resource_set_implementation(resource, &output_impl, NULL, NULL);
+		return;
+	}
+	screen = output->screen;
 
 	wl_resource_set_implementation(resource, &output_impl, output,
 	                               &remove_resource);
@@ -107,6 +116,7 @@ output_new(drmModeConnectorPtr connector)
 	pixman_region32_init(&output->previous_damage);
 
 	output->connector = connector->connector_id;
+	output->disconnected = false;
 
 	if (connector->count_modes == 0) {
 		goto error2;
@@ -179,15 +189,16 @@ output_new_fb(uint32_t width, uint32_t height, const char *name)
 void
 output_destroy(struct output *output)
 {
-	struct wl_resource *resource, *tmp;
 	workspace_output_removed(output);
 	foreign_toplevel_output_removed(output);
 
-	wl_list_for_each_safe(resource, tmp, &output->resources, link)
-		wl_resource_destroy(resource);
+	/* The clients still hold their wl_output objects and will release them
+	 * once they see the global go; every request that takes one tolerates
+	 * the NULL user data this leaves. */
+	orphan_resources(&output->resources);
+	global_retire(output->global);
 	pixman_region32_fini(&output->current_damage);
 	pixman_region32_fini(&output->previous_damage);
 	wl_array_release(&output->modes);
-	wl_global_destroy(output->global);
 	free(output);
 }

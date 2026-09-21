@@ -45,6 +45,7 @@ struct panel {
 	struct view_handler view_handler;
 	struct screen *screen;
 	struct screen_modifier modifier;
+	struct wl_listener screen_destroy_listener;
 	uint32_t edge;
 	uint32_t offset, strut_size;
 	uint32_t y_offset;
@@ -96,6 +97,30 @@ update_position(struct panel *panel)
 	view_move(&panel->view->base, (int32_t)x, (int32_t)y);
 }
 
+/* The modifier and the destroy listener are held exactly while docked. */
+static void
+undock(struct panel *panel)
+{
+	if (!panel->docked) {
+		return;
+	}
+	wl_list_remove(&panel->modifier.link);
+	wl_list_remove(&panel->screen_destroy_listener.link);
+	panel->docked = false;
+}
+
+static void
+handle_screen_destroy(struct wl_listener *listener, void *data)
+{
+	struct panel *panel =
+	    wl_container_of(listener, panel, screen_destroy_listener);
+
+	(void)data;
+	undock(panel);
+	panel->screen = NULL;
+	compositor_view_hide(panel->view);
+}
+
 static void
 dock(struct wl_client *client, struct wl_resource *resource, uint32_t edge,
      struct wl_resource *screen_resource, uint32_t focus)
@@ -105,9 +130,15 @@ dock(struct wl_client *client, struct wl_resource *resource, uint32_t edge,
 	uint32_t length;
 
 	if (screen_resource) {
+		/* NULL once the screen has been unplugged; see screen_destroy. */
 		screen = wl_resource_get_user_data(screen_resource);
-	} else {
+	} else if (!wl_list_empty(&swc.screens)) {
 		screen = wl_container_of(swc.screens.next, screen, link);
+	} else {
+		screen = NULL;
+	}
+	if (!screen) {
+		return;
 	}
 
 	switch (edge) {
@@ -123,19 +154,26 @@ dock(struct wl_client *client, struct wl_resource *resource, uint32_t edge,
 		return;
 	}
 
-	if (panel->screen && screen != panel->screen) {
-		wl_list_remove(&panel->modifier.link);
-		screen_update_usable_geometry(panel->screen);
+	/* Re-docking, to the same screen or another, must not link the
+	 * modifier twice. */
+	if (panel->docked) {
+		struct screen *previous = panel->screen;
+
+		undock(panel);
+		if (previous != screen) {
+			screen_update_usable_geometry(previous);
+		}
 	}
 
 	panel->screen = screen;
 	panel->edge = edge;
 	panel->docked = true;
+	wl_list_insert(&screen->modifiers, &panel->modifier.link);
+	wl_signal_add(&screen->destroy_signal, &panel->screen_destroy_listener);
 
 	update_position(panel);
 	compositor_view_show(panel->view);
 	raise_window_top(panel->view);
-	wl_list_insert(&screen->modifiers, &panel->modifier.link);
 
 	if (focus) {
 		keyboard_set_focus(swc.seat->keyboard, panel->view);
@@ -192,7 +230,11 @@ handle_resize(struct view_handler *handler, uint32_t old_width,
               uint32_t old_height)
 {
 	struct panel *panel = wl_container_of(handler, panel, view_handler);
-	update_position(panel);
+
+	/* Not docked yet, or its screen has gone. */
+	if (panel->screen) {
+		update_position(panel);
+	}
 }
 
 static const struct view_handler_impl view_handler_impl = {
@@ -249,7 +291,7 @@ destroy_panel(struct wl_resource *resource)
 	struct panel *panel = wl_resource_get_user_data(resource);
 
 	if (panel->docked) {
-		wl_list_remove(&panel->modifier.link);
+		undock(panel);
 		screen_update_usable_geometry(panel->screen);
 	}
 
@@ -299,6 +341,7 @@ panel_new(struct wl_client *client, uint32_t version, uint32_t id,
 	panel->view_handler.impl = &view_handler_impl;
 	panel->view->always_top = true;
 	panel->modifier.modify = &modify;
+	panel->screen_destroy_listener.notify = &handle_screen_destroy;
 	panel->screen = NULL;
 	panel->offset = 0;
 	panel->y_offset = 0;

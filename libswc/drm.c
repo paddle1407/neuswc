@@ -22,6 +22,7 @@
  */
 
 #include "drm.h"
+#include "compositor.h"
 #include "dmabuf.h"
 #include "drm_syncobj.h"
 #include "event.h"
@@ -44,12 +45,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <wayland-server.h>
 #include <wld/drm.h>
 #include <wld/wld.h>
 #include <drm_fourcc.h>
 #include <xf86drm.h>
+#ifdef ENABLE_LIBUDEV
+#include <libudev.h>
+#endif
 
 struct swc_drm swc_drm;
 
@@ -60,6 +65,15 @@ static struct {
 	struct wl_global *dmabuf;
 	struct wl_global *syncobj;
 	struct wl_event_source *event_source;
+
+	/* Connector hotplug, reported by the kernel as a uevent on the card. */
+#ifdef ENABLE_LIBUDEV
+	struct udev *udev;
+	struct udev_monitor *monitor;
+	struct wl_event_source *monitor_source;
+	dev_t devnum;
+#endif
+	struct wl_event_source *rescan_source;
 } drm;
 
 static void
@@ -320,6 +334,90 @@ bind_drm(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	wl_drm_send_format(resource, WL_DRM_FORMAT_ARGB8888);
 }
 
+#ifdef ENABLE_LIBUDEV
+static void
+rescan_connectors(void *data);
+
+static int
+handle_uevent(int fd, uint32_t mask, void *data)
+{
+	struct udev_device *device;
+	const char *hotplug;
+	bool ours;
+
+	while ((device = udev_monitor_receive_device(drm.monitor))) {
+		hotplug = udev_device_get_property_value(device, "HOTPLUG");
+		ours = udev_device_get_devnum(device) == drm.devnum;
+		udev_device_unref(device);
+
+		/* A burst of these arrives for one plug; probe once, after it. */
+		if (ours && hotplug && strcmp(hotplug, "1") == 0 &&
+		    !drm.rescan_source) {
+			drm.rescan_source = wl_event_loop_add_idle(
+			    swc.event_loop, &rescan_connectors, NULL);
+		}
+	}
+
+	return 0;
+}
+
+/* Hotplug is an extra: without it the screens found at startup stay. */
+static void
+hotplug_initialize(void)
+{
+	struct stat st;
+
+	if (fstat(swc.drm->fd, &st) < 0) {
+		goto error0;
+	}
+	drm.devnum = st.st_rdev;
+
+	if (!(drm.udev = udev_new())) {
+		goto error0;
+	}
+	if (!(drm.monitor = udev_monitor_new_from_netlink(drm.udev, "udev"))) {
+		goto error1;
+	}
+	if (udev_monitor_filter_add_match_subsystem_devtype(drm.monitor, "drm",
+	                                                    NULL) < 0 ||
+	    udev_monitor_enable_receiving(drm.monitor) < 0) {
+		goto error2;
+	}
+	drm.monitor_source = wl_event_loop_add_fd(
+	    swc.event_loop, udev_monitor_get_fd(drm.monitor), WL_EVENT_READABLE,
+	    &handle_uevent, NULL);
+	if (!drm.monitor_source) {
+		goto error2;
+	}
+
+	return;
+
+error2:
+	udev_monitor_unref(drm.monitor);
+	drm.monitor = NULL;
+error1:
+	udev_unref(drm.udev);
+	drm.udev = NULL;
+error0:
+	WARNING("Could not watch for monitor hotplug; screens are fixed at "
+	        "startup\n");
+}
+
+static void
+hotplug_finalize(void)
+{
+	if (drm.monitor_source) {
+		wl_event_source_remove(drm.monitor_source);
+	}
+	if (drm.monitor) {
+		udev_monitor_unref(drm.monitor);
+	}
+	if (drm.udev) {
+		udev_unref(drm.udev);
+	}
+}
+#endif
+
 bool
 drm_initialize(void)
 {
@@ -399,6 +497,10 @@ drm_initialize(void)
 		drm.syncobj = drm_syncobj_manager_create(swc.display);
 	}
 
+#ifdef ENABLE_LIBUDEV
+	hotplug_initialize();
+#endif
+
 	return true;
 
 error4:
@@ -416,6 +518,12 @@ error0:
 void
 drm_finalize(void)
 {
+#ifdef ENABLE_LIBUDEV
+	hotplug_finalize();
+#endif
+	if (drm.rescan_source) {
+		wl_event_source_remove(drm.rescan_source);
+	}
 	if (drm.syncobj) {
 		wl_global_destroy(drm.syncobj);
 	}
@@ -432,37 +540,129 @@ drm_finalize(void)
 	close(swc.drm->fd);
 }
 
-bool
-drm_create_screens(struct wl_list *screens)
+/*
+ * The planes no screen holds yet, for cursor planes to be handed out from.
+ * Each holds a listener on swc.event_signal that only plane_destroy
+ * unregisters, so whatever is left over has to go through destroy_planes.
+ */
+static bool
+get_free_planes(struct wl_list *screens, struct wl_list *planes)
 {
 	drmModePlaneRes *plane_ids;
-	drmModeRes *resources;
-	drmModeConnector *connector;
-	struct plane *plane, *cursor_plane;
-	struct output *output;
-	uint32_t i, taken_crtcs = 0;
-	struct wl_list planes;
+	struct plane *plane;
+	struct screen *screen;
+	uint32_t i;
+	bool used;
 
+	wl_list_init(planes);
 	plane_ids = drmModeGetPlaneResources(swc.drm->fd);
 	if (!plane_ids) {
 		ERROR("Could not get DRM plane resources\n");
 		return false;
 	}
-	wl_list_init(&planes);
 	for (i = 0; i < plane_ids->count_planes; ++i) {
-		plane = plane_new(plane_ids->planes[i]);
-		if (plane) {
-			wl_list_insert(&planes, &plane->link);
+		used = false;
+		wl_list_for_each(screen, screens, link)
+		{
+			if (screen->planes.cursor &&
+			    screen->planes.cursor->id == plane_ids->planes[i]) {
+				used = true;
+				break;
+			}
+		}
+		if (!used && (plane = plane_new(plane_ids->planes[i]))) {
+			wl_list_insert(planes, &plane->link);
 		}
 	}
 	drmModeFreePlaneResources(plane_ids);
 
+	return true;
+}
+
+static void
+destroy_planes(struct wl_list *planes)
+{
+	struct plane *plane, *tmp;
+
+	wl_list_for_each_safe(plane, tmp, planes, link)
+		plane_destroy(plane);
+}
+
+/* Leaves it to the caller to put the screen in the list: startup and hotplug
+ * put them at different ends. */
+static struct screen *
+create_screen(drmModeRes *resources, drmModeConnector *connector,
+              struct wl_list *screens, struct wl_list *planes)
+{
+	struct plane *plane, *cursor_plane;
+	struct output *output;
+	struct screen *screen;
+	uint32_t taken_crtcs = 0;
+	int crtc_index;
+
+	wl_list_for_each(screen, screens, link)
+		taken_crtcs |= UINT32_C(1) << screen->id;
+
+	if (!find_available_crtc(resources, connector, taken_crtcs, &crtc_index)) {
+		WARNING("Could not find CRTC for connector %" PRIu32 "\n",
+		        connector->connector_id);
+		return NULL;
+	}
+
+	cursor_plane = NULL;
+	wl_list_for_each(plane, planes, link)
+	{
+		if (plane->type == DRM_PLANE_TYPE_CURSOR &&
+		    plane->possible_crtcs & UINT32_C(1) << crtc_index) {
+			wl_list_remove(&plane->link);
+			cursor_plane = plane;
+			break;
+		}
+	}
+	if (!cursor_plane) {
+		WARNING("Could not find cursor plane for CRTC %d\n", crtc_index);
+	}
+
+	if (!(output = output_new(connector))) {
+		/* The cursor plane was taken out of the list for this
+		 * connector, so nothing else will free it. */
+		if (cursor_plane) {
+			plane_destroy(cursor_plane);
+		}
+		return NULL;
+	}
+
+	output->screen = screen =
+	    screen_new(resources->crtcs[crtc_index], output, cursor_plane);
+	if (!screen) {
+		ERROR("Could not create screen for CRTC %d\n", crtc_index);
+		output_destroy(output);
+		if (cursor_plane) {
+			plane_destroy(cursor_plane);
+		}
+		return NULL;
+	}
+	screen->id = crtc_index;
+
+	return screen;
+}
+
+bool
+drm_create_screens(struct wl_list *screens)
+{
+	drmModeRes *resources;
+	drmModeConnector *connector;
+	struct screen *screen;
+	uint32_t i;
+	struct wl_list planes;
+
+	if (!get_free_planes(screens, &planes)) {
+		return false;
+	}
+
 	resources = drmModeGetResources(swc.drm->fd);
 	if (!resources) {
-		struct plane *p, *ptmp;
-
-		wl_list_for_each_safe(p, ptmp, &planes, link)
-			plane_destroy(p);
+		destroy_planes(&planes);
 		ERROR("Could not get DRM resources\n");
 		return false;
 	}
@@ -475,69 +675,195 @@ drm_create_screens(struct wl_list *screens)
 		if (!connector) {
 			continue;
 		}
-		if (connector->connection == DRM_MODE_CONNECTED) {
-			int crtc_index;
-
-			if (!find_available_crtc(resources, connector, taken_crtcs,
-			                         &crtc_index)) {
-				WARNING("Could not find CRTC for connector %d\n", i);
-				continue;
-			}
-
-			cursor_plane = NULL;
-			wl_list_for_each(plane, &planes, link)
-			{
-				if (plane->type == DRM_PLANE_TYPE_CURSOR &&
-				    plane->possible_crtcs & UINT32_C(1) << crtc_index) {
-					wl_list_remove(&plane->link);
-					cursor_plane = plane;
-					break;
-				}
-			}
-			if (!cursor_plane) {
-				WARNING("Could not find cursor plane for CRTC %d\n",
-				        crtc_index);
-			}
-
-			if (!(output = output_new(connector))) {
-				/* The cursor plane was taken out of the list for this
-				 * connector, so nothing else will free it. */
-				if (cursor_plane) {
-					plane_destroy(cursor_plane);
-				}
-				continue;
-			}
-
-			output->screen =
-			    screen_new(resources->crtcs[crtc_index], output, cursor_plane);
-			if (!output->screen) {
-				ERROR("Could not create screen for CRTC %d\n", crtc_index);
-				output_destroy(output);
-				if (cursor_plane) {
-					plane_destroy(cursor_plane);
-				}
-				continue;
-			}
-			output->screen->id = crtc_index;
-			taken_crtcs |= UINT32_C(1) << crtc_index;
-
-			wl_list_insert(screens, &output->screen->link);
+		if (connector->connection == DRM_MODE_CONNECTED &&
+		    (screen = create_screen(resources, connector, screens,
+		                            &planes))) {
+			wl_list_insert(screens, &screen->link);
 		}
 	}
 	drmModeFreeResources(resources);
-
-	/* Only the cursor planes taken above were handed to a screen. The rest of
-	 * the list is still ours, and each one holds a listener on
-	 * swc.event_signal that only plane_destroy unregisters. */
-	{
-		struct plane *p, *ptmp;
-
-		wl_list_for_each_safe(p, ptmp, &planes, link)
-			plane_destroy(p);
-	}
+	destroy_planes(&planes);
 
 	return true;
 }
+
+/* Hotplug {{{ */
+
+#ifdef ENABLE_LIBUDEV
+
+static uint32_t
+screen_connector(struct screen *screen)
+{
+	struct output *output;
+
+	if (wl_list_empty(&screen->outputs)) {
+		return 0;
+	}
+	output = wl_container_of(screen->outputs.next, output, link);
+	return output->connector;
+}
+
+static drmModeConnector *
+find_connector(drmModeConnector **connectors, int count, uint32_t id)
+{
+	int i;
+
+	for (i = 0; i < count; ++i) {
+		if (connectors[i] && connectors[i]->connector_id == id) {
+			return connectors[i];
+		}
+	}
+	return NULL;
+}
+
+static struct screen *
+find_screen(uint32_t connector)
+{
+	struct screen *screen;
+
+	wl_list_for_each(screen, &swc.screens, link)
+	{
+		if (screen_connector(screen) == connector) {
+			return screen;
+		}
+	}
+	return NULL;
+}
+
+/* A screen for every connected connector that lacks one. */
+static bool
+add_screens(drmModeRes *resources, drmModeConnector **connectors)
+{
+	struct wl_list planes;
+	struct screen *screen;
+	struct output *output;
+	bool changed = false;
+	int i;
+
+	if (!get_free_planes(&swc.screens, &planes)) {
+		return false;
+	}
+	for (i = 0; i < resources->count_connectors; ++i) {
+		if (!connectors[i] ||
+		    connectors[i]->connection != DRM_MODE_CONNECTED) {
+			continue;
+		}
+		if ((screen = find_screen(connectors[i]->connector_id))) {
+			output = wl_container_of(screen->outputs.next, output, link);
+			/* The last screen, kept through an unplug, is back. The CRTC
+			 * is still programmed for it, but set the mode again rather
+			 * than trust a flip to a monitor that was just replugged. */
+			if (output->disconnected) {
+				output->disconnected = false;
+				screen->planes.primary.need_modeset = true;
+				changed = true;
+			}
+			continue;
+		}
+		if ((screen = create_screen(resources, connectors[i], &swc.screens,
+		                            &planes))) {
+			/* At the end: the first screen is the fallback for a lot of
+			 * things, and a monitor being plugged in should not move it. */
+			wl_list_insert(swc.screens.prev, &screen->link);
+			DEBUG("Screen %s connected\n", swc_screen_get_name(&screen->base));
+			screen_added(screen);
+			changed = true;
+		}
+	}
+	destroy_planes(&planes);
+
+	return changed;
+}
+
+/*
+ * Tear down the screens whose connector is gone. The last screen is kept even
+ * then: everything from the window manager's layout to absolute pointer motion
+ * assumes there is one, and it has somewhere to put the windows when a
+ * monitor comes back.
+ */
+static bool
+remove_screens(drmModeConnector **connectors, int count)
+{
+	struct screen *screen, *tmp;
+	struct output *output;
+	drmModeConnector *connector;
+	bool changed = false;
+
+	wl_list_for_each_safe(screen, tmp, &swc.screens, link)
+	{
+		connector = find_connector(connectors, count, screen_connector(screen));
+		if (connector && connector->connection == DRM_MODE_CONNECTED) {
+			continue;
+		}
+		if (swc.screens.next->next == &swc.screens) {
+			output = wl_container_of(screen->outputs.next, output, link);
+			if (!output->disconnected) {
+				WARNING("Last screen was unplugged; keeping it until "
+				        "another is connected\n");
+				output->disconnected = true;
+			}
+			continue;
+		}
+		DEBUG("Screen %s disconnected\n", swc_screen_get_name(&screen->base));
+		/* Off before its buffers are freed with it. */
+		primary_plane_disable(&screen->planes.primary);
+		screen_destroy(screen);
+		changed = true;
+	}
+
+	return changed;
+}
+
+static void
+rescan_connectors(void *data)
+{
+	drmModeRes *resources;
+	drmModeConnector **connectors;
+	bool changed;
+	int i;
+
+	(void)data;
+	drm.rescan_source = NULL;
+
+	if (!(resources = drmModeGetResources(swc.drm->fd))) {
+		ERROR("Could not get DRM resources: %s\n", strerror(errno));
+		return;
+	}
+	connectors = calloc(resources->count_connectors, sizeof(*connectors));
+	if (!connectors) {
+		drmModeFreeResources(resources);
+		return;
+	}
+	/* Probed once, here: every question below is about this snapshot. */
+	for (i = 0; i < resources->count_connectors; ++i)
+		connectors[i] = drmModeGetConnector(swc.drm->fd,
+		                                    resources->connectors[i]);
+
+	/*
+	 * New screens first, so the window manager always has a screen to move
+	 * the windows of a removed one to. Then again after the removals, for a
+	 * connector that could only get a CRTC once a removed screen let go of
+	 * its own.
+	 */
+	changed = add_screens(resources, connectors);
+	if (remove_screens(connectors, resources->count_connectors)) {
+		add_screens(resources, connectors);
+		changed = true;
+	}
+
+	if (changed) {
+		screens_update_pointer_region();
+		compositor_damage_all();
+	}
+
+	for (i = 0; i < resources->count_connectors; ++i)
+		drmModeFreeConnector(connectors[i]);
+	free(connectors);
+	drmModeFreeResources(resources);
+}
+#endif
+
+/* }}} */
 
 enum { WLD_USER_OBJECT_FRAMEBUFFER = WLD_USER_ID };
 

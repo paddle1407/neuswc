@@ -262,6 +262,11 @@ handle_screen_destroy(struct wl_listener *listener, void *data)
 		input_mode_cancel();
 		swc_overview_end();
 	}
+	/* The id is a CRTC index, and a monitor plugged in later can be given
+	 * the same one: nothing of this screen may be left waiting for it. */
+	compositor.pending_flips &= ~target->mask;
+	compositor.scheduled_updates &= ~target->mask;
+	compositor.recover_updates &= ~target->mask;
 	wl_list_remove(&target->view_handler.link);
 	wl_list_remove(&target->screen_destroy_listener.link);
 	wld_destroy_surface(target->surface);
@@ -2685,6 +2690,30 @@ bind_compositor(struct wl_client *client, void *data, uint32_t version,
 		return;
 	}
 	wl_resource_set_implementation(resource, &compositor_impl, NULL, NULL);
+}
+
+void
+compositor_screen_added(struct screen *screen)
+{
+	struct compositor_view *view;
+
+	if (!compositor.initialized || target_get(screen)) {
+		return;
+	}
+	if (!target_new(screen)) {
+		ERROR("Could not create render target for new screen\n");
+		return;
+	}
+	/* Views keep the bit of a screen that went away until they move. Its id
+	 * may be this screen's now, and a hidden view is not really on it. */
+	wl_list_for_each(view, &compositor.views, link) {
+		if (view->visible)
+			update_view_screens(view);
+		else
+			view_set_screens(&view->base,
+			                 view->base.screens & ~screen_mask(screen));
+	}
+	compositor_damage_all();
 }
 
 bool

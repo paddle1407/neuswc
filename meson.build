@@ -28,7 +28,8 @@ add_project_arguments(cc.get_supported_arguments([
 ], language: 'c')
 
 requires = [
-  dependency('wayland-server', version: '>=1.6.0'),
+  # wl_global_remove and wl_global_set_user_data, for unplugged outputs.
+  dependency('wayland-server', version: '>=1.18.0'),
 ]
 requires_private = [
   dependency('pixman-1'),
