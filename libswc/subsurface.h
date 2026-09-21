@@ -47,6 +47,10 @@ struct subsurface {
 	int32_t x, y;
 	int32_t pending_x, pending_y;
 	bool pending_position;
+	/* The parent's pending stacking order changed on account of this
+	 * subsurface -- it was added or moved, or its parent's view is new --
+	 * and the parent's next commit has to restack. */
+	bool order_dirty;
 	bool sync;
 	bool pending;
 	bool added;

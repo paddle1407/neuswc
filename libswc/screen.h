@@ -97,6 +97,18 @@ screen_new(struct output *output);
 void
 screen_destroy(struct screen *screen);
 
+/*
+ * For a screen created after startup, once it is in swc.screens: what
+ * compositor_initialize, pointer_initialize and the protocol globals did for
+ * the screens that were there from the start.
+ */
+void
+screen_added(struct screen *screen);
+
+/* Recompute where the pointer may go after screens come or go. */
+void
+screens_update_pointer_region(void);
+
 static inline uint32_t
 screen_mask(struct screen *screen)
 {

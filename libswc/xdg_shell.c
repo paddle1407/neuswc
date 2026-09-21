@@ -24,7 +24,9 @@
 #include "xdg_shell.h"
 #include "compositor.h"
 #include "internal.h"
+#include "keyboard.h"
 #include "output.h"
+#include "pointer.h"
 #include "screen.h"
 #include "seat.h"
 #include "surface.h"
@@ -41,7 +43,9 @@ struct xdg_surface {
 	struct wl_resource *resource, *role;
 	struct surface *surface;
 	struct wl_listener surface_destroy_listener, role_destroy_listener;
-	uint32_t configure_serial;
+	/* The xdg_wm_base it came from, for the errors that belong to it. */
+	struct wl_resource *wm_base;
+	struct wl_listener wm_base_destroy_listener;
 	enum {
 		XDG_ROLE_NONE,
 		XDG_ROLE_TOPLEVEL,
@@ -53,6 +57,7 @@ struct xdg_positioner {
 	int32_t width, height;
 	int32_t anchor_x, anchor_y;
 	int32_t anchor_width, anchor_height;
+	bool has_anchor_rect;
 	enum xdg_positioner_anchor anchor;
 	enum xdg_positioner_gravity gravity;
 	enum xdg_positioner_constraint_adjustment constraint;
@@ -73,6 +78,11 @@ struct toplevel_configure {
 	struct wl_list link;
 	uint32_t serial;
 	uint64_t generation;
+};
+
+struct popup_configure {
+	struct wl_list link;
+	uint32_t serial;
 };
 
 struct xdg_toplevel {
@@ -100,8 +110,53 @@ struct xdg_popup {
 	struct compositor_view *view;
 	struct compositor_view *parent;
 	struct wl_listener parent_destroy_listener;
+	struct wl_list configures;
+	unsigned configure_count;
 	bool configured;
+
+	/* In popup_grab.popups while it is part of the grab chain. */
+	struct wl_list grab_link;
+	/* Asked for an explicit grab, whether or not it was granted. */
+	bool grabbed;
+	/* popup_done has been sent; nothing more is owed. */
+	bool dismissed;
 };
+
+/* A view that may be destroyed while it is remembered. */
+struct view_ref {
+	struct compositor_view *view;
+	struct wl_listener destroy_listener;
+	/* Something, possibly nothing, is remembered. */
+	bool set;
+	/* What to do when the view goes: remember nothing at all, or remember
+	 * that there is no view any more. */
+	bool forget_on_destroy;
+};
+
+/*
+ * The seat's popup grab: the chain of nested grabbing popups, topmost first.
+ * swc drives a single seat, so there is one chain. All of the popups belong
+ * to one client, which keeps the pointer as usual ("owner events") while the
+ * topmost popup keeps the keyboard.
+ */
+static struct {
+	struct wl_list popups;
+	struct wl_client *client;
+	/* The keyboard focus the grab took over, given back when it ends. */
+	struct view_ref restore;
+	/* A window the window manager focused while the grab held the
+	 * keyboard; it gets the focus once the grab is over. */
+	struct view_ref pending;
+	/* Watches for presses outside the client. Never removed once added:
+	 * it may end the grab from inside the pointer's handler walk. */
+	struct pointer_handler pointer_handler;
+	struct pointer *pointer;
+} popup_grab = {
+    .popups = {&popup_grab.popups, &popup_grab.popups},
+    .pending = {.forget_on_destroy = true},
+};
+
+static const struct xdg_popup_interface popup_impl;
 
 static void queue_configure(struct xdg_toplevel *toplevel);
 static void send_wm_capabilities(struct xdg_toplevel *toplevel);
@@ -136,11 +191,18 @@ set_anchor_rect(struct wl_client *client, struct wl_resource *resource,
 {
 	struct xdg_positioner *positioner = wl_resource_get_user_data(resource);
 
-	if (width <= 0 || height <= 0) {
+	/*
+	 * A zero-width or zero-height anchor rectangle is a point to hang the
+	 * popup off -- a text caret, or wherever the pointer was -- and the
+	 * protocol only rejects a negative one. Clients do anchor that way, so
+	 * treating zero as invalid kills them for conforming behaviour.
+	 */
+	if (width < 0 || height < 0) {
 		wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT,
-		                       "invalid anchor size");
+		                       "negative anchor size");
 		return;
 	}
+	positioner->has_anchor_rect = true;
 	positioner->anchor_x = x;
 	positioner->anchor_y = y;
 	positioner->anchor_width = width;
@@ -1135,6 +1197,316 @@ send_wm_capabilities(struct xdg_toplevel *toplevel)
 }
 
 /* xdg_popup */
+/*
+ * A client with more than one configure in flight may acknowledge an older
+ * one: it answers the configure it has finished processing, which need not be
+ * the last the compositor sent. Keeping every serial sent -- and dropping it
+ * along with everything older once it is acknowledged -- is what lets a
+ * reposition overlap an ack without the client appearing to invent a serial.
+ * Only a serial that was never sent is a protocol error.
+ */
+static bool
+popup_record_configure(struct xdg_popup *popup, uint32_t *serial)
+{
+	struct popup_configure *c;
+
+	/* Bound memory if a client stops acknowledging configure events. */
+	if (popup->configure_count >= 1024) {
+		wl_resource_post_no_memory(popup->resource);
+		return false;
+	}
+	c = calloc(1, sizeof(*c));
+	if (!c) {
+		wl_resource_post_no_memory(popup->resource);
+		return false;
+	}
+	c->serial = wl_display_next_serial(swc.display);
+	wl_list_insert(popup->configures.prev, &c->link);
+	++popup->configure_count;
+	*serial = c->serial;
+
+	return true;
+}
+
+static bool
+popup_ack_configure(struct xdg_popup *popup, uint32_t serial)
+{
+	struct popup_configure *c, *tmp, *match = NULL;
+
+	wl_list_for_each(c, &popup->configures, link) {
+		if (c->serial == serial) {
+			match = c;
+			break;
+		}
+	}
+	if (!match) {
+		return false;
+	}
+	wl_list_for_each_safe(c, tmp, &popup->configures, link) {
+		bool last = c == match;
+		wl_list_remove(&c->link);
+		free(c);
+		--popup->configure_count;
+		if (last)
+			break;
+	}
+
+	return true;
+}
+
+/* Popup grabs */
+static void
+handle_view_ref_destroy(struct wl_listener *listener, void *data)
+{
+	struct view_ref *ref = wl_container_of(listener, ref, destroy_listener);
+
+	(void)data;
+	wl_list_remove(&ref->destroy_listener.link);
+	ref->view = NULL;
+	if (ref->forget_on_destroy) {
+		ref->set = false;
+	}
+}
+
+static void
+view_ref_clear(struct view_ref *ref)
+{
+	if (ref->view) {
+		wl_list_remove(&ref->destroy_listener.link);
+	}
+	ref->view = NULL;
+	ref->set = false;
+}
+
+static void
+view_ref_set(struct view_ref *ref, struct compositor_view *view)
+{
+	view_ref_clear(ref);
+	ref->set = true;
+	ref->view = view;
+	if (view) {
+		ref->destroy_listener.notify = &handle_view_ref_destroy;
+		wl_signal_add(&view->destroy_signal, &ref->destroy_listener);
+	}
+}
+
+static struct xdg_popup *
+popup_from_view(struct compositor_view *view)
+{
+	struct wl_resource *role;
+
+	if (!view || !view->surface) {
+		return NULL;
+	}
+	role = view->surface->role;
+	if (!role ||
+	    !wl_resource_instance_of(role, &xdg_popup_interface, &popup_impl)) {
+		return NULL;
+	}
+
+	return wl_resource_get_user_data(role);
+}
+
+static bool
+popup_in_grab(struct xdg_popup *popup)
+{
+	return popup && !wl_list_empty(&popup->grab_link);
+}
+
+static struct xdg_popup *
+popup_grab_topmost(void)
+{
+	struct xdg_popup *popup;
+
+	if (wl_list_empty(&popup_grab.popups)) {
+		return NULL;
+	}
+
+	return wl_container_of(popup_grab.popups.next, popup, grab_link);
+}
+
+static void
+post_wm_base_error(struct xdg_popup *popup, uint32_t code, const char *message)
+{
+	struct wl_resource *wm_base = popup->xdg_surface->wm_base;
+
+	if (wm_base) {
+		wl_resource_post_error(wm_base, code, "%s", message);
+	} else {
+		wl_client_post_implementation_error(
+		    wl_resource_get_client(popup->resource), "%s", message);
+	}
+}
+
+/* Unmap the popup and tell the client it is done with. */
+static void
+popup_dismiss(struct xdg_popup *popup)
+{
+	if (popup_in_grab(popup)) {
+		wl_list_remove(&popup->grab_link);
+		wl_list_init(&popup->grab_link);
+	}
+	if (popup->dismissed) {
+		return;
+	}
+	popup->dismissed = true;
+	compositor_view_hide(popup->view);
+	xdg_popup_send_popup_done(popup->resource);
+}
+
+/*
+ * Give the keyboard to the topmost grabbing popup, or, once there is none,
+ * back to whatever had it before -- and then to the window the window
+ * manager chose in the meantime, so that it sees the focus change it asked
+ * for.
+ */
+static void
+popup_grab_update_focus(void)
+{
+	struct keyboard *keyboard = swc.seat ? swc.seat->keyboard : NULL;
+	struct xdg_popup *top = popup_grab_topmost();
+	struct compositor_view *restore, *pending;
+	bool has_pending;
+
+	if (!keyboard) {
+		return;
+	}
+	if (top) {
+		keyboard_set_focus(keyboard, top->view);
+		return;
+	}
+
+	restore = popup_grab.restore.view;
+	pending = popup_grab.pending.view;
+	has_pending = popup_grab.pending.set;
+	view_ref_clear(&popup_grab.restore);
+	view_ref_clear(&popup_grab.pending);
+
+	/* Only take the keyboard back from the popups; if something else has
+	 * it by now, that is where it should stay. */
+	if (!keyboard->focus.view || keyboard->focus.client == popup_grab.client) {
+		keyboard_set_focus(keyboard, restore);
+	}
+	popup_grab.client = NULL;
+	if (has_pending) {
+		swc_window_focus(pending && pending->window ? &pending->window->base
+		                                            : NULL);
+	}
+}
+
+/*
+ * Dismiss the grabbing popups from the topmost down to and including 'last',
+ * or all of them when it is NULL. The protocol asks for the same order it
+ * demands of clients: children before their parents.
+ */
+static void
+popup_grab_dismiss(struct xdg_popup *last)
+{
+	struct xdg_popup *popup;
+
+	while ((popup = popup_grab_topmost())) {
+		popup_dismiss(popup);
+		if (popup == last) {
+			break;
+		}
+	}
+	popup_grab_update_focus();
+}
+
+/* A press anywhere but on the grabbing client's surfaces ends the grab. The
+ * press itself goes on to wherever it was going. */
+static bool
+popup_grab_handle_button(struct pointer_handler *handler, uint32_t time,
+                         struct button *button, uint32_t state)
+{
+	struct pointer *pointer = popup_grab.pointer;
+
+	(void)handler;
+	(void)time;
+	(void)button;
+	if (state != WL_POINTER_BUTTON_STATE_PRESSED ||
+	    wl_list_empty(&popup_grab.popups)) {
+		return false;
+	}
+	if (!pointer->focus.view || pointer->focus.client != popup_grab.client) {
+		popup_grab_dismiss(NULL);
+	}
+
+	return false;
+}
+
+static void
+popup_grab_watch_pointer(struct pointer *pointer)
+{
+	if (popup_grab.pointer == pointer) {
+		return;
+	}
+	popup_grab.pointer_handler = (struct pointer_handler){
+	    .button = &popup_grab_handle_button,
+	};
+	wl_list_insert(&pointer->handlers, &popup_grab.pointer_handler.link);
+	popup_grab.pointer = pointer;
+}
+
+struct compositor_view *
+xdg_popup_grab_filter_keyboard_focus(struct compositor_view *view)
+{
+	struct xdg_popup *top = popup_grab_topmost();
+
+	if (!top || popup_in_grab(popup_from_view(view))) {
+		return view;
+	}
+	/* The grabbing client moving focus between its own surfaces leaves it
+	 * where the grab says it goes. Anyone else taking the keyboard -- a lock
+	 * screen, an exclusive panel -- is the user doing something else. */
+	if (view && wl_resource_get_client(view->surface->resource) ==
+	                popup_grab.client) {
+		return top->view;
+	}
+	popup_grab_dismiss(NULL);
+
+	return view;
+}
+
+bool
+xdg_popup_grab_defer_window_focus(struct compositor_view *view)
+{
+	struct xdg_popup *top = popup_grab_topmost();
+
+	if (!top) {
+		return false;
+	}
+	/* Popups hide with their parent. Once the menu has gone off the screen
+	 * that way -- its workspace switched away, say -- the grab has nothing
+	 * left to hold the keyboard for. */
+	if (top->view->base.buffer && !top->view->visible) {
+		popup_grab_dismiss(NULL);
+		return false;
+	}
+	/* Otherwise the popup keeps the keyboard, which with focus following the
+	 * pointer is what stops a menu from losing it the moment the pointer
+	 * crosses another window on the way to an item. The last window asked
+	 * for is focused when the grab ends. */
+	if (view == popup_grab.restore.view) {
+		view_ref_clear(&popup_grab.pending);
+	} else {
+		view_ref_set(&popup_grab.pending, view);
+	}
+
+	return true;
+}
+
+struct compositor_view *
+xdg_popup_grab_focus_owner(struct compositor_view *view)
+{
+	if (!popup_in_grab(popup_from_view(view))) {
+		return view;
+	}
+
+	return popup_grab.pending.set ? popup_grab.pending.view
+	                              : popup_grab.restore.view;
+}
+
 static void
 handle_popup_parent_destroy(struct wl_listener *listener, void *data)
 {
@@ -1147,8 +1519,11 @@ handle_popup_parent_destroy(struct wl_listener *listener, void *data)
 	wl_list_init(&popup->parent_destroy_listener.link);
 	popup->parent = NULL;
 	compositor_view_set_parent(popup->view, NULL);
-	compositor_view_hide(popup->view);
-	xdg_popup_send_popup_done(popup->resource);
+	if (popup_in_grab(popup)) {
+		popup_grab_dismiss(popup);
+	} else {
+		popup_dismiss(popup);
+	}
 }
 
 static void
@@ -1159,14 +1534,94 @@ destroy_popup(struct wl_resource *resource)
 	if (popup->parent) {
 		wl_list_remove(&popup->parent_destroy_listener.link);
 	}
+	/* The grab passes to the popup below, or back to whatever had the
+	 * keyboard before, while the view is still there to leave. */
+	if (popup_in_grab(popup)) {
+		wl_list_remove(&popup->grab_link);
+		wl_list_init(&popup->grab_link);
+		popup_grab_update_focus();
+	}
+	struct popup_configure *c, *tmp;
+	wl_list_for_each_safe(c, tmp, &popup->configures, link) {
+		wl_list_remove(&c->link);
+		free(c);
+	}
 	compositor_view_destroy(popup->view);
 	free(popup);
+}
+
+static void
+popup_destroy(struct wl_client *client, struct wl_resource *resource)
+{
+	struct xdg_popup *popup = wl_resource_get_user_data(resource);
+
+	(void)client;
+	if (popup_in_grab(popup) && popup != popup_grab_topmost()) {
+		post_wm_base_error(popup, XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
+		                   "destroyed a grabbing popup below the topmost");
+		return;
+	}
+	wl_resource_destroy(resource);
 }
 
 static void
 grab(struct wl_client *client, struct wl_resource *resource,
      struct wl_resource *seat, uint32_t serial)
 {
+	struct xdg_popup *popup = wl_resource_get_user_data(resource);
+	struct xdg_popup *parent_popup = popup_from_view(popup->parent);
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+	struct keyboard *keyboard = swc.seat ? swc.seat->keyboard : NULL;
+	struct xdg_popup *top;
+
+	(void)seat;
+	if (popup->grabbed || popup->dismissed) {
+		return;
+	}
+	if (popup->view->base.buffer) {
+		wl_resource_post_error(resource, XDG_POPUP_ERROR_INVALID_GRAB,
+		                       "grab requested after the popup was mapped");
+		return;
+	}
+	if (parent_popup && !parent_popup->grabbed) {
+		wl_resource_post_error(resource, XDG_POPUP_ERROR_INVALID_GRAB,
+		                       "parent popup did not take an explicit grab");
+		return;
+	}
+	popup->grabbed = true;
+
+	/* A grab has to answer something the user just did to this client. A
+	 * refused grab, like one whose parent menu is already gone, is dismissed
+	 * straight away. */
+	if (!pointer || !keyboard || (parent_popup && parent_popup->dismissed) ||
+	    !input_serial_is_recent(client, serial)) {
+		popup_dismiss(popup);
+		return;
+	}
+
+	top = popup_grab_topmost();
+	if (parent_popup) {
+		/* The parent grabbed and has not been dismissed, so it is in the
+		 * chain, and a nested grab has to hang off the end of it. */
+		if (parent_popup != top) {
+			post_wm_base_error(popup, XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
+			                   "grabbing popup is not a child of the topmost");
+			return;
+		}
+	} else if (top) {
+		/* A new menu from a toplevel: whatever chain was up before, this
+		 * client's or another's, is finished with. */
+		popup_grab_dismiss(NULL);
+	}
+
+	if (wl_list_empty(&popup_grab.popups)) {
+		popup_grab.client = client;
+		view_ref_set(&popup_grab.restore, keyboard->focus.view);
+		view_ref_clear(&popup_grab.pending);
+		popup_grab_watch_pointer(pointer);
+	}
+	wl_list_insert(&popup_grab.popups, &popup->grab_link);
+	keyboard_set_focus(keyboard, popup->view);
 }
 
 /*
@@ -1205,8 +1660,9 @@ reposition(struct wl_client *client, struct wl_resource *resource,
 	view_move(&popup->view->base, popup->parent->base.geometry.x + rect.x,
 	          popup->parent->base.geometry.y + rect.y);
 
-	serial = wl_display_next_serial(swc.display);
-	popup->xdg_surface->configure_serial = serial;
+	if (!popup_record_configure(popup, &serial)) {
+		return;
+	}
 	xdg_popup_send_repositioned(popup->resource, token);
 	xdg_popup_send_configure(popup->resource, rect.x, rect.y, rect.width,
 	                         rect.height);
@@ -1214,7 +1670,7 @@ reposition(struct wl_client *client, struct wl_resource *resource,
 }
 
 static const struct xdg_popup_interface popup_impl = {
-    .destroy = destroy_resource,
+    .destroy = popup_destroy,
     .grab = grab,
     .reposition = reposition,
 };
@@ -1237,6 +1693,11 @@ xdg_popup_set_parent(struct wl_resource *popup_resource,
 	if (!popup || popup->parent || popup->configured) {
 		return false;
 	}
+	/* Take the serial before touching any state, so that a failure here
+	 * leaves the popup as it was. */
+	if (!popup_record_configure(popup, &serial)) {
+		return false;
+	}
 
 	popup->parent = parent;
 	popup->parent_destroy_listener.notify = handle_popup_parent_destroy;
@@ -1250,8 +1711,6 @@ xdg_popup_set_parent(struct wl_resource *popup_resource,
 	compositor_view_set_parent(popup->view, parent);
 	compositor_view_restack(popup->view, parent, true);
 
-	serial = wl_display_next_serial(swc.display);
-	popup->xdg_surface->configure_serial = serial;
 	popup->configured = true;
 	xdg_popup_send_configure(popup->resource, rect.x, rect.y, rect.width,
 	                         rect.height);
@@ -1281,7 +1740,9 @@ xdg_popup_new(struct wl_client *client, uint32_t version, uint32_t id,
 	}
 	popup->xdg_surface = xdg_surface;
 	popup->positioner = *positioner;
+	wl_list_init(&popup->configures);
 	wl_list_init(&popup->parent_destroy_listener.link);
+	wl_list_init(&popup->grab_link);
 	popup->resource =
 	    wl_resource_create(client, &xdg_popup_interface, version, id);
 	if (!popup->resource) {
@@ -1365,7 +1826,7 @@ get_popup(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 		return;
 	}
 	if (positioner->width <= 0 || positioner->height <= 0 ||
-	    positioner->anchor_width <= 0 || positioner->anchor_height <= 0) {
+	    !positioner->has_anchor_rect) {
 		wl_resource_post_error(resource,
 		                       XDG_WM_BASE_ERROR_INVALID_POSITIONER,
 		                       "xdg_positioner is incomplete");
@@ -1395,6 +1856,7 @@ ack_configure(struct wl_client *client, struct wl_resource *resource,
 {
 	struct xdg_surface *xdg_surface = wl_resource_get_user_data(resource);
 	struct xdg_toplevel *toplevel;
+	struct xdg_popup *popup;
 
 	if (!xdg_surface->role) {
 		return;
@@ -1416,8 +1878,11 @@ ack_configure(struct wl_client *client, struct wl_resource *resource,
 			--toplevel->configure_count;
 			if (last) break;
 		}
-	} else if (serial != xdg_surface->configure_serial) {
-		wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SERIAL, "unknown popup configure serial");
+	} else if (xdg_surface->role_type == XDG_ROLE_POPUP) {
+		popup = wl_resource_get_user_data(xdg_surface->role);
+		if (!popup_ack_configure(popup, serial)) {
+			wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SERIAL, "unknown popup configure serial");
+		}
 	}
 }
 
@@ -1467,11 +1932,25 @@ handle_role_destroy(struct wl_listener *listener, void *data)
 }
 
 static void
+handle_wm_base_destroy(struct wl_listener *listener, void *data)
+{
+	struct xdg_surface *xdg_surface =
+	    wl_container_of(listener, xdg_surface, wm_base_destroy_listener);
+
+	(void)data;
+	wl_list_remove(&xdg_surface->wm_base_destroy_listener.link);
+	xdg_surface->wm_base = NULL;
+}
+
+static void
 destroy_xdg_surface(struct wl_resource *resource)
 {
 	struct xdg_surface *xdg_surface = wl_resource_get_user_data(resource);
 
 	wl_list_remove(&xdg_surface->surface_destroy_listener.link);
+	if (xdg_surface->wm_base) {
+		wl_list_remove(&xdg_surface->wm_base_destroy_listener.link);
+	}
 	if (xdg_surface->role) {
 		wl_resource_destroy(xdg_surface->role);
 	}
@@ -1479,8 +1958,8 @@ destroy_xdg_surface(struct wl_resource *resource)
 }
 
 static struct xdg_surface *
-xdg_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
-                struct surface *surface)
+xdg_surface_new(struct wl_client *client, struct wl_resource *wm_base,
+                uint32_t id, struct surface *surface)
 {
 	struct xdg_surface *xdg_surface;
 
@@ -1488,17 +1967,20 @@ xdg_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
 	if (!xdg_surface) {
 		goto error0;
 	}
-	xdg_surface->resource =
-	    wl_resource_create(client, &xdg_surface_interface, version, id);
+	xdg_surface->resource = wl_resource_create(
+	    client, &xdg_surface_interface, wl_resource_get_version(wm_base), id);
 	if (!xdg_surface->resource) {
 		goto error1;
 	}
 	xdg_surface->surface = surface;
-	xdg_surface->configure_serial = 0;
 	xdg_surface->surface_destroy_listener.notify = &handle_surface_destroy;
 	xdg_surface->role = NULL;
 	xdg_surface->role_type = XDG_ROLE_NONE;
 	xdg_surface->role_destroy_listener.notify = &handle_role_destroy;
+	xdg_surface->wm_base = wm_base;
+	xdg_surface->wm_base_destroy_listener.notify = &handle_wm_base_destroy;
+	wl_resource_add_destroy_listener(wm_base,
+	                                 &xdg_surface->wm_base_destroy_listener);
 	wl_resource_add_destroy_listener(surface->resource,
 	                                 &xdg_surface->surface_destroy_listener);
 	wl_resource_set_implementation(xdg_surface->resource, &xdg_surface_impl,
@@ -1549,8 +2031,7 @@ get_xdg_surface(struct wl_client *client, struct wl_resource *resource,
 	struct xdg_surface *xdg_surface;
 	struct surface *surface = wl_resource_get_user_data(surface_resource);
 
-	xdg_surface =
-	    xdg_surface_new(client, wl_resource_get_version(resource), id, surface);
+	xdg_surface = xdg_surface_new(client, resource, id, surface);
 	if (!xdg_surface) {
 		wl_client_post_no_memory(client);
 	}

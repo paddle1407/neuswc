@@ -2,6 +2,7 @@
 #define SWC_OUTPUT_H
 
 #include <pixman.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <wayland-util.h>
 #ifdef ENABLE_DRM
@@ -25,6 +26,8 @@ struct output {
 #ifdef ENABLE_DRM
 	/* The DRM connector corresponding to this output */
 	uint32_t connector;
+	/* Unplugged, but kept because it is the last screen there is. */
+	bool disconnected;
 #endif
 
 	struct wl_global *global;

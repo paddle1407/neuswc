@@ -32,6 +32,7 @@
 #include "surface.h"
 #include "util.h"
 #include "view.h"
+#include "xdg_shell.h"
 
 #include "ext-session-lock-v1-server-protocol.h"
 
@@ -126,6 +127,8 @@ save_focus(void)
 	struct compositor_view *view =
 	    swc.seat && swc.seat->keyboard ? swc.seat->keyboard->focus.view : NULL;
 
+	/* A menu's grab ends with the lock; give the focus back to its owner. */
+	view = xdg_popup_grab_focus_owner(view);
 	clear_saved_focus();
 	if (!view) {
 		return;

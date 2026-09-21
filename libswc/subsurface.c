@@ -146,7 +146,11 @@ subsurface_set_parent_view(struct subsurface *subsurface, struct view *parent)
 		compositor_view_set_parent(view, parent_view);
 		if (!parent_view) compositor_view_hide(view);
 	}
-	if (parent_view) subsurface_update_position(subsurface);
+	if (parent_view) {
+		subsurface_update_position(subsurface);
+		/* A new parent view knows nothing of where this one belongs. */
+		subsurface->order_dirty = true;
+	}
 }
 
 static void
@@ -280,6 +284,7 @@ place_above(struct wl_client *client, struct wl_resource *resource,
 		wl_list_insert(&sibling_subsurface->pending_link,
 		               &subsurface->pending_link);
 	}
+	subsurface->order_dirty = true;
 }
 
 static void
@@ -307,6 +312,7 @@ place_below(struct wl_client *client, struct wl_resource *resource,
 		wl_list_insert(sibling_subsurface->pending_link.prev,
 		               &subsurface->pending_link);
 	}
+	subsurface->order_dirty = true;
 }
 
 static void
@@ -332,6 +338,46 @@ set_desync(struct wl_client *client, struct wl_resource *resource)
 	}
 }
 
+/*
+ * The pending order becomes the current one on the parent's commit. Most
+ * commits -- new damage, a frame callback -- leave it as it was, and then
+ * the children's views are already where they belong: the compositor carries
+ * a view's descendants along whenever it restacks it. So the order is only
+ * rebuilt, and the views restacked, when a wl_subsurface request changed it.
+ */
+static bool
+take_order_dirty(struct surface *parent)
+{
+	struct subsurface *child;
+	bool dirty = false;
+
+	wl_list_for_each(child, &parent->subsurfaces, link)
+	{
+		dirty |= child->order_dirty;
+		child->order_dirty = false;
+	}
+
+	return dirty;
+}
+
+static void
+apply_pending_positions(struct surface *parent)
+{
+	struct subsurface *child;
+
+	wl_list_for_each(child, &parent->subsurfaces, link)
+	{
+		if (!child->pending_position) {
+			continue;
+		}
+
+		child->pending_position = false;
+		child->x = child->pending_x;
+		child->y = child->pending_y;
+		subsurface_update_position(child);
+	}
+}
+
 void
 subsurface_parent_commit(struct surface *parent)
 {
@@ -341,6 +387,10 @@ subsurface_parent_commit(struct surface *parent)
 	struct compositor_view *child_view;
 
 	if (!parent) {
+		return;
+	}
+	if (!take_order_dirty(parent)) {
+		apply_pending_positions(parent);
 		return;
 	}
 
@@ -396,17 +446,7 @@ subsurface_parent_commit(struct surface *parent)
 		}
 	}
 
-	wl_list_for_each(child, &parent->subsurfaces, link)
-	{
-		if (!child->pending_position) {
-			continue;
-		}
-
-		child->x = child->pending_x;
-		child->y = child->pending_y;
-		child->pending_position = false;
-		subsurface_update_position(child);
-	}
+	apply_pending_positions(parent);
 
 	wl_list_for_each(child, &parent->state.subsurfaces_below, current_link)
 	{
@@ -507,6 +547,7 @@ subsurface_new(struct wl_client *client, uint32_t version, uint32_t id,
 	subsurface->pending_x = 0;
 	subsurface->pending_y = 0;
 	subsurface->pending_position = false;
+	subsurface->order_dirty = true;
 	subsurface->sync = true;
 	subsurface->pending = false;
 	subsurface->added = false;
