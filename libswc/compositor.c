@@ -438,6 +438,19 @@ repaint_view(struct target *target, struct compositor_view *view,
 		return;
 	}
 
+	/*
+	 * Everything drawn below -- buffer, border and decorations -- lies inside
+	 * the extents, and is clipped by the damage and by view->clip. A view the
+	 * damage misses, or one wholly covered by opaque views above (which paint
+	 * that area themselves), would build a dozen regions only to draw nothing.
+	 */
+	if (pixman_region32_contains_rectangle(damage, &view->extents) ==
+	        PIXMAN_REGION_OUT ||
+	    pixman_region32_contains_rectangle(&view->clip, &view->extents) ==
+	        PIXMAN_REGION_IN) {
+		return;
+	}
+
 	buf_w = view->base.buffer->width;
 	buf_h = view->base.buffer->height;
 	buf_x = geom->x - view->buffer_offset_x;
@@ -2158,30 +2171,39 @@ calculate_damage(void)
 		}
 
 		geom = &view->base.geometry;
-		pixman_region32_t view_region;
 
-		pixman_region32_init_rect(&view_region, geom->x, geom->y, geom->width,
-		                          geom->height);
+		/*
+		 * Clip the surface by the opaque region covering it. Everything that
+		 * consults the clip works inside the view's extents, so keep only that
+		 * part: a copy of the whole accumulated region grows with every opaque
+		 * window above, which made this quadratic in the window count.
+		 */
+		pixman_region32_intersect_rect(&view->clip, &compositor.opaque,
+		                               view->extents.x1, view->extents.y1,
+		                               span_u32(view->extents.x1, view->extents.x2),
+		                               span_u32(view->extents.y1, view->extents.y2));
 
-		/* Clip the surface by the opaque region covering it. */
-		pixman_region32_copy(&view->clip, &compositor.opaque);
+		/* Add the surface's opaque region, in global coordinates, to the
+		 * accumulated opaque region. Many clients declare none at all. */
+		bool bar_opaque = view->decor.titlebar.enabled && view->base.buffer;
+		if (bar_opaque || pixman_region32_not_empty(&view->surface->state.opaque)) {
+			pixman_region32_copy(&surface_opaque, &view->surface->state.opaque);
+			pixman_region32_translate(&surface_opaque,
+			                          geom->x - view->buffer_offset_x,
+			                          geom->y - view->buffer_offset_y);
+			pixman_region32_intersect_rect(&surface_opaque, &surface_opaque,
+			                               geom->x, geom->y, geom->width,
+			                               geom->height);
 
-		/* Translate the opaque region to global coordinates. */
-		pixman_region32_copy(&surface_opaque, &view->surface->state.opaque);
-		pixman_region32_translate(&surface_opaque,
-		                          geom->x - view->buffer_offset_x,
-		                          geom->y - view->buffer_offset_y);
-		pixman_region32_intersect(&surface_opaque, &surface_opaque,
-		                          &view_region);
+			/* The cached solid bar is opaque too; avoid drawing windows
+			 * behind it. */
+			if (bar_opaque)
+				pixman_region32_union_rect(&surface_opaque, &surface_opaque,
+				    geom->x, geom->y - view->decor.top, geom->width, view->decor.top);
 
-		/* The cached solid bar is opaque too; avoid drawing windows behind it. */
-		if (view->decor.titlebar.enabled && view->base.buffer)
-			pixman_region32_union_rect(&surface_opaque, &surface_opaque,
-			    geom->x, geom->y - view->decor.top, geom->width, view->decor.top);
-
-		/* Add the surface's opaque region to the accumulated opaque region. */
-		pixman_region32_union(&compositor.opaque, &compositor.opaque,
-		                      &surface_opaque);
+			pixman_region32_union(&compositor.opaque, &compositor.opaque,
+			                      &surface_opaque);
+		}
 
 		surface_damage = &view->surface->state.damage;
 
@@ -2215,12 +2237,14 @@ calculate_damage(void)
 		/* redraw entire thingy if border or decor changed */
 		if (view->border.damaged_border1 || view->border.damaged_border2 ||
 		    view->decor.damaged) {
-			pixman_region32_t border_region;
+			pixman_region32_t border_region, view_region;
 
 			pixman_region32_init_with_extents(&border_region, &view->extents);
-
+			pixman_region32_init_rect(&view_region, geom->x, geom->y,
+			                          geom->width, geom->height);
 			pixman_region32_subtract(&border_region, &border_region,
 			                         &view_region);
+			pixman_region32_fini(&view_region);
 
 			pixman_region32_union(&compositor.damage, &compositor.damage,
 			                      &border_region);
@@ -2231,8 +2255,6 @@ calculate_damage(void)
 			view->border.damaged_border2 = false;
 			view->decor.damaged = false;
 		}
-
-		pixman_region32_fini(&view_region);
 	}
 
 	pixman_region32_fini(&surface_opaque);
