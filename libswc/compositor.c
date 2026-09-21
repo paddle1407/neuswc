@@ -1088,10 +1088,11 @@ render_zoomed(struct screen *screen, struct wld_renderer *renderer, float zoom)
 	wl_list_for_each_reverse(view, &compositor.views, link) {
 		struct wld_buffer *src = view->buffer, *bar;
 		const struct swc_rectangle *vg = &view->base.geometry;
+		const struct swc_rectangle frame = frame_geometry(view);
 		struct swc_rectangle bar_rect;
 		struct wld_rect dst;
 		struct wld_frect area;
-		double scale, x, y, w, h, out, in, border;
+		double scale, x, y, fx, fy, fw, fh, border;
 		double sx, sy, sw, sh;
 
 		/*
@@ -1108,17 +1109,18 @@ render_zoomed(struct screen *screen, struct wld_renderer *renderer, float zoom)
 		scale = view->always_top ? 1.0 : zoom;
 		x = (vg->x - cx) * scale + geom->width / 2.0;
 		y = (vg->y - cy) * scale + geom->height / 2.0;
-		w = vg->width * scale;
-		h = vg->height * scale;
-		out = view->border.outwidth * scale;
-		in = view->border.inwidth * scale;
-		border = out + in;
+		/* The border encloses the titlebar too, as it does unzoomed. */
+		fx = (frame.x - cx) * scale + geom->width / 2.0;
+		fy = (frame.y - cy) * scale + geom->height / 2.0;
+		fw = frame.width * scale;
+		fh = frame.height * scale;
+		border = ((double)view->border.outwidth + view->border.inwidth) * scale;
 
-		if (x + w + border < 0 || x - border >= geom->width ||
-		    y + h + border < 0 || y - border >= geom->height)
+		if (fx + fw + border < 0 || fx - border >= geom->width ||
+		    fy + fh + border < 0 || fy - border >= geom->height)
 			continue;
 
-		fill_border_scaled(renderer, view, x, y, w, h, scale);
+		fill_border_scaled(renderer, view, fx, fy, fw, fh, scale);
 
 		/*
 		 * A window's geometry can be a sub-rectangle of its buffer -- the
