@@ -2333,15 +2333,33 @@ update_screen(struct screen *screen)
 		return;
 	}
 
+	/*
+	 * wld keeps each scanout buffer's damage in screen coordinates, and
+	 * hands back what the buffer about to be drawn has missed. Everything
+	 * else -- views, the opaque region, screencopy -- is global, so that
+	 * is the one round trip: damage is global again from here on.
+	 */
 	pixman_region32_init(&damage);
 	pixman_region32_intersect_rect(&damage, &compositor.damage, geom->x,
 	                               geom->y, geom->width, geom->height);
 	pixman_region32_translate(&damage, -geom->x, -geom->y);
 	total_damage = wld_surface_damage(target->surface, &damage);
+	pixman_region32_clear(&damage);
 
 	/* Don't repaint the screen if it is waiting for a page flip. */
 	if (compositor.pending_flips & screen_mask(screen)) {
 		pixman_region32_fini(&damage);
+		return;
+	}
+
+	/* No back buffer to draw into. The damage is recorded on every buffer
+	 * already, so retry once as for a failed flip. */
+	if (!total_damage) {
+		pixman_region32_fini(&damage);
+		if (!target->swap_failed) {
+			target->swap_failed = true;
+			compositor.recover_updates |= screen_mask(screen);
+		}
 		return;
 	}
 
@@ -2354,10 +2372,8 @@ update_screen(struct screen *screen)
 		render_overview(screen, swc.backend->renderer);
 		wld_flush(swc.backend->renderer);
 		/* Screencopy consumes global damage, including on a second monitor. */
-		pixman_region32_clear(&damage);
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 	} else if (compositor.zoom != 1.0f) {
-		pixman_region32_clear(&damage);
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 
 		if (!wld_set_target_surface(swc.backend->renderer, target->surface)) {
