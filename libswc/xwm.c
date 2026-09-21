@@ -47,6 +47,9 @@ struct xwl_window {
 	xcb_window_t id;
 	uint32_t surface_id;
 	bool override_redirect, supports_delete;
+	/* WM_TRANSIENT_FOR, kept so that a parent paired after its dialog can
+	 * still be found. */
+	xcb_window_t transient_for;
 	struct wl_list link;
 
 	/* Only used for paired windows. */
@@ -172,6 +175,136 @@ find_window(struct wl_list *list, xcb_window_t id)
 	}
 
 	return NULL;
+}
+
+/* WM_CLASS names the application; its class half is what X desktops group
+ * and match windows by, so it serves as the app id. */
+static void
+update_class(struct xwl_window *xwl_window)
+{
+	xcb_get_property_cookie_t cookie;
+	xcb_icccm_get_wm_class_reply_t reply;
+	const char *app_id;
+
+	cookie = xcb_icccm_get_wm_class(xwm.connection, xwl_window->id);
+	if (!xcb_icccm_get_wm_class_reply(xwm.connection, cookie, &reply, NULL)) {
+		return;
+	}
+	app_id = reply.class_name && *reply.class_name ? reply.class_name
+	                                               : reply.instance_name;
+	if (app_id && *app_id &&
+	    (!xwl_window->window.base.app_id ||
+	     strcmp(app_id, xwl_window->window.base.app_id) != 0)) {
+		window_set_app_id(&xwl_window->window, app_id);
+	}
+	xcb_icccm_get_wm_class_reply_wipe(&reply);
+}
+
+static uint32_t
+size_hint(int32_t value)
+{
+	return value > 0 ? (uint32_t)value : 0;
+}
+
+/*
+ * WM_NORMAL_HINTS: the minimum and maximum size. ICCCM has the base size
+ * stand in for a missing minimum. Zero means no limit, as it does for
+ * xdg_toplevel, and a maximum below the minimum is dropped rather than
+ * letting the window manager clamp to an impossible range.
+ */
+static void
+update_size_hints(struct xwl_window *xwl_window)
+{
+	struct swc_window *base = &xwl_window->window.base;
+	xcb_get_property_cookie_t cookie;
+	xcb_size_hints_t hints;
+	uint32_t min_width = 0, min_height = 0, max_width = 0, max_height = 0;
+
+	cookie = xcb_icccm_get_wm_normal_hints(xwm.connection, xwl_window->id);
+	if (xcb_icccm_get_wm_normal_hints_reply(xwm.connection, cookie, &hints,
+	                                        NULL)) {
+		if (hints.flags & XCB_ICCCM_SIZE_HINT_P_MIN_SIZE) {
+			min_width = size_hint(hints.min_width);
+			min_height = size_hint(hints.min_height);
+		} else if (hints.flags & XCB_ICCCM_SIZE_HINT_BASE_SIZE) {
+			min_width = size_hint(hints.base_width);
+			min_height = size_hint(hints.base_height);
+		}
+		if (hints.flags & XCB_ICCCM_SIZE_HINT_P_MAX_SIZE) {
+			max_width = size_hint(hints.max_width);
+			max_height = size_hint(hints.max_height);
+		}
+	}
+	if (max_width && max_width < min_width) {
+		max_width = 0;
+	}
+	if (max_height && max_height < min_height) {
+		max_height = 0;
+	}
+
+	base->min_width = min_width;
+	base->min_height = min_height;
+	base->max_width = max_width;
+	base->max_height = max_height;
+}
+
+/*
+ * Make the window a child of the one it is transient for, if that one is
+ * managed. A window transient for itself, for an unmanaged window, or for one
+ * of its own descendants gets no parent: a cycle would never end the walks
+ * the compositor makes up the parent chain.
+ */
+static void
+apply_transient_for(struct xwl_window *xwl_window)
+{
+	struct xwl_window *parent = NULL;
+	struct swc_window *ancestor;
+
+	if (xwl_window->transient_for &&
+	    xwl_window->transient_for != xwl_window->id) {
+		parent = find_window(&xwm.windows, xwl_window->transient_for);
+	}
+	if (parent && parent->override_redirect) {
+		parent = NULL;
+	}
+	for (ancestor = parent ? &parent->window.base : NULL; ancestor;
+	     ancestor = ancestor->parent) {
+		if (ancestor == &xwl_window->window.base) {
+			parent = NULL;
+			break;
+		}
+	}
+	window_set_parent(&xwl_window->window, parent ? &parent->window : NULL);
+}
+
+static void
+update_transient_for(struct xwl_window *xwl_window)
+{
+	xcb_get_property_cookie_t cookie;
+	xcb_window_t parent;
+
+	cookie = xcb_icccm_get_wm_transient_for(xwm.connection, xwl_window->id);
+	if (!xcb_icccm_get_wm_transient_for_reply(xwm.connection, cookie, &parent,
+	                                          NULL)) {
+		parent = XCB_WINDOW_NONE;
+	}
+	xwl_window->transient_for = parent;
+	apply_transient_for(xwl_window);
+}
+
+/* Dialogs that named this window before it was paired can have it now. */
+static void
+adopt_transients(struct xwl_window *parent)
+{
+	struct xwl_window *window;
+
+	wl_list_for_each(window, &xwm.windows, link)
+	{
+		if (window != parent && !window->override_redirect &&
+		    window->transient_for == parent->id) {
+			apply_transient_for(window);
+		}
+	}
 }
 
 static struct xwl_window *
@@ -396,11 +529,19 @@ manage_window(struct xwl_window *xwl_window)
 		xcb_configure_window(xwm.connection, xwl_window->id, mask, values);
 		update_name(xwl_window);
 		update_protocols(xwl_window);
+		update_class(xwl_window);
+		update_size_hints(xwl_window);
+		/* Before window_manage, so the window manager meets a dialog
+		 * already knowing whose it is. */
+		update_transient_for(xwl_window);
 		window_manage(&xwl_window->window);
 	}
 
 	wl_list_remove(&xwl_window->link);
 	wl_list_insert(&xwm.windows, &xwl_window->link);
+	if (!xwl_window->override_redirect) {
+		adopt_transients(xwl_window);
+	}
 
 	return true;
 }
@@ -437,6 +578,7 @@ create_notify(xcb_create_notify_event_t *event)
 	xwl_window->id = event->window;
 	xwl_window->surface_id = 0;
 	xwl_window->override_redirect = event->override_redirect;
+	xwl_window->transient_for = XCB_WINDOW_NONE;
 	wl_list_insert(&xwm.unpaired_windows, &xwl_window->link);
 }
 
@@ -493,7 +635,8 @@ property_notify(xcb_property_notify_event_t *event)
 {
 	struct xwl_window *xwl_window;
 
-	if (!(xwl_window = find_window(&xwm.windows, event->window))) {
+	if (!(xwl_window = find_window(&xwm.windows, event->window)) ||
+	    xwl_window->override_redirect) {
 		return;
 	}
 
@@ -502,6 +645,13 @@ property_notify(xcb_property_notify_event_t *event)
 		update_name(xwl_window);
 	} else if (event->atom == xwm.atoms[ATOM_WM_PROTOCOLS].value) {
 		update_protocols(xwl_window);
+	} else if (event->atom == XCB_ATOM_WM_CLASS &&
+	           event->state == XCB_PROPERTY_NEW_VALUE) {
+		update_class(xwl_window);
+	} else if (event->atom == XCB_ATOM_WM_NORMAL_HINTS) {
+		update_size_hints(xwl_window);
+	} else if (event->atom == XCB_ATOM_WM_TRANSIENT_FOR) {
+		update_transient_for(xwl_window);
 	}
 }
 
