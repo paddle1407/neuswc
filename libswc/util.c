@@ -22,6 +22,7 @@
  */
 
 #include "util.h"
+#include "internal.h"
 
 #include <wayland-server.h>
 
@@ -43,6 +44,90 @@ destroy_resource(struct wl_client *client, struct wl_resource *resource)
 {
 	wl_resource_destroy(resource);
 }
+
+void
+orphan_resources(struct wl_list *resources)
+{
+	struct wl_resource *resource, *tmp;
+
+	wl_resource_for_each_safe(resource, tmp, resources) {
+		wl_list_remove(wl_resource_get_link(resource));
+		wl_list_init(wl_resource_get_link(resource));
+		wl_resource_set_user_data(resource, NULL);
+	}
+}
+
+/* Retired globals {{{ */
+
+/*
+ * How long a withdrawn global stays bindable. A client reads global_remove
+ * only when it next dispatches, and one that sent a bind before then must
+ * still find the global there, or libwayland disconnects it for naming a
+ * global that does not exist.
+ */
+#define GLOBAL_RETIRE_DELAY_MS 5000
+
+struct retired_global {
+	struct wl_global *global;
+	struct wl_event_source *timer;
+	struct wl_list link;
+};
+
+static struct wl_list retired_globals = {&retired_globals, &retired_globals};
+
+static void
+retired_global_destroy(struct retired_global *retired)
+{
+	wl_list_remove(&retired->link);
+	if (retired->timer) {
+		wl_event_source_remove(retired->timer);
+	}
+	wl_global_destroy(retired->global);
+	free(retired);
+}
+
+static int
+handle_retire_timeout(void *data)
+{
+	retired_global_destroy(data);
+	return 0;
+}
+
+void
+global_retire(struct wl_global *global)
+{
+	struct retired_global *retired;
+
+	/* The object behind it is about to go: a late bind gets an inert
+	 * resource rather than a pointer to freed memory. */
+	wl_global_set_user_data(global, NULL);
+	wl_global_remove(global);
+
+	if (!(retired = malloc(sizeof(*retired)))) {
+		wl_global_destroy(global);
+		return;
+	}
+	retired->global = global;
+	retired->timer = wl_event_loop_add_timer(swc.event_loop,
+	                                         &handle_retire_timeout, retired);
+	wl_list_insert(&retired_globals, &retired->link);
+	if (!retired->timer ||
+	    wl_event_source_timer_update(retired->timer,
+	                                 GLOBAL_RETIRE_DELAY_MS) < 0) {
+		retired_global_destroy(retired);
+	}
+}
+
+void
+retired_globals_finish(void)
+{
+	struct retired_global *retired, *tmp;
+
+	wl_list_for_each_safe(retired, tmp, &retired_globals, link)
+		retired_global_destroy(retired);
+}
+
+/* }}} */
 
 /* Descriptor accounting {{{ */
 

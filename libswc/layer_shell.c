@@ -914,6 +914,19 @@ handle_surface_commit(struct wl_listener *listener, void *data)
 	}
 }
 
+/* Detach an unmapped surface from its screen and tell the client. */
+static void
+close_layer_surface(struct layer_surface *surface)
+{
+	clear_configures(surface);
+	surface->configured = false;
+	surface->closed = true;
+	surface->layer_screen = NULL;
+	wl_list_remove(&surface->screen_link);
+	wl_list_init(&surface->screen_link);
+	zwlr_layer_surface_v1_send_closed(surface->resource);
+}
+
 static void
 handle_screen_destroy(struct wl_listener *listener, void *data)
 {
@@ -930,15 +943,7 @@ handle_screen_destroy(struct wl_listener *listener, void *data)
 	update_keyboard_focus();
 
 	wl_list_for_each_safe(surface, next, &layer_screen->surfaces, screen_link)
-	{
-		clear_configures(surface);
-		surface->configured = false;
-		surface->closed = true;
-		surface->layer_screen = NULL;
-		wl_list_remove(&surface->screen_link);
-		wl_list_init(&surface->screen_link);
-		zwlr_layer_surface_v1_send_closed(surface->resource);
-	}
+	    close_layer_surface(surface);
 
 	wl_list_remove(&layer_screen->modifier.link);
 	wl_list_remove(&layer_screen->screen_destroy_listener.link);
@@ -1122,8 +1127,10 @@ get_layer_surface(struct wl_client *client, struct wl_resource *resource,
                   const char *namespace_)
 {
 	struct surface *surface = wl_resource_get_user_data(surface_resource);
+	struct layer_surface *layer_surface;
 	struct output *output;
 	struct screen *screen;
+	bool gone = false;
 
 	(void)namespace_;
 	if (layer > ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY) {
@@ -1147,14 +1154,29 @@ get_layer_surface(struct wl_client *client, struct wl_resource *resource,
 	if (output_resource) {
 		output = wl_resource_get_user_data(output_resource);
 		screen = output ? output->screen : NULL;
+		/* Asked for on an output that has since been unplugged. That is a
+		 * race the client cannot avoid, not an error: it gets a surface
+		 * that is closed straight away, as if the output had gone after. */
+		if (!screen) {
+			gone = true;
+			screen = default_screen();
+		}
 	} else {
 		screen = default_screen();
 	}
 
 	if (!screen ||
-	    !layer_surface_new(client, wl_resource_get_version(resource), id, surface,
-	                       screen, layer)) {
+	    !(layer_surface = layer_surface_new(client,
+	                                        wl_resource_get_version(resource),
+	                                        id, surface, screen, layer))) {
 		wl_client_post_no_memory(client);
+		return;
+	}
+	if (gone) {
+		struct layer_screen *layer_screen = layer_surface->layer_screen;
+
+		close_layer_surface(layer_surface);
+		release_layer_screen_if_empty(layer_screen);
 	}
 }
 
