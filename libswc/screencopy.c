@@ -17,7 +17,9 @@
 #endif
 #include "internal.h"
 #include "output.h"
+#include "pointer.h"
 #include "screen.h"
+#include "seat.h"
 #include "shm.h"
 #include "snap.h"
 #include "util.h"
@@ -48,7 +50,53 @@ struct capture_history {
 	uint64_t image, cursor;
 	struct swc_rectangle rect;
 	bool valid, overlay_cursor;
+	/* Where the overlaid cursor was, screen-local; empty if not drawn. */
+	pixman_box32_t cursor_box;
 };
+
+/*
+ * What each screen's damage was over its last few repaints, so that a copy
+ * can be limited to what changed since a buffer was last filled, and the
+ * damage event can say what changed since the client's last copy. 'evicted'
+ * is the newest image revision that has fallen out of the ring: anything
+ * older than that can no longer be answered, and gets the full rectangle.
+ */
+#define DAMAGE_HISTORY 32
+
+static struct damage_history {
+	/* Only compared: a new screen that took over the id starts afresh. */
+	struct screen *screen;
+	struct {
+		uint64_t image;
+		pixman_region32_t region;
+	} entries[DAMAGE_HISTORY];
+	unsigned next, count;
+	uint64_t evicted;
+} damage_history[SWC_MAX_SCREENS];
+
+/*
+ * What a client's buffer was last filled with. A client that captures into a
+ * pool of buffers -- a screencast usually does -- gets each one back several
+ * frames later, and only what changed on the screen since then has to be
+ * copied into it again. A buffer that has never been filled, or that failed
+ * part way through, is copied in full.
+ */
+struct buffer_state {
+	struct wl_resource *buffer;
+	struct wl_listener destroy_listener;
+	struct wl_list link;
+	uint32_t screen_id;
+	struct swc_rectangle rect;
+	bool overlay_cursor;
+	uint64_t image;
+	pixman_box32_t cursor_box;
+};
+
+static struct wl_list buffer_states = {&buffer_states, &buffer_states};
+
+/* A handful of boxes is worth copying one by one; beyond that, the time goes
+ * on per-copy overhead and the box around them all is copied instead. */
+#define MAX_COPY_BOXES 16
 struct capture_manager {
 	unsigned references;
 	struct capture_history history[SWC_MAX_SCREENS];
@@ -82,12 +130,135 @@ screencopy_cursor_changed(uint32_t screens)
 	schedule_capture(16);
 }
 
+static void
+buffer_state_destroy(struct buffer_state *state)
+{
+	wl_list_remove(&state->destroy_listener.link);
+	wl_list_remove(&state->link);
+	free(state);
+}
+
 void
 screencopy_finalize(void)
 {
+	struct buffer_state *state, *tmp;
+
 	if (capture_timer) wl_event_source_remove(capture_timer);
 	capture_timer = NULL;
 	timer_armed = false;
+	wl_list_for_each_safe(state, tmp, &buffer_states, link)
+		buffer_state_destroy(state);
+	for (unsigned i = 0; i < SWC_MAX_SCREENS; ++i) {
+		struct damage_history *history = &damage_history[i];
+		for (unsigned j = 0; j < history->count; ++j)
+			pixman_region32_fini(&history->entries[j].region);
+		*history = (struct damage_history){0};
+	}
+}
+
+static void
+damage_history_add(struct screen *screen, uint64_t image, pixman_region32_t *region)
+{
+	struct damage_history *history = &damage_history[screen->id];
+	unsigned slot;
+
+	if (history->screen != screen) {
+		for (unsigned i = 0; i < history->count; ++i)
+			pixman_region32_fini(&history->entries[i].region);
+		/* Buffers filled from the old screen are copied in full. */
+		*history = (struct damage_history){.screen = screen, .evicted = image};
+	}
+	slot = history->next;
+
+	if (history->count < DAMAGE_HISTORY) {
+		pixman_region32_init(&history->entries[slot].region);
+		++history->count;
+	} else {
+		history->evicted = history->entries[slot].image;
+	}
+	history->entries[slot].image = image;
+	pixman_region32_copy(&history->entries[slot].region, region);
+	history->next = (slot + 1) % DAMAGE_HISTORY;
+}
+
+/* Add everything that changed on the screen after image revision 'since' to
+ * 'region', in screen-local coordinates. False if the history no longer goes
+ * back that far. */
+static bool
+damage_since(uint32_t id, uint64_t since, pixman_region32_t *region)
+{
+	struct damage_history *history = &damage_history[id];
+
+	if (since < history->evicted) return false;
+	for (unsigned i = 0; i < history->count; ++i) {
+		if (history->entries[i].image > since)
+			pixman_region32_union(region, region, &history->entries[i].region);
+	}
+	return true;
+}
+
+/* The box the overlaid cursor covers on 'screen', screen-local, as
+ * snap_overlay_cursor_region and snap_render_cursor draw it. */
+static pixman_box32_t
+cursor_box(struct screen *screen)
+{
+	struct pointer *pointer = swc.seat ? swc.seat->pointer : NULL;
+	pixman_box32_t box = {0, 0, 0, 0};
+
+	if (!pointer || !pointer->cursor.buffer || !pointer->cursor.view.buffer ||
+	    !(pointer->cursor.view.screens & screen_mask(screen)))
+		return box;
+	box.x1 = pointer->cursor.view.geometry.x - screen->base.geometry.x;
+	box.y1 = pointer->cursor.view.geometry.y - screen->base.geometry.y;
+	box.x2 = box.x1 + (int32_t)pointer->cursor.buffer->width;
+	box.y2 = box.y1 + (int32_t)pointer->cursor.buffer->height;
+	return box;
+}
+
+static void
+region_add_box(pixman_region32_t *region, const pixman_box32_t *box)
+{
+	if (box->x2 > box->x1 && box->y2 > box->y1)
+		pixman_region32_union_rect(region, region, box->x1, box->y1,
+		                           box->x2 - box->x1, box->y2 - box->y1);
+}
+
+/* Clip to the frame, and trade a scattering of boxes for the one box around
+ * them. */
+static void
+region_finish(pixman_region32_t *region, const struct swc_rectangle *rect)
+{
+	int count;
+
+	pixman_region32_intersect_rect(region, region, rect->x, rect->y,
+	                               rect->width, rect->height);
+	pixman_region32_rectangles(region, &count);
+	if (count > MAX_COPY_BOXES) {
+		pixman_box32_t extents = *pixman_region32_extents(region);
+		pixman_region32_fini(region);
+		pixman_region32_init_with_extents(region, &extents);
+	}
+}
+
+static void
+handle_buffer_state_destroy(struct wl_listener *listener, void *data)
+{
+	struct buffer_state *state = wl_container_of(listener, state, destroy_listener);
+
+	(void)data;
+	buffer_state_destroy(state);
+}
+
+static struct buffer_state *
+buffer_state_find(struct wl_resource *buffer)
+{
+	struct buffer_state *state;
+
+	wl_list_for_each(state, &buffer_states, link) {
+		if (state->buffer == buffer)
+			return state;
+	}
+	return NULL;
 }
 
 enum capture_path { CAPTURE_DMABUF, CAPTURE_SHM_DIRECT, CAPTURE_SHM_FALLBACK, CAPTURE_PATHS };
@@ -228,20 +399,40 @@ invalid:
 	return false;
 }
 
-/* Read the already-composited image into the client's memory. A GPU readback
- * is still synchronous, but there is no second scene render or staging copy. */
+/*
+ * Read the already-composited image into the client's memory. A GPU readback
+ * is still synchronous, but there is no second scene render or staging copy.
+ *
+ * Only 'region' (screen-local, inside the frame) is read. GLES2 cannot read
+ * into a destination with a different row length, so a box narrower than the
+ * frame would cost one read per row; reading whole-width bands of rows keeps
+ * it to one read per band while still skipping the rows nothing touched.
+ */
 static bool
 copy_shm(struct screencopy_frame *frame, struct swc_shm_buffer_info *target,
-         enum capture_path *path)
+         pixman_region32_t *region, enum capture_path *path)
 {
 	struct wld_buffer *source = compositor_capture_buffer(frame->screen);
 	struct wld_renderer *renderer = swc.backend->renderer;
 	bool copied = false;
 	const struct swc_rectangle *r = &frame->rect;
+	int count;
+	pixman_box32_t *boxes = pixman_region32_rectangles(region, &count);
 	if (source && renderer) {
-		if (wld_set_target_buffer(renderer, source))
-			copied = wld_read_pixels(renderer, r->x, r->y, r->width, r->height,
-			                         target->stride, target->data);
+		if (wld_set_target_buffer(renderer, source)) {
+			copied = true;
+			/* Boxes come sorted by their top edge, so bands that overlap or
+			 * touch are next to each other. */
+			for (int i = 0; i < count && copied;) {
+				int32_t y1 = boxes[i].y1, y2 = boxes[i].y2;
+				for (++i; i < count && boxes[i].y1 <= y2; ++i)
+					y2 = MAX(y2, boxes[i].y2);
+				copied = wld_read_pixels(renderer, r->x, y1, r->width, y2 - y1,
+				                         target->stride,
+				                         (uint8_t *)target->data +
+				                             (size_t)(y1 - r->y) * target->stride);
+			}
+		}
 		wld_set_target_buffer(renderer, NULL);
 	}
 	if (copied) {
@@ -263,10 +454,15 @@ copy_shm(struct screencopy_frame *frame, struct swc_shm_buffer_info *target,
 			if (fallback) wld_buffer_unreference(fallback);
 			return false;
 		}
-		for (uint32_t y = 0; y < r->height; ++y)
-			memcpy((uint8_t *)target->data + (size_t)y * target->stride,
-			       (uint8_t *)source->map + (size_t)(y + r->y) * source->pitch + (size_t)r->x * 4,
-			       r->width * 4);
+		for (int i = 0; i < count; ++i) {
+			size_t bytes = (size_t)(boxes[i].x2 - boxes[i].x1) * 4;
+			for (int32_t y = boxes[i].y1; y < boxes[i].y2; ++y)
+				memcpy((uint8_t *)target->data + (size_t)(y - r->y) * target->stride +
+				           (size_t)(boxes[i].x1 - r->x) * 4,
+				       (uint8_t *)source->map + (size_t)y * source->pitch +
+				           (size_t)boxes[i].x1 * 4,
+				       bytes);
+		}
 		wld_unmap(source);
 		*path = fallback ? CAPTURE_SHM_FALLBACK : CAPTURE_SHM_DIRECT;
 		if (fallback) wld_buffer_unreference(fallback);
@@ -278,7 +474,8 @@ copy_shm(struct screencopy_frame *frame, struct swc_shm_buffer_info *target,
 }
 
 static bool
-copy_dmabuf(struct screencopy_frame *frame, struct wld_buffer *destination)
+copy_dmabuf(struct screencopy_frame *frame, struct wld_buffer *destination,
+            pixman_region32_t *region)
 {
 	struct wld_buffer *source = compositor_capture_buffer(frame->screen);
 	struct wld_renderer *renderer = swc.backend->renderer;
@@ -287,7 +484,12 @@ copy_dmabuf(struct screencopy_frame *frame, struct wld_buffer *destination)
 	bool copied = wld_set_target_buffer(renderer, destination);
 	if (copied) {
 		const struct swc_rectangle *r = &frame->rect;
-		wld_copy_rectangle(renderer, source, 0, 0, r->x, r->y, r->width, r->height);
+		int count;
+		pixman_box32_t *boxes = pixman_region32_rectangles(region, &count);
+		for (int i = 0; i < count; ++i)
+			wld_copy_rectangle(renderer, source, boxes[i].x1 - r->x,
+			                   boxes[i].y1 - r->y, boxes[i].x1, boxes[i].y1,
+			                   boxes[i].x2 - boxes[i].x1, boxes[i].y2 - boxes[i].y1);
 		if (frame->overlay_cursor)
 			copied = snap_render_cursor(renderer, frame->screen, r);
 		/* Complete GPU writes before ready: retain the synchronization barrier
@@ -298,9 +500,69 @@ copy_dmabuf(struct screencopy_frame *frame, struct wld_buffer *destination)
 	return copied;
 }
 
+/*
+ * The part of the screen to copy into the client's buffer: what changed since
+ * the buffer was last filled for this same frame shape, plus the cursor where
+ * it was drawn then and where it is now, so that the cursor is never blended
+ * twice or left behind. Plain copy requests, and anything the history cannot
+ * answer, copy the whole frame.
+ */
+static void
+frame_copy_region(struct screencopy_frame *frame, struct buffer_state *state,
+                  bool with_damage, pixman_box32_t current_cursor,
+                  pixman_region32_t *region)
+{
+	const struct swc_rectangle *r = &frame->rect;
+
+	if (!with_damage || !state || state->screen_id != frame->screen->id ||
+	    memcmp(&state->rect, r, sizeof(*r)) != 0 ||
+	    state->overlay_cursor != frame->overlay_cursor ||
+	    !damage_since(frame->screen->id, state->image, region)) {
+		pixman_region32_fini(region);
+		pixman_region32_init_rect(region, r->x, r->y, r->width, r->height);
+		return;
+	}
+	if (frame->overlay_cursor) {
+		region_add_box(region, &state->cursor_box);
+		region_add_box(region, &current_cursor);
+	}
+	region_finish(region, r);
+}
+
+/* What changed since this manager's last copy of the screen, as the damage
+ * event reports it: in frame coordinates, and the whole frame when the last
+ * copy was of something else or is too far back to tell. */
+static void
+frame_send_damage(struct screencopy_frame *frame, const struct capture_history *h,
+                  pixman_box32_t current_cursor)
+{
+	const struct swc_rectangle *r = &frame->rect;
+	pixman_region32_t damage;
+	pixman_box32_t *boxes;
+	int count;
+
+	pixman_region32_init(&damage);
+	if (!h->valid || memcmp(&h->rect, r, sizeof(*r)) != 0 ||
+	    h->overlay_cursor != frame->overlay_cursor ||
+	    !damage_since(frame->screen->id, h->image, &damage)) {
+		pixman_region32_union_rect(&damage, &damage, r->x, r->y, r->width, r->height);
+	} else if (frame->overlay_cursor) {
+		region_add_box(&damage, &h->cursor_box);
+		region_add_box(&damage, &current_cursor);
+	}
+	region_finish(&damage, r);
+	boxes = pixman_region32_rectangles(&damage, &count);
+	for (int i = 0; i < count; ++i)
+		zwlr_screencopy_frame_v1_send_damage(frame->resource, boxes[i].x1 - r->x,
+		                                      boxes[i].y1 - r->y,
+		                                      boxes[i].x2 - boxes[i].x1,
+		                                      boxes[i].y2 - boxes[i].y1);
+	pixman_region32_fini(&damage);
+}
+
 static void
 frame_copy(struct screencopy_frame *frame, struct wl_resource *buffer_resource,
-           pixman_region32_t *damage, bool post_error)
+           bool with_damage, bool post_error)
 {
 	struct capture_target target;
 	struct timespec start = {0}, ts;
@@ -312,10 +574,24 @@ frame_copy(struct screencopy_frame *frame, struct wl_resource *buffer_resource,
 		frame_fail(frame);
 		return;
 	}
+	uint32_t id = frame->screen->id;
+	struct buffer_state *state = buffer_state_find(buffer_resource);
+	pixman_box32_t cursor = {0, 0, 0, 0};
+	if (frame->overlay_cursor) cursor = cursor_box(frame->screen);
+	pixman_region32_t region;
+	pixman_region32_init(&region);
+	frame_copy_region(frame, state, with_damage, cursor, &region);
+
 	enum capture_path path = CAPTURE_DMABUF;
-	bool copied = target.dmabuf ? copy_dmabuf(frame, target.dmabuf) :
-	                             copy_shm(frame, &target.shm, &path);
+	bool copied = true;
+	/* Nothing to copy is a copy that cannot fail. */
+	if (pixman_region32_not_empty(&region))
+		copied = target.dmabuf ? copy_dmabuf(frame, target.dmabuf, &region) :
+		                         copy_shm(frame, &target.shm, &region, &path);
+	pixman_region32_fini(&region);
 	if (!copied) {
+		/* Whatever the buffer holds now, it is not a frame. */
+		if (state) buffer_state_destroy(state);
 		if (target.dmabuf && !force_shm) {
 			force_shm = true;
 			WARNING("DMA-BUF capture target could not be rendered; offering SHM on subsequent frames\n");
@@ -323,20 +599,31 @@ frame_copy(struct screencopy_frame *frame, struct wl_resource *buffer_resource,
 		frame_fail(frame);
 		return;
 	}
-	struct capture_history *history = &frame->manager->history[frame->screen->id];
-	*history = (struct capture_history){
-		.image = image_revision[frame->screen->id], .cursor = cursor_revision[frame->screen->id],
-		.rect = frame->rect, .valid = true, .overlay_cursor = frame->overlay_cursor,
-	};
+	if (!state && (state = calloc(1, sizeof(*state)))) {
+		state->buffer = buffer_resource;
+		state->destroy_listener.notify = &handle_buffer_state_destroy;
+		wl_resource_add_destroy_listener(buffer_resource, &state->destroy_listener);
+		wl_list_insert(&buffer_states, &state->link);
+	}
+	if (state) {
+		state->screen_id = id;
+		state->rect = frame->rect;
+		state->overlay_cursor = frame->overlay_cursor;
+		state->image = image_revision[id];
+		state->cursor_box = cursor;
+	}
+
+	struct capture_history *history = &frame->manager->history[id];
 	frame->completed = true;
 	frame_dequeue(frame);
 	zwlr_screencopy_frame_v1_send_flags(frame->resource, 0);
-	/* Full damage is conservative and covers changes between requests too.
-	 * Buffers are filled in full; reporting only this repaint's damage could
-	 * omit earlier changes or a cursor moving between capture requests. */
-	if (damage && wl_resource_get_version(frame->resource) >= 2)
-		zwlr_screencopy_frame_v1_send_damage(frame->resource, 0, 0,
-		                                      frame->rect.width, frame->rect.height);
+	if (with_damage && wl_resource_get_version(frame->resource) >= 2)
+		frame_send_damage(frame, history, cursor);
+	*history = (struct capture_history){
+		.image = image_revision[id], .cursor = cursor_revision[id],
+		.rect = frame->rect, .valid = true, .overlay_cursor = frame->overlay_cursor,
+		.cursor_box = cursor,
+	};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	profile_capture(path, &start, &ts);
 	uint64_t seconds = ts.tv_sec;
@@ -392,7 +679,7 @@ copy(struct wl_client *client, struct wl_resource *resource, struct wl_resource 
 	if (!frame_claim(frame))
 		return;
 
-	frame_copy(frame, buffer_resource, NULL, true);
+	frame_copy(frame, buffer_resource, false, true);
 }
 
 static void
@@ -594,11 +881,7 @@ handle_capture_timer(void *data)
 	wl_list_for_each_safe(frame, tmp, &pending, link) {
 		if (!swc.active) { frame_fail(frame); continue; }
 		if (!frame->dirty_at_request && !frame_is_dirty(frame)) continue;
-		pixman_region32_t damage;
-		pixman_region32_init_rect(&damage, frame->rect.x, frame->rect.y,
-		                          frame->rect.width, frame->rect.height);
-		frame_copy(frame, frame->buffer, &damage, false);
-		pixman_region32_fini(&damage);
+		frame_copy(frame, frame->buffer, true, false);
 	}
 	return 0;
 }
@@ -607,29 +890,30 @@ void
 screencopy_handle_damage(struct screen *screen, pixman_region32_t *global_damage)
 {
 	struct screencopy_frame *frame, *tmp;
-	pixman_region32_t damage;
+	const struct swc_rectangle *geom = &screen->base.geometry;
+	pixman_region32_t local;
 
-	if (pixman_region32_not_empty(global_damage))
-		image_revision[screen->id] = ++revision;
-	if (wl_list_empty(&pending)) return;
+	if (!pixman_region32_not_empty(global_damage)) return;
+	image_revision[screen->id] = ++revision;
+
+	pixman_region32_init(&local);
+	pixman_region32_intersect_rect(&local, global_damage, geom->x, geom->y, geom->width,
+	                               geom->height);
+	pixman_region32_translate(&local, -geom->x, -geom->y);
+	damage_history_add(screen, image_revision[screen->id], &local);
 
 	wl_list_for_each_safe (frame, tmp, &pending, link) {
 		if (frame->screen != screen) continue;
-		const struct swc_rectangle *geom = &frame->screen->base.geometry;
-		struct wl_resource *buffer = frame->buffer;
+		pixman_region32_t damage;
 
 		pixman_region32_init(&damage);
-		pixman_region32_intersect_rect(&damage, global_damage, geom->x, geom->y, geom->width,
-		                               geom->height);
-		pixman_region32_translate(&damage, -geom->x, -geom->y);
-		pixman_region32_intersect_rect(&damage, &damage, frame->rect.x, frame->rect.y,
+		pixman_region32_intersect_rect(&damage, &local, frame->rect.x, frame->rect.y,
 		                               frame->rect.width, frame->rect.height);
-
 		if (pixman_region32_not_empty(&damage))
-			frame_copy(frame, buffer, &damage, false);
-
+			frame_copy(frame, frame->buffer, true, false);
 		pixman_region32_fini(&damage);
 	}
+	pixman_region32_fini(&local);
 }
 
 struct wl_global *

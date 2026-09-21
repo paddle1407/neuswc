@@ -34,6 +34,17 @@
 #include <stdint.h>
 #include <wayland-server.h>
 
+#ifdef ENABLE_DRM
+struct primary_plane;
+
+struct primary_plane_flip {
+	struct drm_handler handler;
+	/* NULL once the plane is finalized with a flip still pending. */
+	struct primary_plane *plane;
+	bool pending;
+};
+#endif
+
 struct primary_plane {
 #ifdef ENABLE_DRM
 	uint32_t crtc;
@@ -44,7 +55,16 @@ struct primary_plane {
 #ifdef ENABLE_DRM
 	struct wl_array connectors;
 	bool need_modeset;
-	struct drm_handler drm_handler;
+	struct primary_plane_flip *flip;
+
+	/*
+	 * A framebuffer whose rendering the GPU has not finished, and the
+	 * sync_file that signals when it has. It is presented from the event
+	 * loop once the fence signals rather than by blocking for it.
+	 */
+	struct wl_event_source *fence_source;
+	int fence_fd;
+	uint32_t fence_fb;
 #endif
 	struct wl_listener swc_listener;
 };
@@ -57,6 +77,12 @@ primary_plane_initialize(struct primary_plane *plane, uint32_t crtc,
 #else
 bool
 primary_plane_initialize(struct primary_plane *plane, struct mode *mode);
+#endif
+#ifdef ENABLE_DRM
+/* Turn the CRTC off for good, for a screen whose monitor was unplugged;
+ * primary_plane_finalize then leaves it off instead of restoring it. */
+void
+primary_plane_disable(struct primary_plane *plane);
 #endif
 void
 primary_plane_finalize(struct primary_plane *plane);

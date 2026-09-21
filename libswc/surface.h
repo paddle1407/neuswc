@@ -115,5 +115,11 @@ bool
 surface_has_buffer(struct surface *surface);
 void
 surface_commit_pending(struct surface *surface);
+/**
+ * Puts a buffer the surface committed on screen after explicit
+ * synchronization held it back, with all of it as damage.
+ */
+void
+surface_show_buffer(struct surface *surface, struct wld_buffer *buffer);
 
 #endif

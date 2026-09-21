@@ -13,7 +13,7 @@
 
 struct wallpaper_output {
 	struct screen *screen;
-	struct wld_buffer *cpu, *native;
+	struct wld_buffer *native;
 	struct wl_list link;
 };
 
@@ -31,7 +31,6 @@ output_destroy(struct wallpaper_output *output)
 		output->screen->wallpaper = NULL;
 	wl_list_remove(&output->link);
 	if (output->native) wld_buffer_unreference(output->native);
-	if (output->cpu) wld_buffer_unreference(output->cpu);
 	free(output);
 }
 
@@ -134,37 +133,44 @@ swc_wallpaper_prepare(const uint32_t *pixels, uint32_t width, uint32_t height,
 		struct wallpaper_output *other;
 		wl_list_for_each(other, &prepared->outputs, link) {
 			if (other->native->width != w || other->native->height != h) continue;
-			output->cpu = other->cpu; output->native = other->native;
-			wld_buffer_reference(output->cpu);
+			output->native = other->native;
 			wld_buffer_reference(output->native);
 			break;
 		}
 		wl_list_insert(prepared->outputs.prev, &output->link);
 		/* Equal-sized monitors can share these immutable buffers. */
 		if (output->native) continue;
-		/* Include the CPU cache, its upload texture, and native output buffer.
+		/* The staging copy, its upload texture, and the native buffer. Only
+		 * the native one is kept, but all three exist while it is filled.
 		 * This bounds nominal pixel storage; drivers can add padding/metadata. */
 		bytes += (uint64_t)w * h * 12;
 		if (!w || !h || w > 8192 || h > 8192 || bytes > 256 * 1024 * 1024) {
 			ERROR("wallpaper: output dimensions/cache budget exceeded\n");
 			goto done;
 		}
-		/* Use the backend's CPU storage so its renderer can upload it directly.
-		 * The software renderer also reads this mapping for legacy capture/zoom. */
-		output->cpu = wld_create_buffer(swc.backend->context, w, h,
-		                               WLD_FORMAT_XRGB8888, WLD_FLAG_MAP);
-		if (!output->cpu || !scale_image(output->cpu, source, width, height,
-		                                mode, prepared->background)) goto done;
-		output->native = wld_create_buffer(swc.backend->context, w, h,
-		                                  WLD_FORMAT_XRGB8888, 0);
-		if (!output->native ||
-		    !(wld_capabilities(renderer, output->cpu) & WLD_CAPABILITY_READ) ||
+		/* Scale on the CPU into the backend's CPU storage, so its renderer can
+		 * upload it directly, then drop it: an output-sized copy per screen is
+		 * a lot to keep for the rare capture that falls back to pixman, which
+		 * reads the native buffer through a mapping instead. */
+		struct wld_buffer *cpu = wld_create_buffer(swc.backend->context, w, h,
+		                                           WLD_FORMAT_XRGB8888, WLD_FLAG_MAP);
+		bool staged = cpu && scale_image(cpu, source, width, height, mode,
+		                                 prepared->background);
+		if (staged)
+			output->native = wld_create_buffer(swc.backend->context, w, h,
+			                                  WLD_FORMAT_XRGB8888, 0);
+		staged = staged && output->native &&
+		    (wld_capabilities(renderer, cpu) & WLD_CAPABILITY_READ) &&
 		    /* Materialize and validate the upload texture before the copy. No
 		     * GPU writes go to the CPU-backed buffer. */
-		    !wld_set_target_buffer(renderer, output->cpu) ||
-		    !wld_set_target_buffer(renderer, output->native)) goto done;
-		wld_copy_rectangle(renderer, output->cpu, 0, 0, 0, 0, w, h);
-		wld_flush(renderer);
+		    wld_set_target_buffer(renderer, cpu) &&
+		    wld_set_target_buffer(renderer, output->native);
+		if (staged) {
+			wld_copy_rectangle(renderer, cpu, 0, 0, 0, 0, w, h);
+			wld_flush(renderer);
+		}
+		if (cpu) wld_buffer_unreference(cpu);
+		if (!staged) goto done;
 	}
 	ok = true;
 done:
@@ -204,9 +210,11 @@ wallpaper_repaint(struct screen *screen, struct wld_renderer *renderer,
 
 	if (output && output->native->width == screen->base.geometry.width &&
 	    output->native->height == screen->base.geometry.height) {
-		struct wld_buffer *buffer = renderer == swc.shm->renderer ?
-		    output->cpu : output->native;
-		wld_copy_region(renderer, buffer, 0, 0, damage);
+		/* pixman reads the native buffer by mapping it, which a driver may
+		 * refuse; the copy then does nothing, so lay the colour down first. */
+		if (renderer == swc.shm->renderer)
+			wld_fill_region(renderer, active ? active->background : 0xff000000, damage);
+		wld_copy_region(renderer, output->native, 0, 0, damage);
 	} else {
 		wld_fill_region(renderer, active ? active->background : 0xff000000, damage);
 	}

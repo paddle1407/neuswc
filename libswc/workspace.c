@@ -418,6 +418,27 @@ void workspace_output_removed(struct output *output)
 	}
 }
 
+void workspace_screen_added(struct screen *screen)
+{
+	struct workspace_manager *manager, *manager_next;
+	if (!managers.next)
+		return;
+	wl_list_for_each_safe(manager, manager_next, &managers, link) {
+		if (!manager->resource || manager->stopped ||
+		    find_group(manager, screen))
+			continue;
+		++manager->live_resources;
+		if (!create_group(manager, wl_resource_get_client(manager->resource),
+		                  wl_resource_get_version(manager->resource), screen))
+			wl_client_post_no_memory(
+				wl_resource_get_client(manager->resource));
+		else
+			ext_workspace_manager_v1_send_done(manager->resource);
+		--manager->live_resources;
+		maybe_free_manager(manager);
+	}
+}
+
 void workspace_screen_removed(struct screen *screen)
 {
 	struct workspace_manager *manager, *manager_next;

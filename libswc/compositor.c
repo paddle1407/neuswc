@@ -262,6 +262,11 @@ handle_screen_destroy(struct wl_listener *listener, void *data)
 		input_mode_cancel();
 		swc_overview_end();
 	}
+	/* The id is a CRTC index, and a monitor plugged in later can be given
+	 * the same one: nothing of this screen may be left waiting for it. */
+	compositor.pending_flips &= ~target->mask;
+	compositor.scheduled_updates &= ~target->mask;
+	compositor.recover_updates &= ~target->mask;
 	wl_list_remove(&target->view_handler.link);
 	wl_list_remove(&target->screen_destroy_listener.link);
 	wld_destroy_surface(target->surface);
@@ -292,9 +297,12 @@ handle_screen_frame(struct view_handler *handler, uint32_t time)
 
 	compositor.pending_flips &= ~target->mask;
 
+	/* Only the surface answers a frame event, and only with the callbacks
+	 * it has queued, so skip the handler walk for views with none. */
 	wl_list_for_each(view, &compositor.views, link)
 	{
-		if (view->visible && view->base.screens & target->mask) {
+		if (view->visible && view->base.screens & target->mask &&
+		    !wl_list_empty(&view->surface->state.frame_callbacks)) {
 			view_frame(&view->base, time);
 		}
 	}
@@ -422,135 +430,177 @@ frame_geometry(const struct compositor_view *view)
 }
 
 static void
-repaint_view(struct target *target, struct compositor_view *view,
-             pixman_region32_t *damage)
+init_grown_rect(pixman_region32_t *region, const struct swc_rectangle *r,
+                int64_t by)
 {
-	pixman_region32_t frame_region, buffer_region, border_region, view_damage,
-	    buffer_damage, border_damage;
-	const struct swc_rectangle *geom = &view->base.geometry,
-	                           *target_geom = &target->view->geometry;
-	int32_t buf_x, buf_y;
-	uint32_t buf_w, buf_h;
-	int64_t total_border;
+	int32_t x1 = clamp_i32((int64_t)r->x - by), y1 = clamp_i32((int64_t)r->y - by);
+	int32_t x2 = clamp_i32((int64_t)r->x + r->width + by);
+	int32_t y2 = clamp_i32((int64_t)r->y + r->height + by);
+
+	pixman_region32_init_rect(region, x1, y1, span_u32(x1, x2), span_u32(y1, y2));
+}
+
+/*
+ * A border is two rings around the frame: the inner one is the frame grown by
+ * the inner width, and the outer one is what the outer width adds around that.
+ * Fill the parts of them inside damage, which is in global coordinates.
+ */
+static void
+fill_border(struct wld_renderer *renderer, const struct swc_rectangle *target_geom,
+            const struct compositor_view *view, pixman_region32_t *damage)
+{
 	const struct swc_rectangle frame = frame_geometry(view);
+	uint32_t in = view->border.inwidth, out = view->border.outwidth;
+	pixman_region32_t ring, hole;
+
+	if (!in && !out)
+		return;
+
+	pixman_region32_init(&ring);
+	if (out) {
+		init_grown_rect(&hole, &frame, (int64_t)out + in);
+		pixman_region32_intersect(&ring, &hole, damage);
+		pixman_region32_fini(&hole);
+		init_grown_rect(&hole, &frame, in);
+		pixman_region32_subtract(&ring, &ring, &hole);
+		pixman_region32_fini(&hole);
+		if (pixman_region32_not_empty(&ring)) {
+			pixman_region32_translate(&ring, -target_geom->x, -target_geom->y);
+			wld_fill_region(renderer, view->border.outcolor, &ring);
+		}
+	}
+	if (in) {
+		init_grown_rect(&hole, &frame, in);
+		pixman_region32_intersect(&ring, &hole, damage);
+		pixman_region32_fini(&hole);
+		init_grown_rect(&hole, &frame, 0);
+		pixman_region32_subtract(&ring, &ring, &hole);
+		pixman_region32_fini(&hole);
+		if (pixman_region32_not_empty(&ring)) {
+			pixman_region32_translate(&ring, -target_geom->x, -target_geom->y);
+			wld_fill_region(renderer, view->border.incolor, &ring);
+		}
+	}
+	pixman_region32_fini(&ring);
+}
+
+/*
+ * Draw the part of src, a view's buffer, inside damage (global coordinates).
+ * A window shows only its geometry; the rest of its buffer is the client's
+ * shadow margin. Anything else shows its whole buffer. Nothing is read from
+ * outside the client's buffer, which a proxy may be larger than.
+ */
+static void
+draw_view_buffer(struct wld_renderer *renderer,
+                 const struct swc_rectangle *target_geom,
+                 struct compositor_view *view, struct wld_buffer *src,
+                 pixman_region32_t *damage)
+{
+	const struct swc_rectangle *geom = &view->base.geometry;
+	int32_t buf_x = geom->x - view->buffer_offset_x;
+	int32_t buf_y = geom->y - view->buffer_offset_y;
+	int32_t dst_x = buf_x - target_geom->x, dst_y = buf_y - target_geom->y;
+	int64_t x1 = buf_x, y1 = buf_y;
+	int64_t x2 = x1 + view->base.buffer->width;
+	int64_t y2 = y1 + view->base.buffer->height;
+	pixman_region32_t region, opaque;
+
+	if (view->window) {
+		x1 = MAX(x1, geom->x);
+		y1 = MAX(y1, geom->y);
+		x2 = MIN(x2, (int64_t)geom->x + geom->width);
+		y2 = MIN(y2, (int64_t)geom->y + geom->height);
+	}
+	pixman_region32_init(&region);
+	pixman_region32_intersect_rect(&region, damage, clamp_i32(x1), clamp_i32(y1),
+	                               span_u32(clamp_i32(x1), clamp_i32(x2)),
+	                               span_u32(clamp_i32(y1), clamp_i32(y2)));
+	if (!pixman_region32_not_empty(&region)) {
+		pixman_region32_fini(&region);
+		return;
+	}
+	pixman_region32_translate(&region, -buf_x, -buf_y);
+
+	if (src->format != WLD_FORMAT_ARGB8888) {
+		wld_copy_region(renderer, src, dst_x, dst_y, &region);
+		pixman_region32_fini(&region);
+		return;
+	}
+
+	/* Trust the committed opaque region. Scanning a whole client buffer to
+	 * discover opacity can force costly GPU mappings; blending the remaining
+	 * pixels is correct even when opaque. */
+	pixman_region32_init(&opaque);
+	pixman_region32_intersect(&opaque, &region, &view->surface->state.opaque);
+	if (pixman_region32_not_empty(&opaque)) {
+		wld_copy_region(renderer, src, dst_x, dst_y, &opaque);
+		pixman_region32_subtract(&region, &region, &opaque);
+	}
+	if (pixman_region32_not_empty(&region))
+		wld_blend_region(renderer, src, dst_x, dst_y, &region);
+	pixman_region32_fini(&opaque);
+	pixman_region32_fini(&region);
+}
+
+/*
+ * Draw a view -- buffer, border and decorations -- where it meets damage (in
+ * global coordinates) into whatever target the renderer already has. src is
+ * the buffer to draw, or NULL if the renderer cannot read one. clip, if given,
+ * is the part covered by opaque views above, which paint it themselves.
+ *
+ * The live frame and a capture both come through here, so a screenshot shows
+ * what the screen does.
+ */
+static void
+paint_view(struct wld_renderer *renderer, const struct swc_rectangle *target_geom,
+           struct compositor_view *view, struct wld_buffer *src,
+           pixman_region32_t *damage, pixman_region32_t *clip)
+{
+	pixman_region32_t view_damage;
 
 	if (!view->base.buffer) {
 		return;
 	}
 
-	buf_w = view->base.buffer->width;
-	buf_h = view->base.buffer->height;
-	buf_x = geom->x - view->buffer_offset_x;
-	buf_y = geom->y - view->buffer_offset_y;
-
-	total_border =
-	    (int64_t)view->border.outwidth + (int64_t)view->border.inwidth;
-	pixman_region32_init_rect(&frame_region, frame.x, frame.y, frame.width,
-	                          frame.height);
-	if (view->window) {
-		pixman_region32_init_rect(&buffer_region, geom->x, geom->y, geom->width,
-		                          geom->height);
-	} else {
-		pixman_region32_init_rect(&buffer_region, buf_x, buf_y, buf_w, buf_h);
-	}
-	pixman_region32_init_rect(&border_region,
-	                          frame.x - (int32_t)total_border,
-	                          frame.y - (int32_t)total_border,
-	                          frame.width + (uint32_t)(2 * total_border),
-	                          frame.height + (uint32_t)(2 * total_border));
-	pixman_region32_subtract(&border_region, &border_region, &frame_region);
-	pixman_region32_init_with_extents(&view_damage, &view->extents);
-	pixman_region32_init(&buffer_damage);
-	pixman_region32_init(&border_damage);
-
-	pixman_region32_intersect(&view_damage, &view_damage, damage);
-	pixman_region32_subtract(&view_damage, &view_damage, &view->clip);
-	pixman_region32_intersect(&border_damage, &view_damage, &border_region);
-	pixman_region32_intersect(&buffer_damage, &view_damage, &buffer_region);
-
-	if (pixman_region32_not_empty(&buffer_damage)) {
-		pixman_region32_translate(&buffer_damage,
-		                          -geom->x + view->buffer_offset_x,
-		                          -geom->y + view->buffer_offset_y);
-		if (view->buffer->format == WLD_FORMAT_ARGB8888) {
-			pixman_region32_t opaque_damage, blend_damage;
-
-			/* Trust the committed opaque region. Scanning a whole client
-			 * buffer to discover opacity can force costly GPU mappings;
-			 * blending the remaining pixels is correct even when opaque. */
-			pixman_region32_init(&opaque_damage);
-			pixman_region32_intersect(&opaque_damage, &buffer_damage,
-			                          &view->surface->state.opaque);
-			pixman_region32_init(&blend_damage);
-			pixman_region32_subtract(&blend_damage, &buffer_damage,
-			                         &opaque_damage);
-
-			if (!pixman_region32_not_empty(&blend_damage)) {
-				wld_copy_region(swc.backend->renderer, view->buffer,
-				                buf_x - target_geom->x,
-				                buf_y - target_geom->y, &buffer_damage);
-			} else {
-				wld_copy_region(swc.backend->renderer, view->buffer,
-				                buf_x - target_geom->x,
-				                buf_y - target_geom->y, &opaque_damage);
-				wld_blend_region(swc.backend->renderer, view->buffer,
-				                 buf_x - target_geom->x,
-				                 buf_y - target_geom->y, &blend_damage);
-			}
-
-			pixman_region32_fini(&blend_damage);
-			pixman_region32_fini(&opaque_damage);
-		} else {
-			wld_copy_region(swc.backend->renderer, view->buffer,
-			                buf_x - target_geom->x, buf_y - target_geom->y,
-			                &buffer_damage);
-		}
+	/*
+	 * Everything drawn below lies inside the extents. A view the damage
+	 * misses, or one wholly covered by opaque views above, draws nothing, and
+	 * neither do its decorations, which clip themselves the same way.
+	 */
+	if (pixman_region32_contains_rectangle(damage, &view->extents) ==
+	        PIXMAN_REGION_OUT ||
+	    (clip && pixman_region32_contains_rectangle(clip, &view->extents) ==
+	        PIXMAN_REGION_IN)) {
+		return;
 	}
 
+	pixman_region32_init(&view_damage);
+	pixman_region32_intersect_rect(&view_damage, damage, view->extents.x1,
+	                               view->extents.y1,
+	                               span_u32(view->extents.x1, view->extents.x2),
+	                               span_u32(view->extents.y1, view->extents.y2));
+	if (clip) {
+		pixman_region32_subtract(&view_damage, &view_damage, clip);
+	}
+
+	if (src) {
+		draw_view_buffer(renderer, target_geom, view, src, &view_damage);
+	}
+	fill_border(renderer, target_geom, view, &view_damage);
 	pixman_region32_fini(&view_damage);
-	pixman_region32_fini(&buffer_damage);
 
-	pixman_region32_t in_rect;
-	pixman_region32_init_rect(&in_rect,
-	                          frame.x - view->border.inwidth,
-	                          frame.y - view->border.inwidth,
-	                          frame.width + (2 * view->border.inwidth),
-	                          frame.height + (2 * view->border.inwidth));
-
-	pixman_region32_t out_border;
-	pixman_region32_init(&out_border);
-	pixman_region32_subtract(&out_border, &border_damage, &in_rect);
-
-	pixman_region32_t in_border;
-	pixman_region32_init(&in_border);
-	pixman_region32_subtract(&in_border, &in_rect, &frame_region);
-	pixman_region32_intersect(&in_border, &in_border, &border_damage);
-
-	pixman_region32_fini(&frame_region);
-	pixman_region32_fini(&buffer_region);
-	pixman_region32_fini(&border_region);
-
-	/* Draw border */
-	if (view->border.outwidth > 0 && pixman_region32_not_empty(&out_border)) {
-		pixman_region32_translate(&out_border, -target_geom->x,
-		                          -target_geom->y);
-		wld_fill_region(swc.backend->renderer, view->border.outcolor, &out_border);
+	if (view->decor.top || view->decor.right || view->decor.bottom ||
+	    view->decor.left) {
+		decor_repaint(renderer, target_geom, view, damage);
 	}
+}
 
-	if (view->border.inwidth > 0 && pixman_region32_not_empty(&in_border)) {
-		pixman_region32_translate(&in_border, -target_geom->x, -target_geom->y);
-		wld_fill_region(swc.backend->renderer, view->border.incolor, &in_border);
-	}
-
-	pixman_region32_fini(&border_damage);
-	pixman_region32_fini(&in_rect);
-	pixman_region32_fini(&out_border);
-	pixman_region32_fini(&in_border);
-
-	if ((view->decor.top || view->decor.right || view->decor.bottom ||
-	     view->decor.left)) {
-		decor_repaint(swc.backend->renderer, target_geom, view, damage);
-	}
+static void
+repaint_view(struct target *target, struct compositor_view *view,
+             pixman_region32_t *damage)
+{
+	paint_view(swc.backend->renderer, &target->view->geometry, view,
+	           view->buffer, damage, &view->clip);
 }
 
 static void
@@ -1014,6 +1064,22 @@ fill_ring(struct wld_renderer *renderer, uint32_t color,
 	wld_fill_rectangle(renderer, color, bx + bw - bt, by + bt, bt, bh - 2 * bt);
 }
 
+/* fill_border() for a view drawn scaled, its frame landing at x, y, w, h in
+ * the target. The same two rings, drawn outer first. */
+static void
+fill_border_scaled(struct wld_renderer *renderer,
+                   const struct compositor_view *view,
+                   double x, double y, double w, double h, double scale)
+{
+	double in = view->border.inwidth * scale;
+	double out = view->border.outwidth * scale;
+
+	if (view->border.outwidth > 0)
+		fill_ring(renderer, view->border.outcolor, x, y, w, h, in + out);
+	if (view->border.inwidth > 0)
+		fill_ring(renderer, view->border.incolor, x, y, w, h, in);
+}
+
 static void
 render_zoomed(struct screen *screen, struct wld_renderer *renderer, float zoom)
 {
@@ -1030,10 +1096,11 @@ render_zoomed(struct screen *screen, struct wld_renderer *renderer, float zoom)
 	wl_list_for_each_reverse(view, &compositor.views, link) {
 		struct wld_buffer *src = view->buffer, *bar;
 		const struct swc_rectangle *vg = &view->base.geometry;
+		const struct swc_rectangle frame = frame_geometry(view);
 		struct swc_rectangle bar_rect;
 		struct wld_rect dst;
 		struct wld_frect area;
-		double scale, x, y, w, h, out, in, border;
+		double scale, x, y, fx, fy, fw, fh, border;
 		double sx, sy, sw, sh;
 
 		/*
@@ -1050,20 +1117,18 @@ render_zoomed(struct screen *screen, struct wld_renderer *renderer, float zoom)
 		scale = view->always_top ? 1.0 : zoom;
 		x = (vg->x - cx) * scale + geom->width / 2.0;
 		y = (vg->y - cy) * scale + geom->height / 2.0;
-		w = vg->width * scale;
-		h = vg->height * scale;
-		out = view->border.outwidth * scale;
-		in = view->border.inwidth * scale;
-		border = out + in;
+		/* The border encloses the titlebar too, as it does unzoomed. */
+		fx = (frame.x - cx) * scale + geom->width / 2.0;
+		fy = (frame.y - cy) * scale + geom->height / 2.0;
+		fw = frame.width * scale;
+		fh = frame.height * scale;
+		border = ((double)view->border.outwidth + view->border.inwidth) * scale;
 
-		if (x + w + border < 0 || x - border >= geom->width ||
-		    y + h + border < 0 || y - border >= geom->height)
+		if (fx + fw + border < 0 || fx - border >= geom->width ||
+		    fy + fh + border < 0 || fy - border >= geom->height)
 			continue;
 
-		if (view->border.outwidth > 0)
-			fill_ring(renderer, view->border.outcolor, x, y, w, h, border);
-		if (view->border.inwidth > 0)
-			fill_ring(renderer, view->border.incolor, x, y, w, h, in);
+		fill_border_scaled(renderer, view, fx, fy, fw, fh, scale);
 
 		/*
 		 * A window's geometry can be a sub-rectangle of its buffer -- the
@@ -1139,7 +1204,9 @@ EXPORT bool swc_window_overview_geometry(struct swc_window *base, struct swc_rec
 	int64_t x2 = x1 + rect->width, y2 = y1 + rect->height;
 	struct compositor_view *child;
 	wl_list_for_each(child, &compositor.views, link) {
-		if (child == view || !child->buffer || overview_owner(child) != view) continue;
+		/* Most views are toplevels with no parent to walk. */
+		if (child == view || !child->parent || !child->buffer ||
+		    overview_owner(child) != view) continue;
 		const struct swc_rectangle *g = &child->base.geometry;
 		x1 = MIN(x1, g->x); y1 = MIN(y1, g->y);
 		x2 = MAX(x2, (int64_t)g->x + g->width);
@@ -1223,12 +1290,8 @@ static void overview_view(struct wld_renderer *renderer, struct compositor_view 
 	struct swc_rectangle frame = frame_geometry(view);
 	double x = dest.x + (frame.x - (double)source.x) * sx;
 	double y = dest.y + (frame.y - (double)source.y) * sy;
-	double in = view->border.inwidth * sx;
-	double out = view->border.outwidth * sx;
-	if (out) fill_ring(renderer, view->border.outcolor, x, y,
-	                   frame.width * sx, frame.height * sy, in + out);
-	if (in) fill_ring(renderer, view->border.incolor, x, y,
-	                  frame.width * sx, frame.height * sy, in);
+	fill_border_scaled(renderer, view, x, y, frame.width * sx,
+	                   frame.height * sy, sx);
 	overview_blit(renderer, view->buffer,
 	    view->window ? view->buffer_offset_x : 0, view->window ? view->buffer_offset_y : 0,
 	    g.width, g.height, dest.x + (g.x - (double)source.x) * sx,
@@ -1361,10 +1424,12 @@ attach(struct view *base, struct wld_buffer *buffer)
 		return ret;
 	}
 
-	/* Schedule updates on the screens the view was previously
-	 * visible on. */
-	update(&view->base);
-
+	/*
+	 * No update() here: both callers, surface_apply_pending() and
+	 * surface_set_view(), follow view_attach() with view_update(), once the
+	 * new size and offset are in place. Updating before them as well worked
+	 * out the screen mask from the old extents, and again after a resize.
+	 */
 	view->buffer_offset_x = 0;
 	view->buffer_offset_y = 0;
 	if (surface && surface->has_window_geometry && buffer) {
@@ -1387,9 +1452,11 @@ attach(struct view *base, struct wld_buffer *buffer)
 			    old_extents.x1, old_extents.y1,
 			    span_u32(old_extents.x1, old_extents.x2), span_u32(old_extents.y1, old_extents.y2));
 			pixman_region32_clear(&view->clip);
-			update_view_screens(view);
+			/* The old extents may be on a screen the new ones are not. The
+			 * caller's update schedules the screens the view is on now. */
+			if (swc.active)
+				schedule_updates(view->base.screens);
 			damage_view(view);
-			update(&view->base);
 		}
 	}
 
@@ -1526,13 +1593,15 @@ view_at(int32_t x, int32_t y)
 	struct swc_rectangle *geom;
 	struct swc_rectangle buffer_geom;
 
+	/*
+	 * Runs on every pointer motion. The titlebar, the content and a surface's
+	 * buffer all lie inside the extents, so four comparisons reject nearly
+	 * every view before the titlebar layout or the input region is consulted.
+	 */
 	wl_list_for_each(view, &compositor.views, link)
 	{
-		if (!view->visible) {
-			if (compositor.overview_screen && view->buffer && view->base.buffer) {
-				renderer_flush_view(view);
-				pixman_region32_clear(&view->surface->state.damage);
-			}
+		if (!view->visible || x < view->extents.x1 || x >= view->extents.x2 ||
+		    y < view->extents.y1 || y >= view->extents.y2) {
 			continue;
 		}
 
@@ -2154,34 +2223,49 @@ calculate_damage(void)
 	wl_list_for_each(view, &compositor.views, link)
 	{
 		if (!view->visible) {
+			/* The overview still shows hidden windows as thumbnails, so their
+			 * upload proxies have to keep up with what the client draws. */
+			if (compositor.overview_screen && view->buffer && view->base.buffer) {
+				renderer_flush_view(view);
+				pixman_region32_clear(&view->surface->state.damage);
+			}
 			continue;
 		}
 
 		geom = &view->base.geometry;
-		pixman_region32_t view_region;
 
-		pixman_region32_init_rect(&view_region, geom->x, geom->y, geom->width,
-		                          geom->height);
+		/*
+		 * Clip the surface by the opaque region covering it. Everything that
+		 * consults the clip works inside the view's extents, so keep only that
+		 * part: a copy of the whole accumulated region grows with every opaque
+		 * window above, which made this quadratic in the window count.
+		 */
+		pixman_region32_intersect_rect(&view->clip, &compositor.opaque,
+		                               view->extents.x1, view->extents.y1,
+		                               span_u32(view->extents.x1, view->extents.x2),
+		                               span_u32(view->extents.y1, view->extents.y2));
 
-		/* Clip the surface by the opaque region covering it. */
-		pixman_region32_copy(&view->clip, &compositor.opaque);
+		/* Add the surface's opaque region, in global coordinates, to the
+		 * accumulated opaque region. Many clients declare none at all. */
+		bool bar_opaque = view->decor.titlebar.enabled && view->base.buffer;
+		if (bar_opaque || pixman_region32_not_empty(&view->surface->state.opaque)) {
+			pixman_region32_copy(&surface_opaque, &view->surface->state.opaque);
+			pixman_region32_translate(&surface_opaque,
+			                          geom->x - view->buffer_offset_x,
+			                          geom->y - view->buffer_offset_y);
+			pixman_region32_intersect_rect(&surface_opaque, &surface_opaque,
+			                               geom->x, geom->y, geom->width,
+			                               geom->height);
 
-		/* Translate the opaque region to global coordinates. */
-		pixman_region32_copy(&surface_opaque, &view->surface->state.opaque);
-		pixman_region32_translate(&surface_opaque,
-		                          geom->x - view->buffer_offset_x,
-		                          geom->y - view->buffer_offset_y);
-		pixman_region32_intersect(&surface_opaque, &surface_opaque,
-		                          &view_region);
+			/* The cached solid bar is opaque too; avoid drawing windows
+			 * behind it. */
+			if (bar_opaque)
+				pixman_region32_union_rect(&surface_opaque, &surface_opaque,
+				    geom->x, geom->y - view->decor.top, geom->width, view->decor.top);
 
-		/* The cached solid bar is opaque too; avoid drawing windows behind it. */
-		if (view->decor.titlebar.enabled && view->base.buffer)
-			pixman_region32_union_rect(&surface_opaque, &surface_opaque,
-			    geom->x, geom->y - view->decor.top, geom->width, view->decor.top);
-
-		/* Add the surface's opaque region to the accumulated opaque region. */
-		pixman_region32_union(&compositor.opaque, &compositor.opaque,
-		                      &surface_opaque);
+			pixman_region32_union(&compositor.opaque, &compositor.opaque,
+			                      &surface_opaque);
+		}
 
 		surface_damage = &view->surface->state.damage;
 
@@ -2215,12 +2299,14 @@ calculate_damage(void)
 		/* redraw entire thingy if border or decor changed */
 		if (view->border.damaged_border1 || view->border.damaged_border2 ||
 		    view->decor.damaged) {
-			pixman_region32_t border_region;
+			pixman_region32_t border_region, view_region;
 
 			pixman_region32_init_with_extents(&border_region, &view->extents);
-
+			pixman_region32_init_rect(&view_region, geom->x, geom->y,
+			                          geom->width, geom->height);
 			pixman_region32_subtract(&border_region, &border_region,
 			                         &view_region);
+			pixman_region32_fini(&view_region);
 
 			pixman_region32_union(&compositor.damage, &compositor.damage,
 			                      &border_region);
@@ -2231,8 +2317,6 @@ calculate_damage(void)
 			view->border.damaged_border2 = false;
 			view->decor.damaged = false;
 		}
-
-		pixman_region32_fini(&view_region);
 	}
 
 	pixman_region32_fini(&surface_opaque);
@@ -2254,15 +2338,33 @@ update_screen(struct screen *screen)
 		return;
 	}
 
+	/*
+	 * wld keeps each scanout buffer's damage in screen coordinates, and
+	 * hands back what the buffer about to be drawn has missed. Everything
+	 * else -- views, the opaque region, screencopy -- is global, so that
+	 * is the one round trip: damage is global again from here on.
+	 */
 	pixman_region32_init(&damage);
 	pixman_region32_intersect_rect(&damage, &compositor.damage, geom->x,
 	                               geom->y, geom->width, geom->height);
 	pixman_region32_translate(&damage, -geom->x, -geom->y);
 	total_damage = wld_surface_damage(target->surface, &damage);
+	pixman_region32_clear(&damage);
 
 	/* Don't repaint the screen if it is waiting for a page flip. */
 	if (compositor.pending_flips & screen_mask(screen)) {
 		pixman_region32_fini(&damage);
+		return;
+	}
+
+	/* No back buffer to draw into. The damage is recorded on every buffer
+	 * already, so retry once as for a failed flip. */
+	if (!total_damage) {
+		pixman_region32_fini(&damage);
+		if (!target->swap_failed) {
+			target->swap_failed = true;
+			compositor.recover_updates |= screen_mask(screen);
+		}
 		return;
 	}
 
@@ -2275,10 +2377,8 @@ update_screen(struct screen *screen)
 		render_overview(screen, swc.backend->renderer);
 		wld_flush(swc.backend->renderer);
 		/* Screencopy consumes global damage, including on a second monitor. */
-		pixman_region32_clear(&damage);
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 	} else if (compositor.zoom != 1.0f) {
-		pixman_region32_clear(&damage);
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 
 		if (!wld_set_target_surface(swc.backend->renderer, target->surface)) {
@@ -2334,7 +2434,13 @@ perform_update(void *data)
 	struct screen *screen;
 	uint32_t updates = compositor.scheduled_updates & ~compositor.pending_flips;
 
-	if (!swc.active || !updates) {
+	/* Forget what was scheduled while switched away: left set, it would stop
+	 * schedule_updates adding the idle, and activation would repaint nothing. */
+	if (!swc.active) {
+		compositor.scheduled_updates = 0;
+		return;
+	}
+	if (!updates) {
 		return;
 	}
 
@@ -2592,6 +2698,30 @@ bind_compositor(struct wl_client *client, void *data, uint32_t version,
 	wl_resource_set_implementation(resource, &compositor_impl, NULL, NULL);
 }
 
+void
+compositor_screen_added(struct screen *screen)
+{
+	struct compositor_view *view;
+
+	if (!compositor.initialized || target_get(screen)) {
+		return;
+	}
+	if (!target_new(screen)) {
+		ERROR("Could not create render target for new screen\n");
+		return;
+	}
+	/* Views keep the bit of a screen that went away until they move. Its id
+	 * may be this screen's now, and a hidden view is not really on it. */
+	wl_list_for_each(view, &compositor.views, link) {
+		if (view->visible)
+			update_view_screens(view);
+		else
+			view_set_screens(&view->base,
+			                 view->base.screens & ~screen_mask(screen));
+	}
+	compositor_damage_all();
+}
+
 bool
 compositor_initialize(void)
 {
@@ -2745,92 +2875,14 @@ render_scene(struct screen *screen, struct wld_renderer *renderer,
 		    !(wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
 			src = view->base.buffer;
 		}
-
 		if (src &&
-		    (wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
-			const struct swc_rectangle *geom = &view->base.geometry;
-			int32_t src_x = view->window ? view->buffer_offset_x : 0;
-			int32_t src_y = view->window ? view->buffer_offset_y : 0;
-			int32_t dst_x = geom->x - src_x - screen->base.geometry.x;
-			int32_t dst_y = geom->y - src_y - screen->base.geometry.y;
-			pixman_region32_t source_region;
-
-			pixman_region32_init_rect(&source_region, src_x, src_y, geom->width,
-			                          geom->height);
-			pixman_region32_intersect_rect(&source_region, &source_region, 0, 0,
-			                               src->width, src->height);
-			if (src->format == WLD_FORMAT_ARGB8888) {
-				wld_blend_region(renderer, src, dst_x, dst_y,
-				                 &source_region);
-			} else {
-				wld_copy_region(renderer, src, dst_x, dst_y,
-				                &source_region);
-			}
-			pixman_region32_fini(&source_region);
+		    !(wld_capabilities(renderer, src) & WLD_CAPABILITY_READ)) {
+			src = NULL;
 		}
 
-		if ((view->border.outwidth > 0 || view->border.inwidth > 0) &&
-		    view->base.buffer) {
-			pixman_region32_t view_region, view_damage, border_damage;
-			const struct swc_rectangle frame = frame_geometry(view);
-			const struct swc_rectangle *target_geom = &screen->base.geometry;
-
-			pixman_region32_init_rect(&view_region, frame.x, frame.y,
-			                          frame.width, frame.height);
-			pixman_region32_init_with_extents(&view_damage, &view->extents);
-			pixman_region32_init(&border_damage);
-
-			pixman_region32_intersect(&view_damage, &view_damage, damage);
-			pixman_region32_subtract(&view_damage, &view_damage, &view->clip);
-			pixman_region32_subtract(&border_damage, &view_damage,
-			                         &view_region);
-
-			pixman_region32_t in_rect;
-			pixman_region32_init_rect(&in_rect,
-			                          frame.x - view->border.inwidth,
-			                          frame.y - view->border.inwidth,
-			                          frame.width + (2 * view->border.inwidth),
-			                          frame.height +
-			                              (2 * view->border.inwidth));
-
-			pixman_region32_t out_border;
-			pixman_region32_init(&out_border);
-			pixman_region32_subtract(&out_border, &border_damage, &in_rect);
-
-			pixman_region32_t in_border;
-			pixman_region32_init(&in_border);
-			pixman_region32_subtract(&in_border, &in_rect, &view_region);
-			pixman_region32_intersect(&in_border, &in_border, &border_damage);
-
-			if (view->border.outwidth > 0 &&
-			    pixman_region32_not_empty(&out_border)) {
-				pixman_region32_translate(&out_border, -target_geom->x,
-				                          -target_geom->y);
-				wld_fill_region(renderer, view->border.outcolor,
-				                &out_border);
-			}
-
-			if (view->border.inwidth > 0 &&
-			    pixman_region32_not_empty(&in_border)) {
-				pixman_region32_translate(&in_border, -target_geom->x,
-				                          -target_geom->y);
-				wld_fill_region(renderer, view->border.incolor,
-				                &in_border);
-			}
-
-			pixman_region32_fini(&border_damage);
-			pixman_region32_fini(&view_region);
-			pixman_region32_fini(&view_damage);
-			pixman_region32_fini(&in_rect);
-			pixman_region32_fini(&out_border);
-			pixman_region32_fini(&in_border);
-		}
-
-		if (view->decor.top || view->decor.right || view->decor.bottom ||
-		    view->decor.left) {
-			const struct swc_rectangle *target_geom = &screen->base.geometry;
-			decor_repaint(renderer, target_geom, view, damage);
-		}
+		/* No clip: it was computed for the last frame, and a capture can
+		 * come after views moved. Drawing bottom-up covers the same ground. */
+		paint_view(renderer, &screen->base.geometry, view, src, damage, NULL);
 	}
 }
 

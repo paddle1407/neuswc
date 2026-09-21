@@ -38,4 +38,25 @@ bool
 xdg_popup_set_parent(struct wl_resource *popup_resource,
                      struct compositor_view *parent);
 
+/*
+ * Popup grabs (xdg_popup.grab). While one is held the topmost grabbing popup
+ * has the keyboard.
+ *
+ * filter_keyboard_focus: the view keyboard focus should really go to. The
+ * grabbing client's own surfaces give way to its topmost popup; any other
+ * view ends the grab.
+ *
+ * defer_window_focus: true if the grab keeps the keyboard and the window
+ * manager's choice of window is to be applied when it ends instead.
+ *
+ * focus_owner: the view that owns the keyboard behind a grabbing popup, for
+ * callers that remember the focus to give it back later.
+ */
+struct compositor_view *
+xdg_popup_grab_filter_keyboard_focus(struct compositor_view *view);
+bool
+xdg_popup_grab_defer_window_focus(struct compositor_view *view);
+struct compositor_view *
+xdg_popup_grab_focus_owner(struct compositor_view *view);
+
 #endif

@@ -32,6 +32,7 @@
 #include "surface.h"
 #include "swc.h"
 #include "util.h"
+#include "xdg_shell.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -111,6 +112,9 @@ client_handle_key(struct keyboard *keyboard,
 		}
 	}
 
+	if (!wl_list_empty(&keyboard->focus.active)) {
+		input_record_serial(keyboard->focus.client, key->press.serial);
+	}
 	wl_resource_for_each(resource, &keyboard->focus.active)
 	    wl_keyboard_send_key(
 	        resource, key->press.serial, time, key->press.value, state);
@@ -361,6 +365,7 @@ keyboard_set_focus(struct keyboard *keyboard, struct compositor_view *view)
 	    session_lock_active()) {
 		return;
 	}
+	view = xdg_popup_grab_filter_keyboard_focus(view);
 	input_focus_set(&keyboard->focus, view);
 }
 
