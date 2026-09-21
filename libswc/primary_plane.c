@@ -79,12 +79,13 @@ attach(struct view *view, struct wld_buffer *buffer)
 		}
 	} else {
 		ret = drmModePageFlip(swc.drm->fd, plane->crtc, fb,
-		                      DRM_MODE_PAGE_FLIP_EVENT, &plane->drm_handler);
+		                      DRM_MODE_PAGE_FLIP_EVENT, &plane->flip->handler);
 
 		if (ret < 0) {
 			ERROR("Page flip failed: %s\n", strerror(errno));
 			return ret;
 		}
+		plane->flip->pending = true;
 	}
 
 	return 0;
@@ -114,9 +115,15 @@ static const struct view_impl view_impl = {
 static void
 handle_page_flip(struct drm_handler *handler, uint32_t time)
 {
-	struct primary_plane *plane = wl_container_of(handler, plane, drm_handler);
+	struct primary_plane_flip *flip = wl_container_of(handler, flip, handler);
 
-	view_frame(&plane->view, time);
+	/* The screen was unplugged with this flip still queued. */
+	if (!flip->plane) {
+		free(flip);
+		return;
+	}
+	flip->pending = false;
+	view_frame(&flip->plane->view, time);
 }
 #endif
 
@@ -156,13 +163,22 @@ primary_plane_initialize(struct primary_plane *plane, struct mode *mode)
 		goto error0;
 	}
 
+	/* The kernel keeps a pointer to this until the flip completes, which
+	 * can be after the screen is gone, so it lives apart from the plane. */
+	if (!(plane->flip = malloc(sizeof(*plane->flip)))) {
+		goto error1;
+	}
+	plane->flip->handler.page_flip = &handle_page_flip;
+	plane->flip->plane = plane;
+	plane->flip->pending = false;
+
 	wl_array_init(&plane->connectors);
 	plane_connectors = wl_array_add(&plane->connectors,
 	                                num_connectors * sizeof(connectors[0]));
 
 	if (!plane_connectors) {
 		ERROR("Failed to allocate connector array\n");
-		goto error1;
+		goto error2;
 	}
 
 	memcpy(plane_connectors, connectors,
@@ -172,7 +188,6 @@ primary_plane_initialize(struct primary_plane *plane, struct mode *mode)
 	view_initialize(&plane->view, &view_impl);
 	plane->view.geometry.width = mode->width;
 	plane->view.geometry.height = mode->height;
-	plane->drm_handler.page_flip = &handle_page_flip;
 	plane->swc_listener.notify = &handle_swc_event;
 	plane->mode = *mode;
 #else
@@ -187,12 +202,32 @@ primary_plane_initialize(struct primary_plane *plane, struct mode *mode)
 	return true;
 
 #ifdef ENABLE_DRM
+error2:
+	wl_array_release(&plane->connectors);
+	free(plane->flip);
 error1:
 	drmModeFreeCrtc(plane->original_crtc_state);
 error0:
 	return false;
 #endif
 }
+
+#ifdef ENABLE_DRM
+void
+primary_plane_disable(struct primary_plane *plane)
+{
+	/* Only the session's master may touch the CRTC; while switched away the
+	 * other session owns it and this would fail anyway. */
+	if (swc.active &&
+	    drmModeSetCrtc(swc.drm->fd, plane->crtc, 0, 0, 0, NULL, 0, NULL) < 0) {
+		WARNING("Could not disable CRTC %u: %s\n", plane->crtc,
+		        strerror(errno));
+	}
+	/* What it showed before this session is not coming back either. */
+	drmModeFreeCrtc(plane->original_crtc_state);
+	plane->original_crtc_state = NULL;
+}
+#endif
 
 void
 primary_plane_finalize(struct primary_plane *plane)
@@ -201,9 +236,17 @@ primary_plane_finalize(struct primary_plane *plane)
 #ifdef ENABLE_DRM
 	wl_array_release(&plane->connectors);
 	drmModeCrtcPtr crtc = plane->original_crtc_state;
-	drmModeSetCrtc(swc.drm->fd, crtc->crtc_id, crtc->buffer_id, crtc->x,
-	               crtc->y, NULL, 0, &crtc->mode);
-	drmModeFreeCrtc(crtc);
+	if (crtc) {
+		drmModeSetCrtc(swc.drm->fd, crtc->crtc_id, crtc->buffer_id, crtc->x,
+		               crtc->y, NULL, 0, &crtc->mode);
+		drmModeFreeCrtc(crtc);
+	}
+	/* A flip still queued frees the handler when it completes. */
+	if (plane->flip->pending) {
+		plane->flip->plane = NULL;
+	} else {
+		free(plane->flip);
+	}
 #else
 	(void)plane;
 #endif

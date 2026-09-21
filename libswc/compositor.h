@@ -196,6 +196,10 @@ compositor_view_damage_decor(struct compositor_view *view);
 struct wld_buffer *
 compositor_get_buffer(struct screen *screen);
 
+/* A screen that appeared after startup needs a render target. */
+void
+compositor_screen_added(struct screen *screen);
+
 /* Newest completed composition; borrowed, read-only, synchronous use only. */
 struct wld_buffer *
 compositor_capture_buffer(struct screen *screen);
