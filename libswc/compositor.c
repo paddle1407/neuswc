@@ -1414,10 +1414,12 @@ attach(struct view *base, struct wld_buffer *buffer)
 		return ret;
 	}
 
-	/* Schedule updates on the screens the view was previously
-	 * visible on. */
-	update(&view->base);
-
+	/*
+	 * No update() here: both callers, surface_apply_pending() and
+	 * surface_set_view(), follow view_attach() with view_update(), once the
+	 * new size and offset are in place. Updating before them as well worked
+	 * out the screen mask from the old extents, and again after a resize.
+	 */
 	view->buffer_offset_x = 0;
 	view->buffer_offset_y = 0;
 	if (surface && surface->has_window_geometry && buffer) {
@@ -1440,9 +1442,11 @@ attach(struct view *base, struct wld_buffer *buffer)
 			    old_extents.x1, old_extents.y1,
 			    span_u32(old_extents.x1, old_extents.x2), span_u32(old_extents.y1, old_extents.y2));
 			pixman_region32_clear(&view->clip);
-			update_view_screens(view);
+			/* The old extents may be on a screen the new ones are not. The
+			 * caller's update schedules the screens the view is on now. */
+			if (swc.active)
+				schedule_updates(view->base.screens);
 			damage_view(view);
-			update(&view->base);
 		}
 	}
 
