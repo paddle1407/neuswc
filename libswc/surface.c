@@ -260,7 +260,8 @@ static void
 surface_apply_pending(struct surface *surface, bool flush_children)
 {
 	struct wld_buffer *buffer;
-	bool attached;
+	struct wl_resource *replaced = NULL;
+	bool attached, ready;
 
 	/*
 	 * An explicit-synchronization protocol error leaves the client dead, so
@@ -275,7 +276,7 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	if (attached) {
 		if (surface->state.buffer &&
 		    surface->state.buffer != surface->pending.state.buffer) {
-			wl_buffer_send_release(surface->state.buffer_resource);
+			replaced = surface->state.buffer_resource;
 		}
 
 		state_set_buffer(&surface->state,
@@ -283,16 +284,20 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	}
 
 	/*
-	 * Signal the release point of the buffer just replaced and make the
-	 * renderer wait for the new buffer's acquire point, before anything can
-	 * schedule a repaint that would sample it.
+	 * Signal the release point of the buffer just replaced and order the
+	 * renderer after the new buffer's acquire point, before anything can
+	 * schedule a repaint that would sample it. A buffer that is not ready
+	 * yet leaves the old one on screen until it is.
 	 */
-	drm_syncobj_surface_apply_commit(surface, attached);
+	ready = drm_syncobj_surface_apply_commit(surface, attached, &replaced);
+	if (replaced) {
+		wl_buffer_send_release(replaced);
+	}
 
 	buffer = surface->state.buffer;
 	/* Destroying the wl_buffer object does not detach its committed contents.
 	 * The view still owns those pixels until an explicit replacement attach. */
-	if (!(surface->pending.commit & SURFACE_COMMIT_ATTACH) && surface->view)
+	if ((!attached || !ready) && surface->view)
 		buffer = surface->view->buffer;
 	if (surface->pending.commit & SURFACE_COMMIT_GEOMETRY) {
 		const struct swc_rectangle *g = &surface->pending.window_geometry;
@@ -549,6 +554,11 @@ surface_set_view(struct surface *surface, struct view *view)
 		return;
 	}
 
+	/* The new view is given the committed buffer, so it has to be ready. */
+	if (view) {
+		drm_syncobj_surface_settle(surface);
+	}
+
 	if (surface->view) {
 		wl_list_remove(&surface->view_handler.link);
 	}
@@ -589,4 +599,21 @@ void
 surface_commit_pending(struct surface *surface)
 {
 	surface_apply_pending(surface, true);
+}
+
+void
+surface_show_buffer(struct surface *surface, struct wld_buffer *buffer)
+{
+	if (!surface->view) {
+		return;
+	}
+
+	/* Whatever the commit damaged was drawn from the old buffer. */
+	if (buffer) {
+		pixman_region32_union_rect(&surface->state.damage,
+		                           &surface->state.damage, 0, 0,
+		                           buffer->width, buffer->height);
+	}
+	view_attach(surface->view, buffer);
+	view_update(surface->view);
 }
