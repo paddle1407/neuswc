@@ -22,6 +22,7 @@
  */
 
 #include "surface.h"
+#include "backend.h"
 #include "compositor.h"
 #include "drm_syncobj.h"
 #include "pointer.h"
@@ -36,9 +37,95 @@
 #include "view.h"
 #include "wayland_buffer.h"
 
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <wld/wld.h>
+
+/* A wl_buffer.release waiting for the GPU to finish reading the buffer. */
+struct pending_release {
+	struct wl_resource *resource;
+	struct wl_listener destroy_listener;
+	struct wl_event_source *source;
+	int fd;
+};
+
+static void
+pending_release_free(struct pending_release *release)
+{
+	wl_list_remove(&release->destroy_listener.link);
+	wl_event_source_remove(release->source);
+	close(release->fd);
+	free(release);
+}
+
+static int
+handle_release_fence(int fd, uint32_t mask, void *data)
+{
+	struct pending_release *release = data;
+
+	(void)fd;
+	(void)mask;
+	wl_buffer_send_release(release->resource);
+	pending_release_free(release);
+	return 0;
+}
+
+static void
+handle_release_destroy(struct wl_listener *listener, void *data)
+{
+	struct pending_release *release =
+	    wl_container_of(listener, release, destroy_listener);
+
+	(void)data;
+	pending_release_free(release);
+}
+
+/*
+ * wl_buffer.release tells the client the compositor is done reading the
+ * buffer. Frames are only flushed to the GPU before they are presented, not
+ * finished, so one that sampled this buffer can still be running; on a driver
+ * without implicit synchronization the client could then draw into it under
+ * that read. Send the release once the renderer's fence says the GPU is done,
+ * which is nearly always already, from the event loop rather than blocking.
+ */
+static void
+release_buffer(struct wl_resource *resource)
+{
+	struct wld_renderer *renderer = swc.backend ? swc.backend->renderer : NULL;
+	struct wld_buffer *buffer = wayland_buffer_get(resource);
+	struct pending_release *release;
+	struct pollfd pollfd;
+	int fd;
+
+	/* Only buffers the renderer samples directly are read on the GPU. */
+	if (!renderer || !buffer ||
+	    !(wld_capabilities(renderer, buffer) & WLD_CAPABILITY_READ) ||
+	    (fd = wld_export_fence(renderer)) < 0) {
+		wl_buffer_send_release(resource);
+		return;
+	}
+
+	pollfd.fd = fd;
+	pollfd.events = POLLIN;
+	if (poll(&pollfd, 1, 0) == 0 && (release = malloc(sizeof(*release)))) {
+		release->source = wl_event_loop_add_fd(
+		    swc.event_loop, fd, WL_EVENT_READABLE, &handle_release_fence, release);
+		if (release->source) {
+			release->resource = resource;
+			release->fd = fd;
+			release->destroy_listener.notify = &handle_release_destroy;
+			wl_resource_add_destroy_listener(resource,
+			                                 &release->destroy_listener);
+			return;
+		}
+		free(release);
+	}
+
+	close(fd);
+	wl_buffer_send_release(resource);
+}
 
 /**
  * Removes a buffer from a surface state.
@@ -260,7 +347,8 @@ static void
 surface_apply_pending(struct surface *surface, bool flush_children)
 {
 	struct wld_buffer *buffer;
-	bool attached;
+	struct wl_resource *replaced = NULL;
+	bool attached, ready;
 
 	/*
 	 * An explicit-synchronization protocol error leaves the client dead, so
@@ -275,7 +363,7 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	if (attached) {
 		if (surface->state.buffer &&
 		    surface->state.buffer != surface->pending.state.buffer) {
-			wl_buffer_send_release(surface->state.buffer_resource);
+			replaced = surface->state.buffer_resource;
 		}
 
 		state_set_buffer(&surface->state,
@@ -283,16 +371,20 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	}
 
 	/*
-	 * Signal the release point of the buffer just replaced and make the
-	 * renderer wait for the new buffer's acquire point, before anything can
-	 * schedule a repaint that would sample it.
+	 * Signal the release point of the buffer just replaced and order the
+	 * renderer after the new buffer's acquire point, before anything can
+	 * schedule a repaint that would sample it. A buffer that is not ready
+	 * yet leaves the old one on screen until it is.
 	 */
-	drm_syncobj_surface_apply_commit(surface, attached);
+	ready = drm_syncobj_surface_apply_commit(surface, attached, &replaced);
+	if (replaced) {
+		release_buffer(replaced);
+	}
 
 	buffer = surface->state.buffer;
 	/* Destroying the wl_buffer object does not detach its committed contents.
 	 * The view still owns those pixels until an explicit replacement attach. */
-	if (!(surface->pending.commit & SURFACE_COMMIT_ATTACH) && surface->view)
+	if ((!attached || !ready) && surface->view)
 		buffer = surface->view->buffer;
 	if (surface->pending.commit & SURFACE_COMMIT_GEOMETRY) {
 		const struct swc_rectangle *g = &surface->pending.window_geometry;
@@ -549,6 +641,11 @@ surface_set_view(struct surface *surface, struct view *view)
 		return;
 	}
 
+	/* The new view is given the committed buffer, so it has to be ready. */
+	if (view) {
+		drm_syncobj_surface_settle(surface);
+	}
+
 	if (surface->view) {
 		wl_list_remove(&surface->view_handler.link);
 	}
@@ -589,4 +686,21 @@ void
 surface_commit_pending(struct surface *surface)
 {
 	surface_apply_pending(surface, true);
+}
+
+void
+surface_show_buffer(struct surface *surface, struct wld_buffer *buffer)
+{
+	if (!surface->view) {
+		return;
+	}
+
+	/* Whatever the commit damaged was drawn from the old buffer. */
+	if (buffer) {
+		pixman_region32_union_rect(&surface->state.damage,
+		                           &surface->state.damage, 0, 0,
+		                           buffer->width, buffer->height);
+	}
+	view_attach(surface->view, buffer);
+	view_update(surface->view);
 }

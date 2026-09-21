@@ -56,6 +56,15 @@ struct primary_plane {
 	struct wl_array connectors;
 	bool need_modeset;
 	struct primary_plane_flip *flip;
+
+	/*
+	 * A framebuffer whose rendering the GPU has not finished, and the
+	 * sync_file that signals when it has. It is presented from the event
+	 * loop once the fence signals rather than by blocking for it.
+	 */
+	struct wl_event_source *fence_source;
+	int fence_fd;
+	uint32_t fence_fb;
 #endif
 	struct wl_listener swc_listener;
 };

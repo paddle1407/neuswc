@@ -11,6 +11,7 @@
 struct surface;
 struct wl_display;
 struct wl_global;
+struct wl_resource;
 
 #ifdef ENABLE_DRM
 
@@ -34,11 +35,26 @@ bool drm_syncobj_surface_check_commit(struct surface *surface);
 
 /**
  * Applies that state: signals the release point of the buffer this commit
- * replaced, and makes further rendering wait for the new acquire point.
+ * replaced, and orders rendering after the new buffer's acquire point.
  *
- * 'attached' says whether this commit replaced the surface's buffer.
+ * 'attached' says whether this commit replaced the surface's buffer, and
+ * '*replaced' is the wl_buffer it replaced, which the caller releases unless
+ * this sets it to NULL, taking that over.
+ *
+ * Returns false when the new buffer cannot be sampled yet. The caller must
+ * then leave the view showing what it shows; the buffer is put up with
+ * surface_show_buffer() once its acquire point signals, without blocking the
+ * commit.
  */
-void drm_syncobj_surface_apply_commit(struct surface *surface, bool attached);
+bool drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
+                                      struct wl_resource **replaced);
+
+/**
+ * Puts up the newest buffer still waiting for its acquire point, after a
+ * bounded wait, for callers about to show the surface's committed buffer
+ * anyway.
+ */
+void drm_syncobj_surface_settle(struct surface *surface);
 
 /** Signals any outstanding release point, when a surface is going away. */
 void drm_syncobj_surface_finish(struct surface *surface);
@@ -59,11 +75,20 @@ drm_syncobj_surface_check_commit(struct surface *surface)
 	return true;
 }
 
-static inline void
-drm_syncobj_surface_apply_commit(struct surface *surface, bool attached)
+static inline bool
+drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
+                                 struct wl_resource **replaced)
 {
 	(void)surface;
 	(void)attached;
+	(void)replaced;
+	return true;
+}
+
+static inline void
+drm_syncobj_surface_settle(struct surface *surface)
+{
+	(void)surface;
 }
 
 static inline void
