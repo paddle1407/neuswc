@@ -41,7 +41,6 @@ struct xdg_surface {
 	struct wl_resource *resource, *role;
 	struct surface *surface;
 	struct wl_listener surface_destroy_listener, role_destroy_listener;
-	uint32_t configure_serial;
 	enum {
 		XDG_ROLE_NONE,
 		XDG_ROLE_TOPLEVEL,
@@ -53,6 +52,7 @@ struct xdg_positioner {
 	int32_t width, height;
 	int32_t anchor_x, anchor_y;
 	int32_t anchor_width, anchor_height;
+	bool has_anchor_rect;
 	enum xdg_positioner_anchor anchor;
 	enum xdg_positioner_gravity gravity;
 	enum xdg_positioner_constraint_adjustment constraint;
@@ -73,6 +73,11 @@ struct toplevel_configure {
 	struct wl_list link;
 	uint32_t serial;
 	uint64_t generation;
+};
+
+struct popup_configure {
+	struct wl_list link;
+	uint32_t serial;
 };
 
 struct xdg_toplevel {
@@ -100,6 +105,8 @@ struct xdg_popup {
 	struct compositor_view *view;
 	struct compositor_view *parent;
 	struct wl_listener parent_destroy_listener;
+	struct wl_list configures;
+	unsigned configure_count;
 	bool configured;
 };
 
@@ -136,11 +143,18 @@ set_anchor_rect(struct wl_client *client, struct wl_resource *resource,
 {
 	struct xdg_positioner *positioner = wl_resource_get_user_data(resource);
 
-	if (width <= 0 || height <= 0) {
+	/*
+	 * A zero-width or zero-height anchor rectangle is a point to hang the
+	 * popup off -- a text caret, or wherever the pointer was -- and the
+	 * protocol only rejects a negative one. Clients do anchor that way, so
+	 * treating zero as invalid kills them for conforming behaviour.
+	 */
+	if (width < 0 || height < 0) {
 		wl_resource_post_error(resource, XDG_POSITIONER_ERROR_INVALID_INPUT,
-		                       "invalid anchor size");
+		                       "negative anchor size");
 		return;
 	}
+	positioner->has_anchor_rect = true;
 	positioner->anchor_x = x;
 	positioner->anchor_y = y;
 	positioner->anchor_width = width;
@@ -1135,6 +1149,63 @@ send_wm_capabilities(struct xdg_toplevel *toplevel)
 }
 
 /* xdg_popup */
+/*
+ * A client with more than one configure in flight may acknowledge an older
+ * one: it answers the configure it has finished processing, which need not be
+ * the last the compositor sent. Keeping every serial sent -- and dropping it
+ * along with everything older once it is acknowledged -- is what lets a
+ * reposition overlap an ack without the client appearing to invent a serial.
+ * Only a serial that was never sent is a protocol error.
+ */
+static bool
+popup_record_configure(struct xdg_popup *popup, uint32_t *serial)
+{
+	struct popup_configure *c;
+
+	/* Bound memory if a client stops acknowledging configure events. */
+	if (popup->configure_count >= 1024) {
+		wl_resource_post_no_memory(popup->resource);
+		return false;
+	}
+	c = calloc(1, sizeof(*c));
+	if (!c) {
+		wl_resource_post_no_memory(popup->resource);
+		return false;
+	}
+	c->serial = wl_display_next_serial(swc.display);
+	wl_list_insert(popup->configures.prev, &c->link);
+	++popup->configure_count;
+	*serial = c->serial;
+
+	return true;
+}
+
+static bool
+popup_ack_configure(struct xdg_popup *popup, uint32_t serial)
+{
+	struct popup_configure *c, *tmp, *match = NULL;
+
+	wl_list_for_each(c, &popup->configures, link) {
+		if (c->serial == serial) {
+			match = c;
+			break;
+		}
+	}
+	if (!match) {
+		return false;
+	}
+	wl_list_for_each_safe(c, tmp, &popup->configures, link) {
+		bool last = c == match;
+		wl_list_remove(&c->link);
+		free(c);
+		--popup->configure_count;
+		if (last)
+			break;
+	}
+
+	return true;
+}
+
 static void
 handle_popup_parent_destroy(struct wl_listener *listener, void *data)
 {
@@ -1158,6 +1229,11 @@ destroy_popup(struct wl_resource *resource)
 
 	if (popup->parent) {
 		wl_list_remove(&popup->parent_destroy_listener.link);
+	}
+	struct popup_configure *c, *tmp;
+	wl_list_for_each_safe(c, tmp, &popup->configures, link) {
+		wl_list_remove(&c->link);
+		free(c);
 	}
 	compositor_view_destroy(popup->view);
 	free(popup);
@@ -1205,8 +1281,9 @@ reposition(struct wl_client *client, struct wl_resource *resource,
 	view_move(&popup->view->base, popup->parent->base.geometry.x + rect.x,
 	          popup->parent->base.geometry.y + rect.y);
 
-	serial = wl_display_next_serial(swc.display);
-	popup->xdg_surface->configure_serial = serial;
+	if (!popup_record_configure(popup, &serial)) {
+		return;
+	}
 	xdg_popup_send_repositioned(popup->resource, token);
 	xdg_popup_send_configure(popup->resource, rect.x, rect.y, rect.width,
 	                         rect.height);
@@ -1237,6 +1314,11 @@ xdg_popup_set_parent(struct wl_resource *popup_resource,
 	if (!popup || popup->parent || popup->configured) {
 		return false;
 	}
+	/* Take the serial before touching any state, so that a failure here
+	 * leaves the popup as it was. */
+	if (!popup_record_configure(popup, &serial)) {
+		return false;
+	}
 
 	popup->parent = parent;
 	popup->parent_destroy_listener.notify = handle_popup_parent_destroy;
@@ -1250,8 +1332,6 @@ xdg_popup_set_parent(struct wl_resource *popup_resource,
 	compositor_view_set_parent(popup->view, parent);
 	compositor_view_restack(popup->view, parent, true);
 
-	serial = wl_display_next_serial(swc.display);
-	popup->xdg_surface->configure_serial = serial;
 	popup->configured = true;
 	xdg_popup_send_configure(popup->resource, rect.x, rect.y, rect.width,
 	                         rect.height);
@@ -1281,6 +1361,7 @@ xdg_popup_new(struct wl_client *client, uint32_t version, uint32_t id,
 	}
 	popup->xdg_surface = xdg_surface;
 	popup->positioner = *positioner;
+	wl_list_init(&popup->configures);
 	wl_list_init(&popup->parent_destroy_listener.link);
 	popup->resource =
 	    wl_resource_create(client, &xdg_popup_interface, version, id);
@@ -1365,7 +1446,7 @@ get_popup(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 		return;
 	}
 	if (positioner->width <= 0 || positioner->height <= 0 ||
-	    positioner->anchor_width <= 0 || positioner->anchor_height <= 0) {
+	    !positioner->has_anchor_rect) {
 		wl_resource_post_error(resource,
 		                       XDG_WM_BASE_ERROR_INVALID_POSITIONER,
 		                       "xdg_positioner is incomplete");
@@ -1395,6 +1476,7 @@ ack_configure(struct wl_client *client, struct wl_resource *resource,
 {
 	struct xdg_surface *xdg_surface = wl_resource_get_user_data(resource);
 	struct xdg_toplevel *toplevel;
+	struct xdg_popup *popup;
 
 	if (!xdg_surface->role) {
 		return;
@@ -1416,8 +1498,11 @@ ack_configure(struct wl_client *client, struct wl_resource *resource,
 			--toplevel->configure_count;
 			if (last) break;
 		}
-	} else if (serial != xdg_surface->configure_serial) {
-		wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SERIAL, "unknown popup configure serial");
+	} else if (xdg_surface->role_type == XDG_ROLE_POPUP) {
+		popup = wl_resource_get_user_data(xdg_surface->role);
+		if (!popup_ack_configure(popup, serial)) {
+			wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SERIAL, "unknown popup configure serial");
+		}
 	}
 }
 
@@ -1494,7 +1579,6 @@ xdg_surface_new(struct wl_client *client, uint32_t version, uint32_t id,
 		goto error1;
 	}
 	xdg_surface->surface = surface;
-	xdg_surface->configure_serial = 0;
 	xdg_surface->surface_destroy_listener.notify = &handle_surface_destroy;
 	xdg_surface->role = NULL;
 	xdg_surface->role_type = XDG_ROLE_NONE;
