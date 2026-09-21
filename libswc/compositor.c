@@ -292,9 +292,12 @@ handle_screen_frame(struct view_handler *handler, uint32_t time)
 
 	compositor.pending_flips &= ~target->mask;
 
+	/* Only the surface answers a frame event, and only with the callbacks
+	 * it has queued, so skip the handler walk for views with none. */
 	wl_list_for_each(view, &compositor.views, link)
 	{
-		if (view->visible && view->base.screens & target->mask) {
+		if (view->visible && view->base.screens & target->mask &&
+		    !wl_list_empty(&view->surface->state.frame_callbacks)) {
 			view_frame(&view->base, time);
 		}
 	}
@@ -1196,7 +1199,9 @@ EXPORT bool swc_window_overview_geometry(struct swc_window *base, struct swc_rec
 	int64_t x2 = x1 + rect->width, y2 = y1 + rect->height;
 	struct compositor_view *child;
 	wl_list_for_each(child, &compositor.views, link) {
-		if (child == view || !child->buffer || overview_owner(child) != view) continue;
+		/* Most views are toplevels with no parent to walk. */
+		if (child == view || !child->parent || !child->buffer ||
+		    overview_owner(child) != view) continue;
 		const struct swc_rectangle *g = &child->base.geometry;
 		x1 = MIN(x1, g->x); y1 = MIN(y1, g->y);
 		x2 = MAX(x2, (int64_t)g->x + g->width);
