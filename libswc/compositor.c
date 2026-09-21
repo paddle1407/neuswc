@@ -1579,13 +1579,15 @@ view_at(int32_t x, int32_t y)
 	struct swc_rectangle *geom;
 	struct swc_rectangle buffer_geom;
 
+	/*
+	 * Runs on every pointer motion. The titlebar, the content and a surface's
+	 * buffer all lie inside the extents, so four comparisons reject nearly
+	 * every view before the titlebar layout or the input region is consulted.
+	 */
 	wl_list_for_each(view, &compositor.views, link)
 	{
-		if (!view->visible) {
-			if (compositor.overview_screen && view->buffer && view->base.buffer) {
-				renderer_flush_view(view);
-				pixman_region32_clear(&view->surface->state.damage);
-			}
+		if (!view->visible || x < view->extents.x1 || x >= view->extents.x2 ||
+		    y < view->extents.y1 || y >= view->extents.y2) {
 			continue;
 		}
 
@@ -2207,6 +2209,12 @@ calculate_damage(void)
 	wl_list_for_each(view, &compositor.views, link)
 	{
 		if (!view->visible) {
+			/* The overview still shows hidden windows as thumbnails, so their
+			 * upload proxies have to keep up with what the client draws. */
+			if (compositor.overview_screen && view->buffer && view->base.buffer) {
+				renderer_flush_view(view);
+				pixman_region32_clear(&view->surface->state.damage);
+			}
 			continue;
 		}
 
