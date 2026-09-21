@@ -22,6 +22,7 @@
  */
 
 #include "surface.h"
+#include "backend.h"
 #include "compositor.h"
 #include "drm_syncobj.h"
 #include "pointer.h"
@@ -36,9 +37,95 @@
 #include "view.h"
 #include "wayland_buffer.h"
 
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <wld/wld.h>
+
+/* A wl_buffer.release waiting for the GPU to finish reading the buffer. */
+struct pending_release {
+	struct wl_resource *resource;
+	struct wl_listener destroy_listener;
+	struct wl_event_source *source;
+	int fd;
+};
+
+static void
+pending_release_free(struct pending_release *release)
+{
+	wl_list_remove(&release->destroy_listener.link);
+	wl_event_source_remove(release->source);
+	close(release->fd);
+	free(release);
+}
+
+static int
+handle_release_fence(int fd, uint32_t mask, void *data)
+{
+	struct pending_release *release = data;
+
+	(void)fd;
+	(void)mask;
+	wl_buffer_send_release(release->resource);
+	pending_release_free(release);
+	return 0;
+}
+
+static void
+handle_release_destroy(struct wl_listener *listener, void *data)
+{
+	struct pending_release *release =
+	    wl_container_of(listener, release, destroy_listener);
+
+	(void)data;
+	pending_release_free(release);
+}
+
+/*
+ * wl_buffer.release tells the client the compositor is done reading the
+ * buffer. Frames are only flushed to the GPU before they are presented, not
+ * finished, so one that sampled this buffer can still be running; on a driver
+ * without implicit synchronization the client could then draw into it under
+ * that read. Send the release once the renderer's fence says the GPU is done,
+ * which is nearly always already, from the event loop rather than blocking.
+ */
+static void
+release_buffer(struct wl_resource *resource)
+{
+	struct wld_renderer *renderer = swc.backend ? swc.backend->renderer : NULL;
+	struct wld_buffer *buffer = wayland_buffer_get(resource);
+	struct pending_release *release;
+	struct pollfd pollfd;
+	int fd;
+
+	/* Only buffers the renderer samples directly are read on the GPU. */
+	if (!renderer || !buffer ||
+	    !(wld_capabilities(renderer, buffer) & WLD_CAPABILITY_READ) ||
+	    (fd = wld_export_fence(renderer)) < 0) {
+		wl_buffer_send_release(resource);
+		return;
+	}
+
+	pollfd.fd = fd;
+	pollfd.events = POLLIN;
+	if (poll(&pollfd, 1, 0) == 0 && (release = malloc(sizeof(*release)))) {
+		release->source = wl_event_loop_add_fd(
+		    swc.event_loop, fd, WL_EVENT_READABLE, &handle_release_fence, release);
+		if (release->source) {
+			release->resource = resource;
+			release->fd = fd;
+			release->destroy_listener.notify = &handle_release_destroy;
+			wl_resource_add_destroy_listener(resource,
+			                                 &release->destroy_listener);
+			return;
+		}
+		free(release);
+	}
+
+	close(fd);
+	wl_buffer_send_release(resource);
+}
 
 /**
  * Removes a buffer from a surface state.
@@ -291,7 +378,7 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	 */
 	ready = drm_syncobj_surface_apply_commit(surface, attached, &replaced);
 	if (replaced) {
-		wl_buffer_send_release(replaced);
+		release_buffer(replaced);
 	}
 
 	buffer = surface->state.buffer;
