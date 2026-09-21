@@ -418,9 +418,23 @@ decor_initialize(void)
 	return font_context != NULL;
 }
 
+/*
+ * Applying a prepared decoration swaps it for the view's old one, which the
+ * prepared view then carries to swc_decor_discard(). Keep that for the next
+ * prepare instead of freeing it: redecorating -- which every focus change does
+ * to two windows -- then keeps the font when its name is unchanged and the bar
+ * buffer when its size is, rather than opening and allocating both afresh.
+ */
+static struct compositor_view *spare;
+
 void
 decor_finalize(void)
 {
+	if (spare) {
+		decor_view_finalize(spare);
+		free(spare);
+		spare = NULL;
+	}
 	titlebar_finalize();
 	if (font_context) {
 		wld_font_destroy_context(font_context);
@@ -808,9 +822,18 @@ swc_decor_prepare(const struct swc_decor *decor, uint32_t width)
 {
 	struct swc_prepared_decor *prepared = calloc(1, sizeof(*prepared));
 	if (!prepared) return NULL;
-	prepared->view = calloc(1, sizeof(*prepared->view));
-	if (!prepared->view) { free(prepared); return NULL; }
-	decor_view_initialize(prepared->view);
+	if ((prepared->view = spare)) {
+		spare = NULL;
+		/* It was another window's: its pointer state is not ours, and its
+		 * bar has to be painted again even where the decoration matches. */
+		prepared->view->decor.hover_button = -1;
+		prepared->view->decor.pressed_button = -1;
+		prepared->view->decor.bar_dirty = true;
+	} else {
+		prepared->view = calloc(1, sizeof(*prepared->view));
+		if (!prepared->view) { free(prepared); return NULL; }
+		decor_view_initialize(prepared->view);
+	}
 	prepared->view->base.geometry.width = width;
 	if (!decor_view_set(prepared->view, decor) || !titlebar_prepare(prepared->view)) {
 		swc_decor_discard(prepared);
@@ -823,7 +846,12 @@ EXPORT void
 swc_decor_discard(struct swc_prepared_decor *prepared)
 {
 	if (!prepared) return;
-	decor_view_finalize(prepared->view);
-	free(prepared->view);
+	/* Not once decor_finalize() has run: nothing would free it. */
+	if (!spare && font_context) {
+		spare = prepared->view;
+	} else {
+		decor_view_finalize(prepared->view);
+		free(prepared->view);
+	}
 	free(prepared);
 }
