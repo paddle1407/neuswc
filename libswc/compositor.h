@@ -97,6 +97,10 @@ struct compositor_view {
 	 * surface. */
 	pixman_region32_t clip;
 
+	/* When a view nothing of which can be seen last got a frame callback.
+	 * Such a view is told about one frame a second, not every one. */
+	uint32_t clipped_frame_time;
+
 	struct {
 		uint32_t outwidth;
 		uint32_t outcolor;
@@ -117,6 +121,9 @@ struct compositor_view {
 		struct swc_titlebar titlebar;
 		int hover_button, pressed_button;
 		struct wld_buffer *bar_buffer;
+		/* The width the bar was last painted at: the buffer is wider, so
+		 * that a resize can keep it. */
+		uint32_t bar_width;
 		bool bar_dirty;
 		const struct swc_decor_parts *parts_key;
 		struct decor_part_buffer parts[8];

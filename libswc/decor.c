@@ -480,6 +480,8 @@ decor_repaint(struct wld_renderer *renderer,
 	int32_t x, y, base_x, base_y, advance, available_width;
 	struct wld_extents extents;
 	pixman_region32_t title_region;
+	pixman_box32_t *title_boxes;
+	int title_box_count, box;
 	int32_t outer_x = geom->x - (int32_t)view->decor.left;
 	int32_t outer_y = geom->y - (int32_t)view->decor.top;
 	uint32_t outer_width = geom->width + view->decor.left + view->decor.right;
@@ -615,18 +617,22 @@ decor_repaint(struct wld_renderer *renderer,
 	x = base_x;
 	y = base_y;
 
+	/*
+	 * Only where the damage is, and not under whatever is stacked above: the
+	 * text is drawn in full otherwise, over windows above it, and blended
+	 * again over the pixels outside the damage that were not repainted, so
+	 * its edges got bolder with every repaint.
+	 */
 	pixman_region32_init_rect(&title_region, x, y, max_width, decor_size);
 	pixman_region32_intersect(&title_region, &title_region, damage);
 	pixman_region32_subtract(&title_region, &title_region, &view->clip);
-	if (!pixman_region32_not_empty(&title_region)) {
+	pixman_region32_translate(&title_region, -target_geom->x, -target_geom->y);
+	if (!pixman_region32_not_empty(&title_region) ||
+	    max_width <= text->padding * 2 || decor_size < font->height) {
 		pixman_region32_fini(&title_region);
 		return;
 	}
-	pixman_region32_fini(&title_region);
-
-	if (max_width <= text->padding * 2 || decor_size < font->height) {
-		return;
-	}
+	title_boxes = pixman_region32_rectangles(&title_region, &title_box_count);
 	max_width -= text->padding * 2;
 
 	if (text->edge == SWC_DECOR_EDGE_LEFT || text->edge == SWC_DECOR_EDGE_RIGHT) {
@@ -640,6 +646,7 @@ decor_repaint(struct wld_renderer *renderer,
 		title_len = decor_title_stacked_length(font, title, available_height,
 		                                      &glyph_count);
 		if (!title_len) {
+			pixman_region32_fini(&title_region);
 			return;
 		}
 
@@ -656,33 +663,42 @@ decor_repaint(struct wld_renderer *renderer,
 			break;
 		}
 
-		while (glyph_offset < title_len) {
-			uint32_t glyph_len = utf8_next_len(title, glyph_offset);
-			int32_t glyph_x;
+		for (box = 0; box < title_box_count; ++box) {
+			int32_t row_y = y;
 
-			wld_font_text_extents_n(font, title + glyph_offset,
-			                        (int32_t)glyph_len, &extents);
-			advance = extents.advance > 0 ? extents.advance : 0;
-			glyph_x = x + (int32_t)text->padding;
-			if ((uint32_t)advance < max_width) {
-				glyph_x += ((int32_t)max_width - advance) / 2;
+			wld_set_clip(renderer, &title_boxes[box]);
+			glyph_offset = 0;
+			while (glyph_offset < title_len) {
+				uint32_t glyph_len = utf8_next_len(title, glyph_offset);
+				int32_t glyph_x;
+
+				wld_font_text_extents_n(font, title + glyph_offset,
+				                        (int32_t)glyph_len, &extents);
+				advance = extents.advance > 0 ? extents.advance : 0;
+				glyph_x = x + (int32_t)text->padding;
+				if ((uint32_t)advance < max_width) {
+					glyph_x += ((int32_t)max_width - advance) / 2;
+				}
+
+				wld_draw_text(renderer, font, text->color,
+				              glyph_x + text->offset_x - target_geom->x,
+				              row_y + (int32_t)font->ascent + text->offset_y -
+				                  target_geom->y,
+				              title + glyph_offset, glyph_len, NULL);
+
+				glyph_offset += glyph_len;
+				row_y += (int32_t)font->height;
 			}
-
-			wld_draw_text(renderer, font, text->color,
-			              glyph_x + text->offset_x - target_geom->x,
-			              y + (int32_t)font->ascent + text->offset_y -
-			                  target_geom->y,
-			              title + glyph_offset, glyph_len, NULL);
-
-			glyph_offset += glyph_len;
-			y += (int32_t)font->height;
 		}
+		wld_set_clip(renderer, NULL);
+		pixman_region32_fini(&title_region);
 
 		return;
 	}
 
 	title_len = decor_title_length(font, title, max_width);
 	if (!title_len) {
+		pixman_region32_fini(&title_region);
 		return;
 	}
 	wld_font_text_extents_n(font, title, (int32_t)title_len, &extents);
@@ -706,8 +722,13 @@ decor_repaint(struct wld_renderer *renderer,
 	x += text->offset_x;
 	y += text->offset_y;
 
-	wld_draw_text(renderer, font, text->color, x - target_geom->x,
-	              y - target_geom->y, title, title_len, NULL);
+	for (box = 0; box < title_box_count; ++box) {
+		wld_set_clip(renderer, &title_boxes[box]);
+		wld_draw_text(renderer, font, text->color, x - target_geom->x,
+		              y - target_geom->y, title, title_len, NULL);
+	}
+	wld_set_clip(renderer, NULL);
+	pixman_region32_fini(&title_region);
 }
 
 bool

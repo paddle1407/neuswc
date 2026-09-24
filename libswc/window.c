@@ -783,8 +783,19 @@ window_unmanage(struct window *window)
 void
 window_set_title(struct window *window, const char *title, size_t length)
 {
+	char *copy = title ? strndup(title, length) : NULL;
+
+	/* Said again rather than changed: nothing downstream has anything to
+	 * do, and a taskbar would repaint every panel for it. A shell that
+	 * sets its title on every prompt does this constantly. */
+	if (!copy == !window->base.title &&
+	    (!copy || strcmp(copy, window->base.title) == 0)) {
+		free(copy);
+		return;
+	}
+
 	free(window->base.title);
-	window->base.title = title ? strndup(title, length) : NULL;
+	window->base.title = copy;
 
 	if (window->handler->title_changed) {
 		window->handler->title_changed(window->handler_data);
@@ -795,8 +806,16 @@ window_set_title(struct window *window, const char *title, size_t length)
 void
 window_set_app_id(struct window *window, const char *app_id)
 {
+	char *copy = app_id ? strdup(app_id) : NULL;
+
+	if (!copy == !window->base.app_id &&
+	    (!copy || strcmp(copy, window->base.app_id) == 0)) {
+		free(copy);
+		return;
+	}
+
 	free(window->base.app_id);
-	window->base.app_id = strdup(app_id);
+	window->base.app_id = copy;
 
 	if (window->handler->app_id_changed) {
 		window->handler->app_id_changed(window->handler_data);

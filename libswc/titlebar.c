@@ -207,20 +207,35 @@ paint_failed(const char *step)
 	return false;
 }
 
+/*
+ * Bring the cached bar image up to date. 'retargeted' is set when painting
+ * happened, which takes the renderer's target with it: the caller may have
+ * been part way through drawing a scene.
+ */
 static bool
-paint_buffer(struct compositor_view *view, uint32_t width, uint32_t height)
+paint_buffer(struct compositor_view *view, uint32_t width, uint32_t height,
+             bool *retargeted)
 {
+	/*
+	 * Wider than the bar, so that a resize keeps the buffer: a GPU buffer
+	 * with its image and texture is not cheap to make, and a drag resizes
+	 * on every frame.
+	 */
+	uint32_t alloc_width = width <= UINT32_MAX - 255 ? (width + 255) & ~255U : width;
+
 	if (!bar_renderer && !(bar_renderer = wld_create_renderer(swc.backend->context)))
 		return paint_failed("no renderer");
-	if (view->decor.bar_buffer && (view->decor.bar_buffer->width != width ||
+	if (view->decor.bar_buffer && (view->decor.bar_buffer->width < width ||
 	    view->decor.bar_buffer->height != height)) titlebar_finish(view);
 	if (!view->decor.bar_buffer)
-		view->decor.bar_buffer = wld_create_buffer(swc.backend->context, width, height,
+		view->decor.bar_buffer = wld_create_buffer(swc.backend->context, alloc_width, height,
 		                                          WLD_FORMAT_XRGB8888, 0);
 	if (!view->decor.bar_buffer) return paint_failed("no buffer");
+	if (view->decor.bar_width != width) view->decor.bar_dirty = true;
 	if (!view->decor.bar_dirty) return true;
 	if (!wld_set_target_buffer(bar_renderer, view->decor.bar_buffer))
 		return paint_failed("buffer is not a render target");
+	*retargeted = true;
 	wld_fill_rectangle(bar_renderer, view->decor.color, 0, 0, width, height);
 
 	const struct swc_decor_text *text = &view->decor.text;
@@ -289,6 +304,7 @@ paint_buffer(struct compositor_view *view, uint32_t width, uint32_t height)
 	wld_flush(bar_renderer);
 	wld_set_target_buffer(bar_renderer, NULL);
 	view->decor.bar_dirty = false;
+	view->decor.bar_width = width;
 	return true;
 }
 
@@ -303,10 +319,11 @@ titlebar_repaint(struct wld_renderer *renderer, const struct swc_rectangle *targ
 	pixman_region32_intersect(&region, &region, damage);
 	pixman_region32_subtract(&region, &region, &view->clip);
 	if (pixman_region32_not_empty(&region)) {
-		bool painted = paint_buffer(view, r.width, r.height);
+		bool retargeted = false;
+		bool painted = paint_buffer(view, r.width, r.height, &retargeted);
 		/* GBM renderers share GL state. Restore the scene FBO and viewport
 		 * after painting the cache, including allocation/failure paths. */
-		if (!wld_set_target_buffer(renderer, renderer->target)) {
+		if (retargeted && !wld_set_target_buffer(renderer, renderer->target)) {
 			pixman_region32_fini(&region);
 			return;
 		}
@@ -336,7 +353,7 @@ titlebar_content(struct compositor_view *view, struct swc_rectangle *rect)
 	 * current as decorations are applied, so this is only empty before the
 	 * first one has been.
 	 */
-	if (!view->decor.bar_buffer || view->decor.bar_buffer->width != r.width ||
+	if (!view->decor.bar_buffer || view->decor.bar_width != r.width ||
 	    view->decor.bar_buffer->height != r.height)
 		return NULL;
 
@@ -347,6 +364,9 @@ titlebar_content(struct compositor_view *view, struct swc_rectangle *rect)
 bool
 titlebar_prepare(struct compositor_view *view)
 {
+	bool retargeted = false;
+
 	return !view->decor.titlebar.enabled || !view->base.geometry.width ||
-	       !view->decor.top || paint_buffer(view, view->base.geometry.width, view->decor.top);
+	       !view->decor.top ||
+	       paint_buffer(view, view->base.geometry.width, view->decor.top, &retargeted);
 }
