@@ -146,6 +146,16 @@ struct target {
 	struct view *view;
 	struct view_handler view_handler;
 	uint32_t mask;
+	struct screen *screen;
+
+	/* Frame callbacks owed for an update that drew nothing are paced by
+	 * this, at the rate a page flip would have paced them. */
+	struct wl_event_source *frame_timer;
+	bool frame_timer_armed;
+
+	/* What the frame in flight changed, kept for the screen capture until
+	 * the frame is on the screen and the GPU has finished it. */
+	pixman_region32_t capture_damage;
 
 	struct wl_listener screen_destroy_listener;
 };
@@ -269,6 +279,9 @@ handle_screen_destroy(struct wl_listener *listener, void *data)
 	compositor.recover_updates &= ~target->mask;
 	wl_list_remove(&target->view_handler.link);
 	wl_list_remove(&target->screen_destroy_listener.link);
+	if (target->frame_timer)
+		wl_event_source_remove(target->frame_timer);
+	pixman_region32_fini(&target->capture_damage);
 	wld_destroy_surface(target->surface);
 	free(target);
 }
@@ -284,11 +297,89 @@ target_get(struct screen *screen)
 	                : NULL;
 }
 
+/* Whether nothing of a view shows: opaque views above cover all of it. */
+static bool
+view_fully_clipped(struct compositor_view *view)
+{
+	return view->extents.x2 > view->extents.x1 &&
+	       view->extents.y2 > view->extents.y1 &&
+	       pixman_region32_contains_rectangle(&view->clip, &view->extents) ==
+	           PIXMAN_REGION_IN;
+}
+
+static void
+send_frame_callbacks(struct target *target, uint32_t time)
+{
+	struct compositor_view *view;
+
+	/* Only the surface answers a frame event, and only with the callbacks
+	 * it has queued, so skip the handler walk for views with none. */
+	wl_list_for_each(view, &compositor.views, link)
+	{
+		if (!view->visible || !(view->base.screens & target->mask) ||
+		    wl_list_empty(&view->surface->state.frame_callbacks))
+			continue;
+		/*
+		 * A window wholly behind opaque ones draws for nobody. Answering it
+		 * every frame has it rendering at full rate for nothing; once a
+		 * second keeps it alive and its clock moving, and is what it gets.
+		 */
+		if (view_fully_clipped(view)) {
+			if (time - view->clipped_frame_time < 1000)
+				continue;
+			view->clipped_frame_time = time;
+		}
+		view_frame(&view->base, time);
+	}
+}
+
+/* One refresh period of the screen, in milliseconds. */
+static int
+screen_frame_delay(struct screen *screen)
+{
+	struct output *output;
+	uint32_t refresh = 0;
+
+	wl_list_for_each(output, &screen->outputs, link) {
+		if (output->preferred_mode)
+			refresh = MAX(refresh, output->preferred_mode->refresh);
+	}
+	if (!refresh)
+		refresh = 60000; /* millihertz */
+	return MAX(1, (int)((1000000ULL + refresh - 1) / refresh));
+}
+
+static int
+handle_frame_timer(void *data)
+{
+	struct target *target = data;
+
+	target->frame_timer_armed = false;
+	if (swc.active)
+		send_frame_callbacks(target, get_time());
+	return 0;
+}
+
+/*
+ * An update with nothing to draw still owes the clients that asked for a
+ * frame their callback, and at the pace the screen would have set had it
+ * flipped, or a client whose commits change nothing visible spins as fast
+ * as the round trip allows.
+ */
+static void
+target_schedule_frame(struct target *target)
+{
+	if (target->frame_timer_armed || !target->frame_timer)
+		return;
+	if (wl_event_source_timer_update(target->frame_timer,
+	                                 screen_frame_delay(target->screen)) == 0)
+		target->frame_timer_armed = true;
+}
+
 static void
 handle_screen_frame(struct view_handler *handler, uint32_t time)
 {
 	struct target *target = wl_container_of(handler, target, view_handler);
-	struct compositor_view *view;
 	if (!target->first_frame_presented) {
 		fprintf(stderr, "startup: output mask 0x%x first frame presented %.3f ms after compositor initialization began\n",
 		        target->mask, (monotonic_us() - compositor_started) / 1000.0);
@@ -297,21 +388,23 @@ handle_screen_frame(struct view_handler *handler, uint32_t time)
 
 	compositor.pending_flips &= ~target->mask;
 
-	/* Only the surface answers a frame event, and only with the callbacks
-	 * it has queued, so skip the handler walk for views with none. */
-	wl_list_for_each(view, &compositor.views, link)
-	{
-		if (view->visible && view->base.screens & target->mask &&
-		    !wl_list_empty(&view->surface->state.frame_callbacks)) {
-			view_frame(&view->base, time);
-		}
-	}
+	send_frame_callbacks(target, time);
 
 	if (target->current_buffer) {
 		wld_surface_release(target->surface, target->current_buffer);
 	}
 
 	target->current_buffer = target->next_buffer;
+
+	/*
+	 * The capture reads the frame just presented, now that the GPU has
+	 * certainly finished it: reading it back any earlier meant waiting for
+	 * the GPU with the whole compositor stopped.
+	 */
+	if (pixman_region32_not_empty(&target->capture_damage)) {
+		screencopy_handle_damage(target->screen, &target->capture_damage);
+		pixman_region32_clear(&target->capture_damage);
+	}
 
 	/* If we had scheduled updates that couldn't run because we were waiting on
 	 * a page flip, run them now. If the compositor is currently updating, then
@@ -402,6 +495,11 @@ target_new(struct screen *screen)
 	target->current_buffer = NULL;
 	target->next_buffer = NULL;
 	target->mask = screen_mask(screen);
+	target->screen = screen;
+	target->frame_timer =
+	    wl_event_loop_add_timer(swc.event_loop, &handle_frame_timer, target);
+	target->frame_timer_armed = false;
+	pixman_region32_init(&target->capture_damage);
 
 	target->screen_destroy_listener.notify = &handle_screen_destroy;
 	wl_signal_add(&screen->destroy_signal, &target->screen_destroy_listener);
@@ -718,9 +816,11 @@ renderer_attach(struct compositor_view *view, struct wld_buffer *client_buffer)
 				if (proxy_height <= UINT32_MAX - 255) {
 					proxy_height = (proxy_height + 255) & ~255U;
 				}
+				/* Uploaded straight from the client's memory where the
+				 * backend can, mapped and copied into where it cannot. */
 				buffer = wld_create_buffer(
 				    swc.backend->context, proxy_width, proxy_height,
-				    client_buffer->format, WLD_FLAG_MAP);
+				    client_buffer->format, WLD_FLAG_MAP | WLD_FLAG_UPLOAD);
 
 				if (!buffer) {
 					return -ENOMEM;
@@ -760,11 +860,13 @@ renderer_flush_view(struct compositor_view *view)
 	 * view_attach then stores as base.buffer. So base.buffer is non-NULL
 	 * below; detaching clears both and takes the early return.
 	 */
+	struct wld_buffer *client = view->base.buffer;
+	pixman_region32_t full, *region = &view->surface->state.damage;
+	bool mapped, uploaded;
+
 	if (view->buffer == view->base.buffer) {
 		return;
 	}
-
-	wld_set_target_buffer(swc.shm->renderer, view->buffer);
 
 	/*
 	 * A new proxy starts empty, so copying only the damaged region leaves it
@@ -772,19 +874,30 @@ renderer_flush_view(struct compositor_view *view)
 	 * which is allowed, and which wfreeze does. Copy the whole buffer once.
 	 */
 	if (view->proxy_dirty) {
-		pixman_region32_t full;
-
-		pixman_region32_init_rect(&full, 0, 0, view->base.buffer->width,
-		                          view->base.buffer->height);
-		wld_copy_region(swc.shm->renderer, view->base.buffer, 0, 0, &full);
-		pixman_region32_fini(&full);
-		view->proxy_dirty = false;
-	} else {
-		wld_copy_region(swc.shm->renderer, view->base.buffer, 0, 0,
-		                &view->surface->state.damage);
+		pixman_region32_init_rect(&full, 0, 0, client->width, client->height);
+		region = &full;
 	}
 
-	wld_flush(swc.shm->renderer);
+	/*
+	 * Straight from the client's memory into the texture: one copy, by the
+	 * driver. A backend that cannot take pixels that way gets them the long
+	 * way round, a CPU copy into the proxy and its own upload out of it.
+	 */
+	mapped = wld_map(client);
+	uploaded = mapped && client->map &&
+	           wld_buffer_upload(view->buffer, client->map, client->pitch,
+	                             region);
+	if (!uploaded) {
+		wld_set_target_buffer(swc.shm->renderer, view->buffer);
+		wld_copy_region(swc.shm->renderer, client, 0, 0, region);
+		wld_flush(swc.shm->renderer);
+	}
+	if (mapped)
+		wld_unmap(client);
+
+	if (region == &full)
+		pixman_region32_fini(&full);
+	view->proxy_dirty = false;
 }
 
 /* }}} */
@@ -2248,7 +2361,12 @@ calculate_damage(void)
 		/* Add the surface's opaque region, in global coordinates, to the
 		 * accumulated opaque region. Many clients declare none at all. */
 		bool bar_opaque = view->decor.titlebar.enabled && view->base.buffer;
-		if (bar_opaque || pixman_region32_not_empty(&view->surface->state.opaque)) {
+		/* An XRGB buffer has no alpha, and is drawn without blending
+		 * whatever the client declared: what it covers is covered. */
+		bool buffer_opaque = view->base.buffer &&
+		    view->base.buffer->format == WLD_FORMAT_XRGB8888;
+		if (bar_opaque || buffer_opaque ||
+		    pixman_region32_not_empty(&view->surface->state.opaque)) {
 			pixman_region32_copy(&surface_opaque, &view->surface->state.opaque);
 			pixman_region32_translate(&surface_opaque,
 			                          geom->x - view->buffer_offset_x,
@@ -2256,6 +2374,25 @@ calculate_damage(void)
 			pixman_region32_intersect_rect(&surface_opaque, &surface_opaque,
 			                               geom->x, geom->y, geom->width,
 			                               geom->height);
+
+			/* The same rectangle draw_view_buffer paints the buffer into. */
+			if (buffer_opaque) {
+				int64_t x1 = (int64_t)geom->x - view->buffer_offset_x;
+				int64_t y1 = (int64_t)geom->y - view->buffer_offset_y;
+				int64_t x2 = x1 + view->base.buffer->width;
+				int64_t y2 = y1 + view->base.buffer->height;
+
+				if (view->window) {
+					x1 = MAX(x1, geom->x);
+					y1 = MAX(y1, geom->y);
+					x2 = MIN(x2, (int64_t)geom->x + geom->width);
+					y2 = MIN(y2, (int64_t)geom->y + geom->height);
+				}
+				pixman_region32_union_rect(&surface_opaque, &surface_opaque,
+				    clamp_i32(x1), clamp_i32(y1),
+				    span_u32(clamp_i32(x1), clamp_i32(x2)),
+				    span_u32(clamp_i32(y1), clamp_i32(y2)));
+			}
 
 			/* The cached solid bar is opaque too; avoid drawing windows
 			 * behind it. */
@@ -2289,6 +2426,13 @@ calculate_damage(void)
 			pixman_region32_translate(surface_damage,
 			                          geom->x - view->buffer_offset_x,
 			                          geom->y - view->buffer_offset_y);
+
+			/* What is behind an opaque window is not on the screen, so a
+			 * change there is nothing to repaint: a video playing behind a
+			 * maximized window used to redraw that window, and flip the
+			 * screen, at the video's rate. */
+			pixman_region32_subtract(surface_damage, surface_damage,
+			                         &view->clip);
 
 			/* Add the surface damage to the compositor damage. */
 			pixman_region32_union(&compositor.damage, &compositor.damage,
@@ -2368,6 +2512,20 @@ update_screen(struct screen *screen)
 		return;
 	}
 
+	/*
+	 * Nothing on this screen changed: a commit that only asked for a frame,
+	 * or one wholly behind opaque windows. There is no frame to draw, and
+	 * none to flip; the callbacks are still owed, at the pace a flip would
+	 * have set.
+	 */
+	if (!pixman_region32_not_empty(total_damage) &&
+	    compositor.overview_screen != &screen->base &&
+	    compositor.zoom == 1.0f) {
+		target_schedule_frame(target);
+		pixman_region32_fini(&damage);
+		return;
+	}
+
 	/* check if zoom */
 	if (profile_render) frame_draw = frame_finish = 0;
 	if (compositor.overview_screen == &screen->base && !session_lock_active()) {
@@ -2404,7 +2562,9 @@ update_screen(struct screen *screen)
 	if (swap_result == 0) {
 		target->swap_failed = false;
 		compositor.pending_flips |= screen_mask(screen);
-		screencopy_handle_damage(screen, &damage);
+		/* Captured once the flip completes; see handle_screen_frame. */
+		pixman_region32_union(&target->capture_damage,
+		                      &target->capture_damage, &damage);
 	} else {
 		/* This frame will never be presented, so its damage must come back. */
 		target_restore_damage(target, geom);
