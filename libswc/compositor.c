@@ -3135,9 +3135,13 @@ compositor_render_to_shm(struct screen *screen)
 	 */
 	if (swc.backend->renderer && swc.backend->context) {
 		if (!capture_cache.scratch) {
+			uint32_t flags = 0;
+#ifdef ENABLE_DRM
+			flags = WLD_DRM_FLAG_SCANOUT;
+#endif
 			capture_cache.scratch = wld_create_buffer(
 			    swc.backend->context, width, height, WLD_FORMAT_XRGB8888,
-			    WLD_DRM_FLAG_SCANOUT);
+			    flags);
 		}
 		scratch = capture_cache.scratch;
 		if (scratch && wld_set_target_buffer(swc.backend->renderer, scratch))

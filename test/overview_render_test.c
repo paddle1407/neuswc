@@ -38,6 +38,7 @@ static uint32_t pixel(struct wld_buffer *b, unsigned x, unsigned y)
 }
 static struct wld_buffer *imported(struct wld_buffer *b)
 {
+#ifdef ENABLE_DRM
 	if (!gpu) return b;
 	union wld_object fd, modifier;
 	assert(wld_export(b,WLD_DRM_OBJECT_PRIME_FD,&fd));
@@ -49,6 +50,9 @@ static struct wld_buffer *imported(struct wld_buffer *b)
 	assert(copy && !wld_map(copy)); /* A real imported, non-CPU-readable client buffer. */
 	wld_buffer_unreference(b);
 	return copy;
+#else
+	return b;
+#endif
 }
 static void check_gpu_sampling(void)
 {
@@ -85,11 +89,16 @@ int main(int argc, char **argv)
 	gpu = argc == 3 && !strcmp(argv[1], "--gpu");
 	test_context = wld_pixman_context;
 	if (gpu) {
+#ifdef ENABLE_DRM
 		fd = open(argv[2],O_RDWR | O_CLOEXEC);
 		assert(fd >= 0);
 		setenv("WLD_DRM_DRIVER","gbm",1);
 		test_context = wld_drm_create_context(fd);
 		assert(test_context && !wld_drm_is_dumb(test_context));
+#else
+		fprintf(stderr, "--gpu requires the DRM backend\n");
+		return 1;
+#endif
 	}
 	struct wld_renderer *r = test_renderer = wld_create_renderer(test_context);
 	assert(r);

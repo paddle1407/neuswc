@@ -1,11 +1,15 @@
 neuswc
 ------
 
-neuswc is a fork of [swc](https://github.com/michaelforney/swc/) created by [wayland.fyi](https://wayland.fyi). it provides an easy C library interface to make a wayland compositor. it is much smaller than alternatives like wlroots, and easier to use. it is also portable to linux, freebsd, netbsd, and openbsd. if you want to help with that (or anything else) submit a patch to the [mailing list](https://lists.sr.ht/~shrub900/neuswc)
+This repository is the [neuswc fork maintained for charaWC](https://github.com/paddle1407/neuswc).
+It provides a C interface for building a Wayland compositor and is based on
+Michael Forney's [swc](https://github.com/michaelforney/swc), through the
+[wayland.fyi](https://wayland.fyi) neuswc project. The desktop using this
+version is [charaWC](https://github.com/paddle1407/charawc).
 
-you can view a list of some compositors made with neuswc at the [wayland.fyi website.](https://wayland.fyi)
-
-the refrence compositor implementation is [tohu](https://git.sr.ht/~shrub900/tohu): it uses many of the new features and is small and simple to understand. if you want to make your own compositor, it can be a useful place to refrence how things work, or a base to customize.
+Linux DRM/libinput and framebuffer backends are supported by the build.
+The tree also retains BSD wsdisplay/wscons paths; hardware and platform
+validation depends on the environment in which it is built.
 
 
 neu features
@@ -28,25 +32,32 @@ build
 -----
 
 you will need: 
-- A C99-compatible compiler
-- meson or muon
+- A C11-compatible compiler
+- Meson 1.8 or newer and Ninja
 - pkg-config
-- wayland-scanner, wayland-server, wayland-client
-- wayland-server, wayland-client
+- wayland-scanner, wayland-server, wayland-client and wayland-protocols
 - libdrm (if  building with DRM support) 
 - pixman, xkbcommon
-- [neuwld](https://git.sr.ht/~shrub900/neuwld)
+- [neuwld](https://github.com/paddle1407/neuwld)
 - libinput on Linux and wscons on BSD
 - xcb, xcb-composite, xcb-ewmh and xcb-icccm if you want Xwayland support.
 
-to build, i use muon and samu. you can probably do something similar with meson and ninja.
-warning if you use muon, you will need a recent version built from their git for wayland module support, probably not your distro-packaged version. i do:
+The protocol package must provide the XML files used in `protocol/meson.build`,
+including stable tablet v2 and staging ext-workspace. The charaWC CI uses
+wayland-protocols 1.49.
 
 ```
-muon setup build
-samu -C build
-sudo samu -C build install
+meson setup build
+ninja -C build
+meson install -C build
 ```
+
+Configure a Linux framebuffer build with `-Dvideo=fb -Dxwayland=disabled`.
+On Linux, tests are registered with Meson; compiling does not execute them. Run
+`meson test -C build --print-errorlogs` explicitly for rendering, input-mode,
+clipboard authorization and keyboard-focus checks. The default checks do
+not require a desktop session or GPU. The overview rendering executable also
+offers an explicit `--gpu /dev/dri/renderD...` mode in DRM builds.
 
 credits
 -------
@@ -55,5 +66,5 @@ an extremely large thank you to [michael forney](https://mforney.org) for creati
 repositories
 ------------
 
-- [srcdump](https://srcdump.net/shrub/neuswc)
-- [sourcehut](https://git.sr.ht/~shrub900/neuswc)
+- [Current charaWC fork](https://github.com/paddle1407/neuswc)
+- [Historical neuswc sourcehut repository](https://git.sr.ht/~shrub900/neuswc)

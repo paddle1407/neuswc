@@ -87,6 +87,10 @@ input_record_serial(struct wl_client *client, uint32_t serial);
 bool
 input_serial_is_recent(struct wl_client *client, uint32_t serial);
 
+/* Selection changes must answer input delivered to the focused client. */
+bool
+input_can_set_selection(struct wl_client *client, uint32_t serial);
+
 /* }}} */
 
 #endif

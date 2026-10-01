@@ -23,6 +23,7 @@
 
 #include "primary_selection.h"
 #include "event.h"
+#include "input.h"
 #include "internal.h"
 #include "keyboard.h"
 #include "seat.h"
@@ -176,10 +177,7 @@ device_set_selection(struct wl_client *client, struct wl_resource *resource,
 	struct primary_selection_device *device =
 	    wl_resource_get_user_data(resource);
 
-	(void)client;
-	(void)serial;
-
-	if (source == device->selection) {
+	if (!input_can_set_selection(client, serial) || source == device->selection) {
 		return;
 	}
 

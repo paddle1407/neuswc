@@ -25,6 +25,7 @@
 #include "data.h"
 #include "drag.h"
 #include "event.h"
+#include "input.h"
 #include "util.h"
 
 static void
@@ -68,8 +69,11 @@ set_selection(struct wl_client *client, struct wl_resource *resource,
 {
 	struct data_device *data_device = wl_resource_get_user_data(resource);
 
-	/* Check if this data source is already the current selection. */
-	if (data_source == data_device->selection) {
+	if (!input_can_set_selection(client, serial))
+		return;
+	/* NULL must still clear a compositor-owned selection (e.g. Xwayland). */
+	if (data_source == data_device->selection &&
+	    (data_source || !data_device->selection_data)) {
 		return;
 	}
 

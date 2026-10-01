@@ -24,6 +24,9 @@
 #include "input.h"
 #include "compositor.h"
 #include "event.h"
+#include "internal.h"
+#include "keyboard.h"
+#include "seat.h"
 #include "surface.h"
 #include "util.h"
 
@@ -191,4 +194,12 @@ input_serial_is_recent(struct wl_client *client, uint32_t serial)
 	}
 
 	return false;
+}
+
+bool
+input_can_set_selection(struct wl_client *client, uint32_t serial)
+{
+	return client && swc.seat && swc.seat->keyboard &&
+	       swc.seat->keyboard->focus.client == client &&
+	       input_serial_is_recent(client, serial);
 }

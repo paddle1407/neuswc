@@ -1,6 +1,6 @@
 project('swc', 'c',
   version: '0.0',
-  meson_version: '>=1.7.99',
+  meson_version: '>=1.8.0',
   license: 'MIT',
   default_options: [
     'c_std=c11',
@@ -135,6 +135,10 @@ subdir('protocol')
 subdir('cursor')
 subdir('launch')
 subdir('libswc')
+# The regression fixtures currently use Linux input keycodes.
+if os == 'linux'
+  subdir('test')
+endif
 
 if get_option('extra')
   subdir('extra')

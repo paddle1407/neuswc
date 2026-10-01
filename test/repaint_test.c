@@ -4,6 +4,7 @@
 #include "../libswc/compositor.c"
 #include <wld/pixman.h>
 struct swc swc;
+void idle_inhibit_update(void) {}
 static struct swc_backend backend;
 static const uint32_t wallpaper = 0xff101010, bar = 0xff8899aa;
 void wallpaper_repaint(struct screen *s, struct wld_renderer *r, pixman_region32_t *region)
