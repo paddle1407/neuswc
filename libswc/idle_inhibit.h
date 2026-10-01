@@ -11,4 +11,6 @@ void idle_inhibit_manager_finish(void);
 /* Whether any client currently holds the session awake. */
 bool idle_inhibit_active(void);
 
+void idle_inhibit_update(void);
+
 #endif

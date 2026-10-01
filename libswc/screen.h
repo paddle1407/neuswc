@@ -58,6 +58,7 @@ struct screen {
 	const struct swc_screen_handler *handler;
 	void *handler_data;
 	bool configuring;
+	uint64_t lock_presented_generation;
 	struct wallpaper_output *wallpaper;
 
 	struct wl_signal destroy_signal;

@@ -198,7 +198,9 @@ activate(void)
 	struct swc_launch_event event = {.type = SWC_LAUNCH_EVENT_ACTIVATE};
 
 	start_devices();
-	send(sock[0], &event, sizeof(event), 0);
+	struct iovec iov = {&event, sizeof(event)};
+	if (send_fd(sock[0], -1, &iov, 1) != (ssize_t)sizeof(event))
+		die("send activation:");
 	active = true;
 }
 
@@ -207,9 +209,13 @@ deactivate(void)
 {
 	struct swc_launch_event event = {.type = SWC_LAUNCH_EVENT_DEACTIVATE};
 
-	send(sock[0], &event, sizeof(event), 0);
+	struct iovec iov = {&event, sizeof(event)};
+	/* Device revocation must still happen if the compositor disconnected. */
+	bool sent = send_fd(sock[0], -1, &iov, 1) == (ssize_t)sizeof(event);
 	stop_devices(true);
 	active = false;
+	if (!sent)
+		die("send deactivation:");
 }
 
 static void
@@ -246,11 +252,11 @@ device_is_allowed(dev_t rdev)
 	return false;
 }
 
-static void
+static bool
 handle_socket_data(int socket)
 {
 	struct swc_launch_request request;
-	struct swc_launch_event response;
+	struct swc_launch_event response = {0};
 	char path[PATH_MAX];
 	struct iovec request_iov[2] = {
 	    {.iov_base = &request, .iov_len = sizeof(request)},
@@ -260,13 +266,18 @@ handle_socket_data(int socket)
 	    {.iov_base = &response, .iov_len = sizeof(response)},
 	};
 	int fd = -1;
+	bool retained = false;
 	struct stat st;
 	ssize_t size;
 
 	size = receive_fd(socket, &fd, request_iov, 2);
-	if (size == -1 || size == 0 || size < sizeof(request)) {
-		return;
+	/* Requests never carry descriptors. Refuse malformed framing outright. */
+	if (fd >= 0) {
+		close(fd);
+		return false;
 	}
+	if (size < (ssize_t)sizeof(request))
+		return false;
 	size -= sizeof(request);
 
 	response.type = SWC_LAUNCH_EVENT_RESPONSE;
@@ -274,7 +285,8 @@ handle_socket_data(int socket)
 
 	switch (request.type) {
 	case SWC_LAUNCH_REQUEST_OPEN_DEVICE:
-		if (size == 0 || path[size - 1] != '\0') {
+		if (size == 0 || path[size - 1] != '\0' ||
+		    memchr(path, '\0', (size_t)size - 1)) {
 			fprintf(stderr, "path is not NULL terminated\n");
 			goto fail;
 		}
@@ -366,6 +378,7 @@ handle_socket_data(int socket)
 			  }
 			#endif
 			input_fds[num_input_fds++] = fd;
+			retained = true;
 		} else if (device_is_drm(st.st_rdev)) {
 #ifdef ENABLE_DRM
 			if (num_drm_fds == ARRAY_LENGTH(drm_fds)) {
@@ -373,6 +386,7 @@ handle_socket_data(int socket)
 				goto fail;
 			}
 			drm_fds[num_drm_fds++] = fd;
+			retained = true;
 #else
 			fprintf(stderr, "DRM device requested by non-DRM backend\n");
 			goto fail;
@@ -395,7 +409,7 @@ handle_socket_data(int socket)
 		}
 		break;
 	case SWC_LAUNCH_REQUEST_ACTIVATE_VT:
-		if (!active) {
+		if (size != 0 || !active) {
 			goto fail;
 		}
 
@@ -419,8 +433,12 @@ fail:
 		close(fd);
 	}
 	fd = -1;
-done:
-	send_fd(socket, fd, response_iov, 1);
+done: {
+	bool sent = send_fd(socket, fd, response_iov, 1) == (ssize_t)sizeof(response);
+	if (fd >= 0 && !retained)
+		close(fd);
+	return sent;
+}
 }
 
 static void
@@ -643,7 +661,7 @@ error0:
 }
 
 static void
-run(int fd)
+run(int fd, pid_t compositor)
 {
 	struct pollfd fds[] = {
 	    {.fd = fd, .events = POLLIN},
@@ -661,7 +679,13 @@ run(int fd)
 			die("poll:");
 		}
 		if (fds[0].revents) {
-			handle_socket_data(fd);
+			if (!(fds[0].revents & POLLIN) || !handle_socket_data(fd)) {
+				/* Wait for SIGCHLD without repeatedly polling a dead socket. */
+				close(fd);
+				fds[0].fd = -1;
+				stop_devices(false);
+				kill(compositor, SIGTERM);
+			}
 		}
 		if (fds[1].revents) {
 			if (read(sigfd[0], &sig, 1) <= 0) {
@@ -834,7 +858,7 @@ main(int argc, char *argv[])
 	posix_spawnattr_destroy(&attr);
 
 	close(sock[1]);
-	run(sock[0]);
+	run(sock[0], pid);
 
 	return EXIT_SUCCESS;
 }

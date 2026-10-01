@@ -38,7 +38,10 @@ enum {
 	SURFACE_COMMIT_OPAQUE = (1 << 2),
 	SURFACE_COMMIT_INPUT = (1 << 3),
 	SURFACE_COMMIT_FRAME = (1 << 4),
-	SURFACE_COMMIT_GEOMETRY = (1 << 5)
+	SURFACE_COMMIT_GEOMETRY = (1 << 5),
+	SURFACE_COMMIT_SCALE = (1 << 6),
+	SURFACE_COMMIT_TRANSFORM = (1 << 7),
+	SURFACE_COMMIT_DAMAGE_BUFFER = (1 << 8)
 };
 
 struct surface_state {
@@ -55,11 +58,19 @@ struct surface_state {
 	/* The region that accepts input. */
 	pixman_region32_t input;
 
+	int32_t buffer_scale, buffer_transform;
 	struct wl_list frame_callbacks;
 
 	/* subsurface order; double-buffered with surface state. */
 	struct wl_list subsurfaces_below;
 	struct wl_list subsurfaces_above;
+};
+
+struct surface_pending {
+	struct surface_state state;
+	uint32_t commit;
+	int32_t x, y;
+	struct swc_rectangle window_geometry;
 };
 
 struct surface {
@@ -72,16 +83,13 @@ struct surface {
 
 	struct surface_state state;
 
-	struct {
-		struct surface_state state;
-		uint32_t commit;
-		int32_t x, y;
-		struct swc_rectangle window_geometry;
-	} pending;
+	struct surface_pending pending, cached;
+	bool applying_cached;
 
 	struct view *view;
 	struct view_handler view_handler;
 	struct wl_resource *role;
+	const char *role_name;
 	struct wl_listener role_destroy_listener;
 
 	struct subsurface *subsurface;
@@ -120,6 +128,6 @@ surface_commit_pending(struct surface *surface);
  * synchronization held it back, with all of it as damage.
  */
 void
-surface_show_buffer(struct surface *surface, struct wld_buffer *buffer);
+surface_show_buffer(struct surface *surface, struct wld_buffer *buffer, int32_t scale, int32_t transform);
 
 #endif

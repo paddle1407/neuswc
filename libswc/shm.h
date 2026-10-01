@@ -52,4 +52,7 @@ shm_destroy(struct swc_shm *shm);
 bool
 shm_buffer_get_info(struct wl_resource *resource, struct swc_shm_buffer_info *info);
 
+bool shm_buffer_read(struct wl_resource *resource);
+bool shm_buffer_write(struct wl_resource *resource);
+
 #endif

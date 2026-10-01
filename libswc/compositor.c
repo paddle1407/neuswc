@@ -40,6 +40,7 @@
 #include "event.h"
 #include "foreign_toplevel.h"
 #include "internal.h"
+#include "idle_inhibit.h"
 #include "layer_shell.h"
 #include "launch.h"
 #include "output.h"
@@ -137,7 +138,9 @@ span_u32(int32_t a, int32_t b)
 }
 
 struct target {
+	uint64_t submitted_lock_generation;
 	bool first_frame_presented;
+	unsigned failed_presentations;
 	/* Set while the last attempted flip/modeset for this screen failed, so a
 	 * persistently failing output retries once rather than spinning on idle. */
 	bool swap_failed;
@@ -191,6 +194,7 @@ static struct {
 	uint32_t recover_updates;
 
 	bool updating;
+	struct wl_event_source *update_source;
 	struct wl_global *global;
 	bool initialized;
 
@@ -376,17 +380,37 @@ target_schedule_frame(struct target *target)
 		target->frame_timer_armed = true;
 }
 
+static void target_restore_damage(struct target *target, const struct swc_rectangle *geom);
+
 static void
 handle_screen_frame(struct view_handler *handler, uint32_t time)
 {
 	struct target *target = wl_container_of(handler, target, view_handler);
-	if (!target->first_frame_presented) {
+	if (target->screen->planes.primary.frame_presented && !target->first_frame_presented) {
 		fprintf(stderr, "startup: output mask 0x%x first frame presented %.3f ms after compositor initialization began\n",
 		        target->mask, (monotonic_us() - compositor_started) / 1000.0);
 		target->first_frame_presented = true;
 	}
 
 	compositor.pending_flips &= ~target->mask;
+	if (!target->screen->planes.primary.frame_presented) {
+		/* A late KMS/fence failure keeps the old scanout buffer owned. */
+		target->submitted_lock_generation = 0;
+		if (target->next_buffer) wld_surface_release(target->surface, target->next_buffer);
+		target->next_buffer = NULL;
+		pixman_region32_clear(&target->capture_damage);
+		target_restore_damage(target, &target->screen->base.geometry);
+		target->swap_failed = true;
+		if (!target->failed_presentations) {
+			target->failed_presentations = 1;
+			compositor.scheduled_updates |= target->mask;
+			if (!compositor.updating) perform_update(NULL);
+		}
+		return;
+	}
+	target->failed_presentations = 0;
+	session_lock_frame_presented(target->screen, target->submitted_lock_generation);
+	target->submitted_lock_generation = 0;
 
 	send_frame_callbacks(target, time);
 
@@ -473,6 +497,8 @@ target_new(struct screen *screen)
 		goto error0;
 	}
 	target->first_frame_presented = false;
+	target->failed_presentations = 0;
+	target->submitted_lock_generation = 0;
 	target->swap_failed = false;
 
 	target->surface =
@@ -704,6 +730,7 @@ repaint_view(struct target *target, struct compositor_view *view,
 static void
 draw_overlays(struct wld_renderer *renderer, const struct swc_rectangle *target_geom)
 {
+	if (session_lock_active()) return;
 	int32_t tx = (int32_t)target_geom->width;
 	int32_t ty = (int32_t)target_geom->height;
 
@@ -749,7 +776,7 @@ draw_overlays(struct wld_renderer *renderer, const struct swc_rectangle *target_
 #undef CLAMP_LOW
 }
 
-static void
+static bool
 renderer_repaint(struct target *target, pixman_region32_t *damage,
                  pixman_region32_t *base_damage, struct wl_list *views,
                  struct screen *screen)
@@ -762,7 +789,7 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 	      target->view->geometry.x, target->view->geometry.y,
 	      target->view->geometry.width, target->view->geometry.height);
 
-	wld_set_target_surface(swc.backend->renderer, target->surface);
+	if (!wld_set_target_surface(swc.backend->renderer, target->surface)) return false;
 
 	if (pixman_region32_not_empty(base_damage)) {
 		pixman_region32_translate(base_damage, -target->view->geometry.x,
@@ -785,6 +812,7 @@ renderer_repaint(struct target *target, pixman_region32_t *damage,
 		frame_draw = drawn - start;
 		frame_finish = monotonic_us() - drawn;
 	}
+	return true;
 }
 
 static int
@@ -1011,10 +1039,18 @@ update_view_screens(struct compositor_view *view)
 }
 
 static void
+perform_scheduled_update(void *data)
+{
+	compositor.update_source = NULL;
+	perform_update(data);
+}
+
+static void
 schedule_updates(uint32_t screens)
 {
-	if (compositor.scheduled_updates == 0) {
-		wl_event_loop_add_idle(swc.event_loop, &perform_update, NULL);
+	if (!compositor.global) return;
+	if (!compositor.update_source) {
+		compositor.update_source = wl_event_loop_add_idle(swc.event_loop, &perform_scheduled_update, NULL);
 	}
 
 	if (screens == -1) {
@@ -2172,6 +2208,7 @@ view_show(struct compositor_view *view, bool raise)
 	 * zeroed ones a view that has never been painted starts with. */
 	update_extents(view);
 	update_view_screens(view);
+	idle_inhibit_update();
 
 	if (view->window && raise) {
 		raise_window(view);
@@ -2224,6 +2261,7 @@ compositor_view_hide(struct compositor_view *view)
 	damage_below_view(view);
 
 	view_set_screens(&view->base, 0);
+	idle_inhibit_update();
 	view->visible = false;
 	if (swc.seat && swc.seat->pointer && swc.seat->pointer->focus.view == view)
 		pointer_set_focus(swc.seat->pointer, NULL);
@@ -2464,6 +2502,7 @@ calculate_damage(void)
 	}
 
 	pixman_region32_fini(&surface_opaque);
+	idle_inhibit_update();
 }
 
 static void
@@ -2536,7 +2575,7 @@ update_screen(struct screen *screen)
 		wld_flush(swc.backend->renderer);
 		/* Screencopy consumes global damage, including on a second monitor. */
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
-	} else if (compositor.zoom != 1.0f) {
+	} else if (compositor.zoom != 1.0f && !session_lock_active()) {
 		pixman_region32_union_rect(&damage, &damage, geom->x, geom->y, geom->width, geom->height);
 
 		if (!wld_set_target_surface(swc.backend->renderer, target->surface)) {
@@ -2551,15 +2590,21 @@ update_screen(struct screen *screen)
 		pixman_region32_translate(&damage, geom->x, geom->y);
 		pixman_region32_init(&base_damage);
 		pixman_region32_subtract(&base_damage, &damage, &compositor.opaque);
-		renderer_repaint(target, &damage, &base_damage, &compositor.views,
-		                 screen);
+		bool rendered_ok = renderer_repaint(target, &damage, &base_damage, &compositor.views, screen);
 		pixman_region32_fini(&base_damage);
+		if (!rendered_ok) {
+			target_restore_damage(target, geom);
+			if (!target->swap_failed) { target->swap_failed = true; compositor.recover_updates |= screen_mask(screen); }
+			pixman_region32_fini(&damage);
+			return;
+		}
 	}
 
 	uint64_t rendered = profile_render ? monotonic_us() : 0;
 	int swap_result = target_swap_buffers(target);
 	uint64_t submitted = profile_render ? monotonic_us() : 0;
 	if (swap_result == 0) {
+		target->submitted_lock_generation = session_lock_generation();
 		target->swap_failed = false;
 		compositor.pending_flips |= screen_mask(screen);
 		/* Captured once the flip completes; see handle_screen_frame. */
@@ -2906,6 +2951,8 @@ compositor_initialize(void)
 	compositor.updating = false;
 	compositor.zoom = 1.0f;
 	if (!decor_initialize()) {
+		wl_global_destroy(compositor.global);
+		compositor.global = NULL;
 		return false;
 	}
 	pixman_region32_init(&compositor.damage);
@@ -2937,6 +2984,11 @@ compositor_initialize(void)
 void
 compositor_finalize(void)
 {
+	if (compositor.update_source) {
+		wl_event_source_remove(compositor.update_source);
+		compositor.update_source = NULL;
+	}
+	wl_list_remove(&compositor.swc_listener.link);
 	wallpaper_finalize();
 	screencopy_finalize();
 	compositor_release_capture_cache();
@@ -2946,6 +2998,7 @@ compositor_finalize(void)
 	pixman_region32_fini(&compositor.damage);
 	pixman_region32_fini(&compositor.opaque);
 	wl_global_destroy(compositor.global);
+	compositor.global = NULL;
 }
 
 struct wld_buffer *
@@ -3109,7 +3162,7 @@ compositor_render_to_shm(struct screen *screen)
 
 	if (compositor.overview_screen == &screen->base && !session_lock_active()) {
 		render_overview(screen, renderer);
-	} else if (compositor.zoom != 1.0f) {
+	} else if (compositor.zoom != 1.0f && !session_lock_active()) {
 		/*
 		 * The zoomed scene is drawn whole and its views land somewhere other
 		 * than their own geometry, so it has its own pass rather than sharing

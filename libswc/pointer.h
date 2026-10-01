@@ -82,6 +82,9 @@ struct pointer {
 };
 
 bool
+pointer_cursor_serial_valid(struct wl_resource *resource, struct wl_client *client, uint32_t serial);
+
+bool
 pointer_initialize(struct pointer *pointer);
 void
 pointer_finalize(struct pointer *pointer);

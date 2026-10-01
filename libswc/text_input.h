@@ -43,4 +43,6 @@ text_input_finish(void);
 void
 text_input_handle_focus(struct compositor_view *view);
 
+void text_input_suspend(void);
+
 #endif

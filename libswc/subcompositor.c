@@ -27,6 +27,7 @@
 #include "surface.h"
 #include "swc.h"
 #include "util.h"
+#include <string.h>
 
 static bool
 is_descendant_of(struct surface *ancestor, struct surface *surface)
@@ -62,7 +63,8 @@ get_subsurface(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	if (surface->subsurface) {
+	if (surface->subsurface || surface->role ||
+	    (surface->role_name && strcmp(surface->role_name, "wl_subsurface") != 0)) {
 		wl_resource_post_error(resource, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
 		                       "surface already has a subsurface role");
 		return;

@@ -1,6 +1,8 @@
 #include "idle_inhibit.h"
 #include "idle_notify.h"
 #include "surface.h"
+#include "compositor.h"
+#include <wld/wld.h>
 #include "util.h"
 
 #include "idle-inhibit-unstable-v1-server-protocol.h"
@@ -8,18 +10,27 @@
 #include <stdlib.h>
 
 struct inhibitor {
+	struct surface *surface;
 	struct wl_resource *resource;
 	struct wl_listener surface_destroy;
 	struct wl_list link;
 };
 
 static struct wl_list inhibitors;
-static bool inhibitors_ready;
+static bool inhibitors_ready, effective_inhibition;
 
 bool
 idle_inhibit_active(void)
 {
-	return inhibitors_ready && !wl_list_empty(&inhibitors);
+	struct inhibitor *inhibitor;
+	if (!inhibitors_ready) return false;
+	wl_list_for_each(inhibitor, &inhibitors, link) {
+		struct compositor_view *view = compositor_view(inhibitor->surface->view);
+		if (view && view->visible && view->base.buffer && view->base.screens &&
+		    pixman_region32_contains_rectangle(&view->clip, &view->extents) != PIXMAN_REGION_IN)
+			return true;
+	}
+	return false;
 }
 
 static void inhibitor_resource_destroy(struct wl_resource *resource)
@@ -30,7 +41,7 @@ static void inhibitor_resource_destroy(struct wl_resource *resource)
 	wl_list_remove(&inhibitor->surface_destroy.link);
 	wl_list_remove(&inhibitor->link);
 	free(inhibitor);
-	idle_notify_inhibit_changed();
+	idle_inhibit_update();
 }
 
 static void inhibitor_destroy(struct wl_client *client,
@@ -72,13 +83,14 @@ static void create_inhibitor(struct wl_client *client,
 		wl_client_post_no_memory(client);
 		return;
 	}
+	inhibitor->surface = surface;
 	inhibitor->resource = resource;
 	inhibitor->surface_destroy.notify = surface_destroyed;
 	wl_signal_add(&surface->signal.destroy, &inhibitor->surface_destroy);
 	wl_list_insert(&inhibitors, &inhibitor->link);
 	wl_resource_set_implementation(resource, &inhibitor_impl, inhibitor,
 	                               inhibitor_resource_destroy);
-	idle_notify_inhibit_changed();
+	idle_inhibit_update();
 }
 
 static const struct zwp_idle_inhibit_manager_v1_interface manager_impl = {
@@ -102,6 +114,7 @@ static void bind_manager(struct wl_client *client, void *data, uint32_t version,
 struct wl_global *idle_inhibit_manager_create(struct wl_display *display)
 {
 	wl_list_init(&inhibitors);
+	effective_inhibition = false;
 	inhibitors_ready = true;
 	return wl_global_create(display, &zwp_idle_inhibit_manager_v1_interface, 1,
 	                        NULL, bind_manager);
@@ -110,6 +123,18 @@ struct wl_global *idle_inhibit_manager_create(struct wl_display *display)
 void idle_inhibit_manager_finish(void)
 {
 	struct inhibitor *inhibitor, *tmp;
+	if (!inhibitors_ready) return;
 	wl_list_for_each_safe(inhibitor, tmp, &inhibitors, link)
 		wl_resource_destroy(inhibitor->resource);
+	inhibitors_ready = false;
+	effective_inhibition = false;
+}
+
+void
+idle_inhibit_update(void)
+{
+	bool active = idle_inhibit_active();
+	if (active == effective_inhibition) return;
+	effective_inhibition = active;
+	idle_notify_inhibit_changed();
 }

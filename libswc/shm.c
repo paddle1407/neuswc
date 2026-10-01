@@ -34,15 +34,54 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <wayland-server.h>
 #include <wld/pixman.h>
 #include <wld/wld.h>
 
+/* Bound compositor-owned snapshots independently of advertised pool sizes. */
+#define CLIENT_SHM_BYTES (UINT64_C(512) * 1024 * 1024)
+#define TOTAL_SHM_BYTES (UINT64_C(2048) * 1024 * 1024)
+#define CLIENT_SHM_BUFFERS 1024
+struct shm_storage {
+	struct wl_list link;
+	struct wl_listener destroy;
+	struct wl_client *client;
+	uint64_t bytes;
+	unsigned buffers, refs;
+};
+static struct wl_list shm_storage_list = { &shm_storage_list, &shm_storage_list };
+static uint64_t owned_pixel_bytes;
+
+static void storage_unref(struct shm_storage *storage)
+{
+	if (!--storage->refs) { wl_list_remove(&storage->link); free(storage); }
+}
+static void storage_client_destroyed(struct wl_listener *listener, void *data)
+{
+	struct shm_storage *storage = wl_container_of(listener, storage, destroy);
+	(void)data;
+	wl_list_remove(&storage->destroy.link);
+	storage->client = NULL;
+	storage_unref(storage);
+}
+static struct shm_storage *storage_get(struct wl_client *client)
+{
+	struct shm_storage *storage;
+	wl_list_for_each(storage, &shm_storage_list, link)
+		if (storage->client == client) { ++storage->refs; return storage; }
+	storage = calloc(1, sizeof(*storage));
+	if (!storage) return NULL;
+	storage->client = client; storage->refs = 2; /* client + new pool */
+	storage->destroy.notify = storage_client_destroyed;
+	wl_client_add_destroy_listener(client, &storage->destroy);
+	wl_list_insert(&shm_storage_list, &storage->link);
+	return storage;
+}
+
 struct pool_mapping {
-	void *data;
 	uint32_t size;
 	unsigned references;
 };
@@ -50,6 +89,7 @@ struct pool_mapping {
 struct pool {
 	struct wl_resource *resource;
 	struct swc_shm *shm;
+	struct shm_storage *storage;
 	struct pool_mapping *mapping;
 	int fd;
 	bool writable;
@@ -60,6 +100,8 @@ struct pool_reference {
 	struct wld_destructor destructor;
 	struct pool *pool;
 	struct pool_mapping *mapping;
+	void *pixels;
+	uint64_t bytes;
 };
 
 struct shm_buffer_record {
@@ -67,6 +109,7 @@ struct shm_buffer_record {
 	struct wl_listener destroy_listener;
 	struct wl_resource *resource;
 	struct pool *pool;
+	void *pixels;
 	uint32_t offset;
 	int32_t width;
 	int32_t height;
@@ -118,12 +161,10 @@ map_pool(int fd, uint32_t size, bool writable)
 
 	if (!mapping)
 		return NULL;
-	mapping->data = mmap(NULL, size, PROT_READ | (writable ? PROT_WRITE : 0),
-	                     MAP_SHARED, fd, 0);
-	if (mapping->data == MAP_FAILED) {
-		free(mapping);
-		return NULL;
-	}
+	/* Keep bounds/lifetime metadata only. Never map client-controlled files:
+	 * pread/pwrite report truncation as an error rather than raising SIGBUS. */
+	(void)fd;
+	(void)writable;
 	mapping->size = size;
 	mapping->references = 1;
 	++live_mappings;
@@ -137,7 +178,6 @@ unref_mapping(struct pool_mapping *mapping)
 {
 	if (--mapping->references)
 		return;
-	munmap(mapping->data, mapping->size);
 	--live_mappings;
 	live_mapping_bytes -= mapping->size;
 	free(mapping);
@@ -152,6 +192,7 @@ unref_pool(struct pool *pool)
 	}
 
 	unref_mapping(pool->mapping);
+	storage_unref(pool->storage);
 	close(pool->fd);
 	free(pool);
 }
@@ -168,6 +209,10 @@ handle_buffer_destroy(struct wld_destructor *destructor)
 {
 	struct pool_reference *reference =
 	    wl_container_of(destructor, reference, destructor);
+	owned_pixel_bytes -= reference->bytes;
+	reference->pool->storage->bytes -= reference->bytes;
+	--reference->pool->storage->buffers;
+	free(reference->pixels);
 	unref_mapping(reference->mapping);
 	unref_pool(reference->pool);
 	free(reference);
@@ -197,6 +242,7 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 	struct wld_buffer *buffer;
 	struct wl_resource *buffer_resource;
 	union wld_object object;
+	void *pixels;
 
 	if (format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888) {
 		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FORMAT,
@@ -211,7 +257,19 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	object.ptr = (void *)((uintptr_t)pool->mapping->data + offset);
+	uint64_t bytes = (uint64_t)height * stride;
+	if (bytes > CLIENT_SHM_BYTES - pool->storage->bytes ||
+	    bytes > TOTAL_SHM_BYTES - owned_pixel_bytes ||
+	    pool->storage->buffers >= CLIENT_SHM_BUFFERS) {
+		wl_resource_post_no_memory(resource);
+		return;
+	}
+	pixels = calloc((size_t)height, (size_t)stride);
+	if (!pixels) {
+		wl_resource_post_no_memory(resource);
+		return;
+	}
+	object.ptr = pixels;
 	buffer =
 	    wld_import_buffer(pool->shm->context, WLD_OBJECT_DATA, object, width,
 	                      height, format_shm_to_wld(format), stride);
@@ -234,6 +292,7 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 	}
 	record->resource = buffer_resource;
 	record->pool = pool;
+	record->pixels = pixels;
 	record->offset = (uint32_t)offset;
 	record->width = width;
 	record->height = height;
@@ -247,7 +306,12 @@ create_buffer(struct wl_client *client, struct wl_resource *resource,
 		goto error3;
 	}
 
+	reference->bytes = bytes;
+	owned_pixel_bytes += bytes;
+	pool->storage->bytes += bytes;
+	++pool->storage->buffers;
 	reference->pool = pool;
+	reference->pixels = pixels;
 	reference->mapping = pool->mapping;
 	++reference->mapping->references;
 	reference->destructor.destroy = &handle_buffer_destroy;
@@ -264,11 +328,13 @@ error3:
 	}
 error2:
 	wl_resource_destroy(buffer_resource);
+	free(pixels);
 	wl_resource_post_no_memory(resource);
 	return;
 error1:
 	wld_buffer_unreference(buffer);
 error0:
+	free(pixels);
 	wl_resource_post_no_memory(resource);
 }
 
@@ -295,7 +361,7 @@ resize(struct wl_client *client, struct wl_resource *resource, int32_t size)
 	mapping = map_pool(pool->fd, size, pool->writable);
 	if (!mapping) {
 		wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
-		                       "mmap failed: %s", strerror(errno));
+		                       "could not allocate pool metadata: %s", strerror(errno));
 		return;
 	}
 	unref_mapping(pool->mapping);
@@ -326,15 +392,18 @@ create_pool(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 		wl_resource_post_no_memory(resource);
 		goto error0;
 	}
+	pool->storage = storage_get(client);
+	if (!pool->storage) { wl_resource_post_no_memory(resource); goto error1; }
 	pool->shm = shm;
-	pool->writable = true;
-	pool->mapping = map_pool(fd, size, true);
+	int access_mode = fcntl(fd, F_GETFL);
+	pool->writable = access_mode >= 0 && (access_mode & O_ACCMODE) != O_RDONLY;
+	pool->mapping = map_pool(fd, size, pool->writable);
 	if (!pool->mapping) {
 		pool->writable = false;
 		pool->mapping = map_pool(fd, size, false);
 		if (!pool->mapping) {
 			wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
-			                       "mmap failed: %s", strerror(errno));
+			                       "could not allocate pool metadata: %s", strerror(errno));
 			goto error1;
 		}
 	}
@@ -353,6 +422,7 @@ create_pool(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 	return;
 
 error1:
+	if (pool->storage) storage_unref(pool->storage);
 	free(pool);
 error0:
 	close(fd);
@@ -446,7 +516,7 @@ shm_buffer_get_info(struct wl_resource *resource, struct swc_shm_buffer_info *in
 			return false;
 		}
 
-		info->data = (uint8_t *)record->pool->mapping->data + record->offset;
+		info->data = record->pixels;
 		info->width = record->width;
 		info->height = record->height;
 		info->stride = record->stride;
@@ -455,5 +525,59 @@ shm_buffer_get_info(struct wl_resource *resource, struct swc_shm_buffer_info *in
 		return true;
 	}
 
+	return false;
+}
+
+/* Copy the committed pixels into compositor-owned storage. Even a file that
+	* is truncated concurrently cannot fault this process: the system call fails. */
+bool
+shm_buffer_read(struct wl_resource *resource)
+{
+	struct shm_buffer_record *record;
+	if (!resource || !shm_buffer_records_initialized) return true;
+	wl_list_for_each(record, &shm_buffer_records, link) {
+		if (record->resource != resource) continue;
+		size_t done = 0, bytes = (size_t)record->stride * record->height;
+		while (done < bytes) {
+			ssize_t n = pread(record->pool->fd, (char *)record->pixels + done,
+		    bytes - done, (off_t)record->offset + done);
+			if (n < 0 && errno == EINTR) continue;
+			if (n <= 0) {
+				wl_resource_post_error(resource, WL_SHM_ERROR_INVALID_FD,
+		    "shared memory backing file became unreadable or too small");
+				return false;
+			}
+			done += (size_t)n;
+		}
+		return true;
+	}
+	return true;
+}
+
+bool
+shm_buffer_write(struct wl_resource *resource)
+{
+	struct shm_buffer_record *record;
+	if (!resource || !shm_buffer_records_initialized) return false;
+	wl_list_for_each(record, &shm_buffer_records, link) {
+		if (record->resource != resource) continue;
+		if (!record->pool->writable) return false;
+		struct stat st;
+		if (fstat(record->pool->fd, &st) != 0 ||
+		    (uint64_t)record->offset + (uint64_t)record->stride * record->height > (uint64_t)st.st_size)
+			return false;
+		for (int32_t y = 0; y < record->height; ++y) {
+			size_t done = 0, bytes = (size_t)record->width * 4;
+			while (done < bytes) {
+				ssize_t n = pwrite(record->pool->fd,
+		    (char *)record->pixels + (size_t)y * record->stride + done,
+		    bytes - done, (off_t)record->offset + (off_t)y * record->stride + done);
+				if (n < 0 && errno == EINTR) continue;
+				if (n <= 0) return false;
+				done += (size_t)n;
+			}
+		}
+		return true;
+	}
 	return false;
 }

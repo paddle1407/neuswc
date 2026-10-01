@@ -63,16 +63,18 @@ struct pending_buffer;
 
 #define MAX_PENDING_BUFFERS 2
 
+struct syncobj_commit {
+	struct syncobj_point acquire, release;
+	bool has_acquire, has_release;
+};
+
 struct drm_syncobj_surface {
 	struct wl_resource *resource;
 	struct surface *surface;
 	struct wl_listener surface_destroy_listener;
 
 	/* Staged by set_acquire_point/set_release_point for the next commit. */
-	struct {
-		struct syncobj_point acquire, release;
-		bool has_acquire, has_release;
-	} pending;
+	struct syncobj_commit pending, cached;
 
 	/* The release point owed for the buffer on screen. */
 	struct syncobj_point release;
@@ -92,6 +94,7 @@ struct drm_syncobj_surface {
 	 */
 	struct pending_buffer *queue[MAX_PENDING_BUFFERS];
 	unsigned queued;
+	bool failed_acquire;
 
 	/*
 	 * The buffer on screen when it is no longer the surface's committed
@@ -110,7 +113,9 @@ struct pending_buffer {
 	struct wl_event_source *source;
 	int fd;
 	/* Signalled once the buffer is done with, whether shown or not. */
-	struct syncobj_point release;
+	struct syncobj_point release, acquire;
+	struct wld_buffer *buffer;
+	int32_t scale, transform;
 };
 
 static struct syncobj_timeline *
@@ -194,7 +199,7 @@ point_export_sync_file(const struct syncobj_point *point)
  */
 #define ACQUIRE_WAIT_MS 50
 
-static void
+static bool
 point_wait_cpu(const struct syncobj_point *point)
 {
 	uint64_t value = point->value;
@@ -203,12 +208,12 @@ point_wait_cpu(const struct syncobj_point *point)
 	int64_t deadline;
 
 	if (!point->timeline) {
-		return;
+		return false;
 	}
 	handle = point->timeline->handle;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-		return;
+		return false;
 	}
 	deadline = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec +
 	           ACQUIRE_WAIT_MS * 1000000;
@@ -228,7 +233,9 @@ point_wait_cpu(const struct syncobj_point *point)
 			WARNING("Timed out waiting for a DRM syncobj acquire point: %s\n",
 			        strerror(errno));
 		}
+		return false;
 	}
+	return true;
 }
 
 /* Whether a descriptor has become readable, without waiting for it to. */
@@ -242,7 +249,7 @@ fd_readable(int fd)
 		ret = poll(&pollfd, 1, 0);
 	} while (ret < 0 && errno == EINTR);
 
-	return ret != 0;
+	return ret > 0 && (pollfd.revents & POLLIN) && !(pollfd.revents & POLLERR);
 }
 
 /*
@@ -276,6 +283,29 @@ point_signal(struct syncobj_point *point)
  * reading. Instead the renderer's fence is attached to the point, and the
  * kernel signals it when that fence does.
  */
+static struct wl_list deferred_releases = { &deferred_releases, &deferred_releases };
+struct deferred_point_release {
+	struct wl_list link;
+	struct syncobj_point point;
+	struct wl_event_source *source;
+	int fd;
+};
+
+static int
+complete_point_release(int fd, uint32_t mask, void *data)
+{
+	struct deferred_point_release *release = data;
+	(void)mask;
+	if (fd_readable(fd)) point_signal(&release->point);
+	else if (!(mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP))) return 0;
+	point_clear(&release->point);
+	wl_event_source_remove(release->source);
+	close(release->fd);
+	wl_list_remove(&release->link);
+	free(release);
+	return 0;
+}
+
 static void
 point_release(struct syncobj_point *point)
 {
@@ -297,12 +327,27 @@ point_release(struct syncobj_point *point)
 			                       point->value, binary, 0, 0) == 0;
 			drmSyncobjDestroy(swc.drm->fd, binary);
 		}
-		if (!attached) {
-			/* Better a stall than a client drawing under the GPU's reads. */
-			struct pollfd pollfd = {.fd = fence, .events = POLLIN};
-
-			poll(&pollfd, 1, ACQUIRE_WAIT_MS);
+		if (!attached && !fd_readable(fence)) {
+			struct deferred_point_release *release = calloc(1, sizeof(*release));
+			if (release) {
+				release->fd = fence;
+				point_set(&release->point, point->timeline, point->value);
+				release->source = wl_event_loop_add_fd(swc.event_loop, fence, WL_EVENT_READABLE,
+		    complete_point_release, release);
+				if (release->source) {
+		    wl_list_insert(&deferred_releases, &release->link);
+		    point_clear(point); return;
+				}
+				point_clear(&release->point);
+				free(release);
+			}
+			/* Resource exhaustion must never claim that in-flight GPU reads ended. */
+			WARNING("Could not defer DRM release; leaving its point unsignalled\n");
+			close(fence);
+			point_clear(point);
+			return;
 		}
+
 		close(fence);
 	}
 
@@ -394,13 +439,13 @@ pending_free(struct pending_buffer *pending)
 	if (pending->source) {
 		wl_event_source_remove(pending->source);
 	}
-	if (pending->fd >= 0) {
-		close(pending->fd);
-	}
+	if (pending->fd >= 0) close(pending->fd);
 	if (pending->resource) {
 		wl_list_remove(&pending->destroy_listener.link);
 	}
 	point_clear(&pending->release);
+	point_clear(&pending->acquire);
+	if (pending->buffer) wld_buffer_unreference(pending->buffer);
 	free(pending);
 }
 
@@ -461,12 +506,16 @@ queue_show(struct drm_syncobj_surface *synced, unsigned index)
 
 	/* The committed buffer's release belongs to the commit that replaces it;
 	 * any older one's is ours. */
-	if (resource != surface->state.buffer_resource) {
+	if (resource && resource != surface->state.buffer_resource) {
 		held_set(synced, resource);
 	}
 
+	struct wld_buffer *buffer = pending->buffer;
+	wld_buffer_reference(buffer);
+	int32_t scale = pending->scale, transform = pending->transform;
 	pending_free(pending);
-	surface_show_buffer(surface, wayland_buffer_get(resource));
+	surface_show_buffer(surface, buffer, scale, transform);
+	wld_buffer_unreference(buffer);
 }
 
 static unsigned
@@ -486,10 +535,12 @@ handle_acquire(int fd, uint32_t mask, void *data)
 	struct pending_buffer *pending = data;
 	struct drm_syncobj_surface *synced = pending->synced;
 
-	(void)fd;
-	(void)mask;
-	/* An error on the descriptor is final too: waiting longer cannot help. */
-	queue_show(synced, queue_index(synced, pending));
+	if (fd_readable(fd)) queue_show(synced, queue_index(synced, pending));
+	else if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) {
+		if (pending->buffer == synced->surface->state.buffer) synced->failed_acquire = true;
+		wl_client_post_implementation_error(wl_resource_get_client(synced->surface->resource), "DRM acquire fence failed");
+		queue_drop(synced, queue_index(synced, pending), true);
+	}
 	return 0;
 }
 
@@ -498,13 +549,11 @@ handle_pending_destroy(struct wl_listener *listener, void *data)
 {
 	struct pending_buffer *pending =
 	    wl_container_of(listener, pending, destroy_listener);
-	struct drm_syncobj_surface *synced = pending->synced;
-
 	(void)data;
-	/* Nothing left to show. The client keeps the old contents on screen. */
+	/* The resource is gone, but its pixels remain committed. The client keeps the old contents on screen. */
 	wl_list_remove(&pending->destroy_listener.link);
 	pending->resource = NULL;
-	queue_drop(synced, queue_index(synced, pending), false);
+	/* The committed pixels and timeline points outlive the wl_buffer object. */
 }
 
 /*
@@ -604,6 +653,26 @@ acquire_ready(const struct syncobj_point *point, int *fd_out)
 	return false;
 }
 
+static int
+poll_acquire(void *data)
+{
+	struct pending_buffer *pending = data;
+	uint32_t handle = pending->acquire.timeline->handle;
+	uint64_t value = pending->acquire.value;
+	if (drmSyncobjTimelineWait(swc.drm->fd, &handle, &value, 1, 0,
+		    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL) == 0)
+		queue_show(pending->synced, queue_index(pending->synced, pending));
+	else if (errno == ETIME || errno == EBUSY || errno == EINTR)
+		wl_event_source_timer_update(pending->source, 16);
+	else {
+		struct drm_syncobj_surface *synced = pending->synced;
+		if (pending->buffer == synced->surface->state.buffer) synced->failed_acquire = true;
+		wl_client_post_implementation_error(wl_resource_get_client(synced->surface->resource), "DRM acquire point wait failed");
+		queue_drop(synced, queue_index(synced, pending), true);
+	}
+	return 0;
+}
+
 /*
  * Queue the surface's committed buffer to go up once 'fd' is readable. False,
  * with nothing changed, if the event loop cannot watch it.
@@ -613,13 +682,15 @@ queue_add(struct drm_syncobj_surface *synced, int fd)
 {
 	struct surface *surface = synced->surface;
 	struct pending_buffer *pending;
+	struct syncobj_commit *commit = surface->applying_cached ? &synced->cached : &synced->pending;
 
 	if (!(pending = calloc(1, sizeof(*pending)))) {
 		return false;
 	}
 
-	pending->source = wl_event_loop_add_fd(swc.event_loop, fd, WL_EVENT_READABLE,
-	                                       &handle_acquire, pending);
+	pending->source = fd >= 0 ?
+	    wl_event_loop_add_fd(swc.event_loop, fd, WL_EVENT_READABLE, &handle_acquire, pending) :
+	    wl_event_loop_add_timer(swc.event_loop, poll_acquire, pending);
 	if (!pending->source) {
 		free(pending);
 		return false;
@@ -629,10 +700,16 @@ queue_add(struct drm_syncobj_surface *synced, int fd)
 	pending->fd = fd;
 	pending->resource = surface->state.buffer_resource;
 	pending->destroy_listener.notify = &handle_pending_destroy;
-	wl_resource_add_destroy_listener(pending->resource,
-	                                 &pending->destroy_listener);
-	point_set(&pending->release, synced->pending.release.timeline,
-	          synced->pending.release.value);
+	if (pending->resource) wl_resource_add_destroy_listener(pending->resource, &pending->destroy_listener);
+	pending->buffer = surface->state.buffer;
+	wld_buffer_reference(pending->buffer);
+	struct surface_pending *state = surface->applying_cached ? &surface->cached : &surface->pending;
+	pending->scale = (state->commit & SURFACE_COMMIT_SCALE) ? state->state.buffer_scale : surface->state.buffer_scale;
+	pending->transform = (state->commit & SURFACE_COMMIT_TRANSFORM) ? state->state.buffer_transform : surface->state.buffer_transform;
+	point_set(&pending->acquire, commit->acquire.timeline, commit->acquire.value);
+	if (fd < 0) wl_event_source_timer_update(pending->source, 16);
+	point_set(&pending->release, commit->release.timeline,
+	          commit->release.value);
 
 	/* The oldest stays put; the newest replaces whatever was queued after. */
 	if (synced->queued == MAX_PENDING_BUFFERS) {
@@ -643,7 +720,7 @@ queue_add(struct drm_syncobj_surface *synced, int fd)
 	return true;
 }
 
-/* Put up the newest waiting buffer now, after at most a bounded wait. */
+/* Put up the newest waiting buffer only if its acquire fence already signalled. */
 static void
 queue_settle(struct drm_syncobj_surface *synced)
 {
@@ -655,7 +732,7 @@ queue_settle(struct drm_syncobj_surface *synced)
 
 	pollfd.fd = synced->queue[synced->queued - 1]->fd;
 	pollfd.events = POLLIN;
-	poll(&pollfd, 1, ACQUIRE_WAIT_MS);
+	if (pollfd.fd >= 0 && fd_readable(pollfd.fd))
 	queue_show(synced, synced->queued - 1);
 }
 
@@ -677,33 +754,27 @@ handle_surface_destroy(struct wl_listener *listener, void *data)
 	synced->surface = NULL;
 	wl_list_remove(&synced->surface_destroy_listener.link);
 	wl_list_init(&synced->surface_destroy_listener.link);
+	if (!synced->resource) {
+		point_clear(&synced->pending.acquire);
+		point_clear(&synced->pending.release);
+		point_clear(&synced->cached.acquire);
+		point_signal(&synced->cached.release);
+		free(synced);
+	}
 }
 
 static void
 destroy_syncobj_surface_resource(struct wl_resource *resource)
 {
 	struct drm_syncobj_surface *synced = wl_resource_get_user_data(resource);
-
-	if (synced->surface) {
-		struct surface *surface = synced->surface;
-
-		/*
-		 * The surface outlives this object, but the outstanding release points
-		 * live here and are about to be freed, so they have to be settled now
-		 * rather than on the commit that replaces the buffer. A buffer still
-		 * waiting for its acquire point gets a bounded wait and goes up; the
-		 * client asked to stop synchronizing, and that is the last chance.
-		 * The buffer left on screen is released marginally earlier than the
-		 * protocol promises, since nothing here will be around to do it later.
-		 */
-		queue_settle(synced);
-		shown_release(synced);
-		surface->synced = NULL;
-		wl_list_remove(&synced->surface_destroy_listener.link);
-	}
-
+	synced->resource = NULL;
 	point_clear(&synced->pending.acquire);
 	point_clear(&synced->pending.release);
+	memset(&synced->pending, 0, sizeof(synced->pending));
+	/* Committed acquire/release obligations survive destruction of this object. */
+	if (synced->surface) return;
+	point_clear(&synced->cached.acquire);
+	point_clear(&synced->cached.release);
 	free(synced);
 }
 
@@ -779,14 +850,15 @@ get_surface(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 	struct surface *surface = wl_resource_get_user_data(surface_resource);
 	struct drm_syncobj_surface *synced;
 
-	if (surface->synced) {
+	if (surface->synced && surface->synced->resource) {
 		wl_resource_post_error(
 		    resource, WP_LINUX_DRM_SYNCOBJ_MANAGER_V1_ERROR_SURFACE_EXISTS,
 		    "the surface already has a synchronization object");
 		return;
 	}
 
-	if (!(synced = calloc(1, sizeof(*synced)))) {
+	synced = surface->synced;
+	if (!synced && !(synced = calloc(1, sizeof(*synced)))) {
 		wl_resource_post_no_memory(resource);
 		return;
 	}
@@ -795,7 +867,7 @@ get_surface(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 	    client, &wp_linux_drm_syncobj_surface_v1_interface,
 	    wl_resource_get_version(resource), id);
 	if (!synced->resource) {
-		free(synced);
+		if (!synced->surface) free(synced);
 		wl_resource_post_no_memory(resource);
 		return;
 	}
@@ -804,9 +876,10 @@ get_surface(struct wl_client *client, struct wl_resource *resource, uint32_t id,
 	                               synced,
 	                               &destroy_syncobj_surface_resource);
 
+	bool newly_created = !synced->surface;
 	synced->surface = surface;
 	synced->surface_destroy_listener.notify = &handle_surface_destroy;
-	wl_signal_add(&surface->signal.destroy, &synced->surface_destroy_listener);
+	if (newly_created) wl_signal_add(&surface->signal.destroy, &synced->surface_destroy_listener);
 	surface->synced = synced;
 }
 
@@ -907,17 +980,19 @@ bool
 drm_syncobj_surface_check_commit(struct surface *surface)
 {
 	struct drm_syncobj_surface *synced = surface->synced;
+	struct surface_pending *state = surface->applying_cached ? &surface->cached : &surface->pending;
+	struct syncobj_commit *commit = synced ? (surface->applying_cached ? &synced->cached : &synced->pending) : NULL;
 	bool attached, has_buffer;
 
-	if (!synced) {
+	if (!synced || (!synced->resource && !commit->has_acquire && !commit->has_release)) {
 		return true;
 	}
 
-	attached = surface->pending.commit & SURFACE_COMMIT_ATTACH;
-	has_buffer = attached && surface->pending.state.buffer_resource;
+	attached = state->commit & SURFACE_COMMIT_ATTACH;
+	has_buffer = attached && state->state.buffer;
 
 	if (!has_buffer) {
-		if (synced->pending.has_acquire || synced->pending.has_release) {
+		if (commit->has_acquire || commit->has_release) {
 			wl_resource_post_error(
 			    synced->resource,
 			    WP_LINUX_DRM_SYNCOBJ_SURFACE_V1_ERROR_NO_BUFFER,
@@ -927,7 +1002,7 @@ drm_syncobj_surface_check_commit(struct surface *surface)
 		return true;
 	}
 
-	if (!synced->pending.has_acquire) {
+	if (!commit->has_acquire) {
 		wl_resource_post_error(
 		    synced->resource,
 		    WP_LINUX_DRM_SYNCOBJ_SURFACE_V1_ERROR_NO_ACQUIRE_POINT,
@@ -935,7 +1010,7 @@ drm_syncobj_surface_check_commit(struct surface *surface)
 		return false;
 	}
 
-	if (!synced->pending.has_release) {
+	if (!commit->has_release) {
 		wl_resource_post_error(
 		    synced->resource,
 		    WP_LINUX_DRM_SYNCOBJ_SURFACE_V1_ERROR_NO_RELEASE_POINT,
@@ -943,8 +1018,8 @@ drm_syncobj_surface_check_commit(struct surface *surface)
 		return false;
 	}
 
-	if (synced->pending.acquire.timeline == synced->pending.release.timeline &&
-	    synced->pending.acquire.value >= synced->pending.release.value) {
+	if (commit->acquire.timeline == commit->release.timeline &&
+	    commit->acquire.value >= commit->release.value) {
 		wl_resource_post_error(
 		    synced->resource,
 		    WP_LINUX_DRM_SYNCOBJ_SURFACE_V1_ERROR_CONFLICTING_POINTS,
@@ -961,7 +1036,7 @@ drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
                                  struct wl_resource **replaced)
 {
 	struct drm_syncobj_surface *synced = surface->synced;
-	bool can_defer;
+	struct syncobj_commit *commit = synced ? (surface->applying_cached ? &synced->cached : &synced->pending) : NULL;
 	int fd;
 
 	if (!synced) {
@@ -973,6 +1048,7 @@ drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
 		return true;
 	}
 
+	synced->failed_acquire = false;
 	if (surface->state.buffer_resource) {
 		forget_resource(synced, surface->state.buffer_resource);
 	}
@@ -981,12 +1057,12 @@ drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
 		*replaced = NULL;
 	}
 
-	if (!synced->pending.has_acquire) {
+	if (!commit->has_acquire) {
 		/* A NULL buffer was attached; there is nothing left to wait for. */
 		queue_clear(synced);
 		shown_release(synced);
-		point_clear(&synced->pending.release);
-		synced->pending.has_release = false;
+		point_clear(&commit->release);
+		commit->has_release = false;
 		return true;
 	}
 
@@ -998,55 +1074,73 @@ drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
 	if (surface->state.buffer &&
 	    (wld_capabilities(swc.backend->renderer, surface->state.buffer) &
 	     WLD_CAPABILITY_READ) &&
-	    !acquire_ready(&synced->pending.acquire, &fd)) {
-		/*
-		 * Keeping the old buffer up is only possible when there is one. The
-		 * first buffer of a surface, before it has a view, still has to be
-		 * waited for here, within a bound.
-		 */
-		can_defer = surface->view && surface->view->buffer;
-		if (fd >= 0 && can_defer && queue_add(synced, fd)) {
+	    !acquire_ready(&commit->acquire, &fd)) {
+		/* The first frame may wait behind a blank view too. */
+		if (queue_add(synced, fd)) {
 			/* The replaced buffer stays on screen, so its release waits. */
 			if (*replaced &&
-			    wayland_buffer_get(*replaced) == surface->view->buffer) {
+			    surface->view && wayland_buffer_get(*replaced) == surface->view->buffer) {
 				held_clear(synced, true);
 				held_set(synced, *replaced);
 				*replaced = NULL;
 			}
 
-			point_clear(&synced->pending.acquire);
-			synced->pending.has_acquire = false;
-			point_clear(&synced->pending.release);
-			synced->pending.has_release = false;
+			point_clear(&commit->acquire);
+			commit->has_acquire = false;
+			point_clear(&commit->release);
+			commit->has_release = false;
 			return false;
 		}
 
 		if (fd >= 0) {
 			close(fd);
 		}
-		point_wait_cpu(&synced->pending.acquire);
+		if (!point_wait_cpu(&commit->acquire)) {
+			synced->failed_acquire = true;
+			wl_resource_post_no_memory(surface->resource);
+			point_clear(&commit->acquire); commit->has_acquire = false;
+			point_signal(&commit->release); commit->has_release = false;
+			return false;
+		}
 	}
 
 	/* Ready now, so it goes up at once, over anything still waiting. */
 	queue_clear(synced);
 	shown_release(synced);
 
-	point_clear(&synced->pending.acquire);
-	synced->pending.has_acquire = false;
+	point_clear(&commit->acquire);
+	commit->has_acquire = false;
 
-	point_set(&synced->release, synced->pending.release.timeline,
-	          synced->pending.release.value);
+	point_set(&synced->release, commit->release.timeline,
+	          commit->release.value);
 	synced->has_release = true;
-	point_clear(&synced->pending.release);
-	synced->pending.has_release = false;
+	point_clear(&commit->release);
+	commit->has_release = false;
 
 	return true;
 }
 
 void
+drm_syncobj_surface_cache_commit(struct surface *surface)
+{
+	struct drm_syncobj_surface *synced = surface->synced;
+	if (!synced || !(surface->pending.commit & SURFACE_COMMIT_ATTACH)) return;
+	point_clear(&synced->cached.acquire);
+	point_signal(&synced->cached.release);
+	synced->cached = synced->pending;
+	memset(&synced->pending, 0, sizeof(synced->pending));
+}
+
+bool
+drm_syncobj_surface_buffer_ready(struct surface *surface)
+{
+	return !surface->synced || (!surface->synced->failed_acquire && surface->synced->queued == 0);
+}
+
+void
 drm_syncobj_surface_settle(struct surface *surface)
 {
-	/* Somebody is about to show the committed buffer regardless. */
+	/* Preserve a blank/old image unless its newest committed buffer is ready. */
 	if (surface->synced) {
 		queue_settle(surface->synced);
 	}
@@ -1063,6 +1157,22 @@ drm_syncobj_surface_finish(struct surface *surface)
 
 	queue_clear(synced);
 	shown_release(synced);
+	point_clear(&synced->cached.acquire);
+	point_signal(&synced->cached.release);
+}
+
+void
+drm_syncobj_manager_finish(void)
+{
+	struct deferred_point_release *release, *tmp;
+	wl_list_for_each_safe(release, tmp, &deferred_releases, link) {
+		if (fd_readable(release->fd)) point_signal(&release->point);
+		point_clear(&release->point);
+		wl_event_source_remove(release->source);
+		close(release->fd);
+		wl_list_remove(&release->link);
+		free(release);
+	}
 }
 
 /* }}} */

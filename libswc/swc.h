@@ -882,6 +882,8 @@ swc_add_axis_binding(uint32_t modifiers, uint32_t axis,
  * server of new windows, screens and input devices.
  */
 struct swc_manager {
+	/* Privileged text/input access; absent callback denies input methods. */
+	bool (*authorize_input_method)(pid_t pid);
 	/**
 	 * Called when a new screen is created.
 	 */

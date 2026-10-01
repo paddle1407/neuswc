@@ -66,6 +66,8 @@ struct primary_plane {
 	int fence_fd;
 	uint32_t fence_fb;
 #endif
+	struct wl_event_source *frame_timer;
+	bool frame_presented;
 	struct wl_listener swc_listener;
 };
 

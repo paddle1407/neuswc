@@ -250,6 +250,10 @@ capture(struct wl_client *client, struct wl_resource *resource,
 	wld_unmap(shm_buffer);
 	wld_buffer_unreference(shm_buffer);
 
+	if (!shm_buffer_write(buffer_resource)) {
+		swc_snap_send_failed(resource, SWC_SNAP_FAILURE_REASON_INTERNAL);
+		return;
+	}
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	swc_snap_send_ready(resource, (uint32_t)ts.tv_sec, (uint32_t)ts.tv_nsec);
 }

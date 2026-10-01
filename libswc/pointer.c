@@ -223,6 +223,33 @@ swc_pointer_send_axis(uint32_t time, uint32_t axis, int32_t value120)
 	pointer->client_axis_source = -1;
 }
 
+struct pointer_resource {
+	struct wl_list link;
+	struct wl_resource *resource;
+	uint32_t enter_serial;
+	bool entered;
+};
+static struct wl_list pointer_resources = { &pointer_resources, &pointer_resources };
+
+static struct pointer_resource *
+find_pointer_resource(struct wl_resource *resource)
+{
+	struct pointer_resource *record;
+	wl_list_for_each(record, &pointer_resources, link)
+		if (record->resource == resource) return record;
+	return NULL;
+}
+
+bool
+pointer_cursor_serial_valid(struct wl_resource *resource, struct wl_client *client,
+                            uint32_t serial)
+{
+	struct pointer_resource *record = find_pointer_resource(resource);
+	struct pointer *pointer = record ? wl_resource_get_user_data(resource) : NULL;
+	return record && record->entered && serial == record->enter_serial && pointer &&
+		    pointer->focus.client == client && pointer->focus.view;
+}
+
 static void
 enter(struct input_focus_handler *handler, struct wl_list *resources,
       struct compositor_view *view)
@@ -248,6 +275,8 @@ enter(struct input_focus_handler *handler, struct wl_list *resources,
 	surface_x = pointer->x - wl_fixed_from_int(origin_x);
 	surface_y = pointer->y - wl_fixed_from_int(origin_y);
 	wl_resource_for_each(resource, resources) {
+		struct pointer_resource *record = find_pointer_resource(resource);
+		if (record) { record->enter_serial = serial; record->entered = true; }
 		wl_pointer_send_enter(resource, serial, view->surface->resource, surface_x, surface_y);
 		if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
 			wl_pointer_send_frame(resource);
@@ -263,6 +292,8 @@ leave(struct input_focus_handler *handler, struct wl_list *resources,
 
 	serial = wl_display_next_serial(swc.display);
 	wl_resource_for_each(resource, resources) {
+		struct pointer_resource *record = find_pointer_resource(resource);
+		if (record) record->entered = false;
 		wl_pointer_send_leave(resource, serial, view->surface->resource);
 		if (wl_resource_get_version(resource) >= WL_POINTER_FRAME_SINCE_VERSION)
 			wl_pointer_send_frame(resource);
@@ -913,9 +944,7 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 	struct pointer *pointer = wl_resource_get_user_data(resource);
 	struct surface *surface;
 
-	(void)serial;
-
-	if (!pointer || client != pointer->focus.client) {
+	if (!pointer_cursor_serial_valid(resource, client, serial)) {
 		return;
 	}
 
@@ -926,6 +955,11 @@ set_cursor(struct wl_client *client, struct wl_resource *resource,
 	}
 
 	surface = surface_resource ? wl_resource_get_user_data(surface_resource) : NULL;
+	if (surface && (!surface->role || !surface->role_name || strcmp(surface->role_name, "wl_pointer") != 0) &&
+	    !surface_set_role(surface, resource)) {
+		wl_resource_post_error(resource, WL_POINTER_ERROR_ROLE, "surface already has another role");
+		return;
+	}
 	if (surface && surface == pointer->cursor.surface) {
 		/* A client may select the same cursor on every motion event. Its
 		 * pixels change on surface commit, not on set_cursor. */
@@ -974,6 +1008,8 @@ unbind(struct wl_resource *resource)
 	struct pointer *pointer = wl_resource_get_user_data(resource);
 	if (pointer)
 		input_focus_remove_resource(&pointer->focus, resource);
+	struct pointer_resource *record = find_pointer_resource(resource);
+	if (record) { wl_list_remove(&record->link); free(record); }
 }
 
 struct wl_resource *
@@ -981,12 +1017,17 @@ pointer_bind(struct pointer *pointer, struct wl_client *client,
              uint32_t version, uint32_t id)
 {
 	struct wl_resource *client_resource;
+	struct pointer_resource *record = calloc(1, sizeof(*record));
+	if (!record) return NULL;
 
 	client_resource =
 	    wl_resource_create(client, &wl_pointer_interface, version, id);
 	if (!client_resource) {
+		free(record);
 		return NULL;
 	}
+	record->resource = client_resource;
+	wl_list_insert(&pointer_resources, &record->link);
 	wl_resource_set_implementation(client_resource, &pointer_impl, pointer,
 	                               &unbind);
 	input_focus_add_resource(&pointer->focus, client_resource);

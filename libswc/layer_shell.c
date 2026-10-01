@@ -175,16 +175,16 @@ shrink_box(pixman_box32_t *box, uint32_t edge, int32_t amount)
 
 	switch (edge) {
 	case ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP:
-		box->y1 = MIN(box->y1 + amount, box->y2);
+		box->y1 = MIN((int64_t)box->y1 + amount, box->y2);
 		break;
 	case ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM:
-		box->y2 = MAX(box->y2 - amount, box->y1);
+		box->y2 = MAX((int64_t)box->y2 - amount, box->y1);
 		break;
 	case ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT:
-		box->x1 = MIN(box->x1 + amount, box->x2);
+		box->x1 = MIN((int64_t)box->x1 + amount, box->x2);
 		break;
 	case ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT:
-		box->x2 = MAX(box->x2 - amount, box->x1);
+		box->x2 = MAX((int64_t)box->x2 - amount, box->x1);
 		break;
 	default:
 		break;
@@ -197,8 +197,8 @@ rectangle_from_box(const pixman_box32_t *box)
 	return (struct swc_rectangle){
 	    .x = box->x1,
 	    .y = box->y1,
-	    .width = (uint32_t)MAX(box->x2 - box->x1, 0),
-	    .height = (uint32_t)MAX(box->y2 - box->y1, 0),
+	    .width = (uint32_t)MAX((int64_t)box->x2 - box->x1, 0),
+	    .height = (uint32_t)MAX((int64_t)box->y2 - box->y1, 0),
 	};
 }
 
@@ -208,37 +208,38 @@ update_position(struct layer_surface *surface,
 {
 	const struct swc_rectangle *view = &surface->view->base.geometry;
 	const struct layer_surface_state *state = &surface->current;
-	int32_t x, y;
+	int64_t x, y;
 
 	if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) &&
 	    !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT)) {
-		x = bounds->x + state->margin.left;
+		x = (int64_t)bounds->x + state->margin.left;
 	} else if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT) &&
 	           !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT)) {
-		x = bounds->x + (int32_t)bounds->width - (int32_t)view->width -
+		x = (int64_t)bounds->x + (int64_t)bounds->width - (int64_t)view->width -
 		    state->margin.right;
 	} else {
-		x = bounds->x +
-		    ((int32_t)bounds->width - (int32_t)view->width +
+		x = (int64_t)bounds->x +
+		    ((int64_t)bounds->width - (int64_t)view->width +
 		     state->margin.left - state->margin.right) /
 		        2;
 	}
 
 	if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) &&
 	    !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM)) {
-		y = bounds->y + state->margin.top;
+		y = (int64_t)bounds->y + state->margin.top;
 	} else if ((state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) &&
 	           !(state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)) {
-		y = bounds->y + (int32_t)bounds->height - (int32_t)view->height -
+		y = (int64_t)bounds->y + (int64_t)bounds->height - (int64_t)view->height -
 		    state->margin.bottom;
 	} else {
-		y = bounds->y +
-		    ((int32_t)bounds->height - (int32_t)view->height +
+		y = (int64_t)bounds->y +
+		    ((int64_t)bounds->height - (int64_t)view->height +
 		     state->margin.top - state->margin.bottom) /
 		        2;
 	}
 
-	view_move(&surface->view->base, x, y);
+	view_move(&surface->view->base, (int32_t)MAX(INT32_MIN, MIN(x, INT32_MAX)),
+	          (int32_t)MAX(INT32_MIN, MIN(y, INT32_MAX)));
 }
 
 static void
@@ -253,8 +254,8 @@ calculate_available_box(struct layer_screen *layer_screen,
 	*available = (pixman_box32_t){
 	    .x1 = geom->x,
 	    .y1 = geom->y,
-	    .x2 = geom->x + (int32_t)geom->width,
-	    .y2 = geom->y + (int32_t)geom->height,
+	    .x2 = (int32_t)MIN((int64_t)geom->x + geom->width, INT32_MAX),
+	    .y2 = (int32_t)MIN((int64_t)geom->y + geom->height, INT32_MAX),
 	};
 
 	for (i = 0; i < ARRAY_LENGTH(layer_order); ++i) {
@@ -281,8 +282,8 @@ arrange_layer_screen(struct layer_screen *layer_screen,
 	pixman_box32_t full = {
 	    .x1 = geom->x,
 	    .y1 = geom->y,
-	    .x2 = geom->x + (int32_t)geom->width,
-	    .y2 = geom->y + (int32_t)geom->height,
+	    .x2 = (int32_t)MIN((int64_t)geom->x + geom->width, INT32_MAX),
+	    .y2 = (int32_t)MIN((int64_t)geom->y + geom->height, INT32_MAX),
 	};
 	struct layer_surface *surface;
 	struct swc_rectangle bounds;
@@ -618,8 +619,8 @@ send_configure(struct layer_surface *surface)
 		box = (pixman_box32_t){
 		    .x1 = geom->x,
 		    .y1 = geom->y,
-		    .x2 = geom->x + (int32_t)geom->width,
-		    .y2 = geom->y + (int32_t)geom->height,
+		    .x2 = (int32_t)MIN((int64_t)geom->x + geom->width, INT32_MAX),
+		    .y2 = (int32_t)MIN((int64_t)geom->y + geom->height, INT32_MAX),
 		};
 	}
 	bounds = rectangle_from_box(&box);

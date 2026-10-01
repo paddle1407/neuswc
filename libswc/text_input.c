@@ -26,6 +26,9 @@
 #include "internal.h"
 #include "keyboard.h"
 #include "seat.h"
+#include "session_lock.h"
+#include "view.h"
+#include <limits.h>
 #include "surface.h"
 #include "util.h"
 
@@ -84,7 +87,10 @@ struct input_popup {
 	struct wl_resource *resource;
 	struct surface *surface;
 	struct compositor_view *view;
-	struct wl_listener surface_destroy_listener;
+	struct wl_listener surface_destroy_listener, surface_commit_listener;
+	struct view_handler anchor_handler;
+	struct wl_listener anchor_destroy;
+	struct compositor_view *anchor;
 	struct wl_list link;
 };
 
@@ -94,6 +100,8 @@ struct input_method {
 	struct wl_resource *grab;
 
 	bool active;
+	pid_t pid;
+	uint32_t serial;
 
 	/* Accumulated until commit(serial). */
 	struct {
@@ -109,10 +117,20 @@ static struct wl_list text_inputs;
 static struct input_method *input_method;
 static struct text_input *focused_input;
 static void set_entered(struct text_input *ti, struct surface *surface);
+static void update_popups(void);
+static void suspend_grab(void);
+static void install_grab(void);
 
 static struct keyboard_handler grab_handler;
 static bool grab_handler_linked;
 static bool initialized;
+
+static bool
+input_method_trusted(void)
+{
+	return input_method && swc.manager && swc.manager->authorize_input_method &&
+		    swc.manager->authorize_input_method(input_method->pid);
+}
 
 /* ------------------------------------------------------------- helpers */
 
@@ -135,7 +153,7 @@ send_state_to_input_method(void)
 {
 	struct text_input *ti = focused_input;
 
-	if (!input_method || !ti || !ti->enabled) {
+	if (!input_method_trusted() || !input_method->active || !ti || !ti->enabled || session_lock_active()) {
 		return;
 	}
 
@@ -155,15 +173,20 @@ send_state_to_input_method(void)
 		                                      ti->pending.content_purpose);
 	}
 	zwp_input_method_v2_send_done(input_method->resource);
+	++input_method->serial;
 }
 
 static void
 input_method_activate(void)
 {
-	if (!input_method || input_method->active) {
+	if (!input_method_trusted() || input_method->active || session_lock_active()) {
 		return;
 	}
+	free(input_method->pending.preedit);
+	free(input_method->pending.commit_string);
+	memset(&input_method->pending, 0, sizeof(input_method->pending));
 	input_method->active = true;
+	install_grab();
 	zwp_input_method_v2_send_activate(input_method->resource);
 	send_state_to_input_method();
 }
@@ -175,26 +198,76 @@ input_method_deactivate(void)
 		return;
 	}
 	input_method->active = false;
+	free(input_method->pending.preedit);
+	free(input_method->pending.commit_string);
+	memset(&input_method->pending, 0, sizeof(input_method->pending));
+	suspend_grab();
+	update_popups();
 	zwp_input_method_v2_send_deactivate(input_method->resource);
 	zwp_input_method_v2_send_done(input_method->resource);
+	++input_method->serial;
 }
 
 /* Tell every input popup where the caret is, so a candidate list can sit
  * under it rather than in the corner of the screen. */
 static void
+popup_changed(struct view_handler *handler)
+{
+	(void)handler;
+	update_popups();
+}
+static void popup_resized(struct view_handler *handler, uint32_t w, uint32_t h)
+{ (void)w; (void)h; popup_changed(handler); }
+static const struct view_handler_impl popup_anchor_impl = {
+	.move = popup_changed, .attach = popup_changed, .resize = popup_resized,
+};
+static void
+popup_anchor_destroyed(struct wl_listener *listener, void *data)
+{
+	struct input_popup *popup = wl_container_of(listener, popup, anchor_destroy);
+	(void)data;
+	wl_list_remove(&popup->anchor_handler.link); wl_list_init(&popup->anchor_handler.link);
+	wl_list_remove(&popup->anchor_destroy.link); wl_list_init(&popup->anchor_destroy.link);
+	popup->anchor = NULL;
+	if (popup->view) compositor_view_hide(popup->view);
+}
+static void
+popup_committed(struct wl_listener *listener, void *data)
+{ (void)listener; (void)data; update_popups(); }
+static void
 update_popups(void)
 {
 	struct input_popup *popup;
-
-	if (!input_method || !focused_input) {
-		return;
+	if (!input_method) return;
+	struct compositor_view *anchor = swc.seat && swc.seat->keyboard ?
+		    swc.seat->keyboard->focus.view : NULL;
+	bool active = input_method_trusted() && input_method->active && focused_input && focused_input->enabled &&
+		    anchor && !session_lock_active();
+	wl_list_for_each(popup, &input_method->popups, link) {
+		if (popup->anchor != anchor) {
+			wl_list_remove(&popup->anchor_handler.link); wl_list_init(&popup->anchor_handler.link);
+			wl_list_remove(&popup->anchor_destroy.link); wl_list_init(&popup->anchor_destroy.link);
+			popup->anchor = anchor;
+			if (anchor) {
+				popup->anchor_handler.impl = &popup_anchor_impl;
+				popup->anchor_destroy.notify = popup_anchor_destroyed;
+				wl_list_insert(&anchor->base.handlers, &popup->anchor_handler.link);
+				wl_signal_add(&anchor->destroy_signal, &popup->anchor_destroy);
 	}
-	wl_list_for_each(popup, &input_method->popups, link)
-	{
-		zwp_input_popup_surface_v2_send_text_input_rectangle(
-		    popup->resource, focused_input->cursor_rect.x,
-		    focused_input->cursor_rect.y, focused_input->cursor_rect.width,
-		    focused_input->cursor_rect.height);
+		}
+		if (!popup->view) continue;
+		if (!active || !popup->view->base.buffer) {
+			compositor_view_hide(popup->view);
+			continue;
+		}
+		zwp_input_popup_surface_v2_send_text_input_rectangle(popup->resource,
+		    focused_input->cursor_rect.x, focused_input->cursor_rect.y,
+		    focused_input->cursor_rect.width, focused_input->cursor_rect.height);
+		int64_t x = (int64_t)anchor->base.geometry.x - anchor->buffer_offset_x + focused_input->cursor_rect.x;
+		int64_t y = (int64_t)anchor->base.geometry.y - anchor->buffer_offset_y + focused_input->cursor_rect.y + focused_input->cursor_rect.height;
+		view_move(&popup->view->base, (int32_t)MAX(INT32_MIN, MIN(x, INT32_MAX)),
+		    (int32_t)MAX(INT32_MIN, MIN(y, INT32_MAX)));
+		compositor_view_show(popup->view);
 	}
 }
 
@@ -426,6 +499,15 @@ set_entered(struct text_input *ti, struct surface *surface)
 }
 
 static void
+reset_text_input_state(struct text_input *ti)
+{
+	ti->enabled = false;
+	free(ti->pending.surrounding_text);
+	memset(&ti->pending, 0, sizeof(ti->pending));
+	memset(&ti->cursor_rect, 0, sizeof(ti->cursor_rect));
+}
+
+static void
 handle_entered_destroy(struct wl_listener *listener, void *data)
 {
 	struct text_input *ti =
@@ -441,6 +523,7 @@ handle_entered_destroy(struct wl_listener *listener, void *data)
 		ti->enabled = false;
 		input_method_deactivate();
 	}
+	reset_text_input_state(ti);
 }
 
 void
@@ -459,7 +542,7 @@ text_input_handle_focus(struct compositor_view *view)
 	 * before the old one has been taken away. */
 	wl_list_for_each(ti, &text_inputs, link)
 	{
-		if (ti->entered && ti->client != client) {
+		if (ti->entered && ti->entered != surface) {
 			zwp_text_input_v3_send_leave(ti->resource,
 			                             ti->entered->resource);
 			set_entered(ti, NULL);
@@ -467,12 +550,14 @@ text_input_handle_focus(struct compositor_view *view)
 				ti->enabled = false;
 				input_method_deactivate();
 			}
+			reset_text_input_state(ti);
 		}
 	}
 
 	focused_input = NULL;
 
 	if (!client || !surface) {
+		update_popups();
 		return;
 	}
 
@@ -491,6 +576,7 @@ text_input_handle_focus(struct compositor_view *view)
 	}
 
 	focused_input = next_focus;
+	update_popups();
 }
 
 /* --------------------------------------------------- keyboard grab */
@@ -501,7 +587,8 @@ grab_handle_key(struct keyboard *keyboard, uint32_t time, struct key *key,
 {
 	(void)keyboard;
 
-	if (!input_method || !input_method->grab) {
+	if (!input_method_trusted() || !input_method->grab || !input_method->active ||
+	    !focused_input || !focused_input->enabled || session_lock_active()) {
 		return false;
 	}
 	zwp_input_method_keyboard_grab_v2_send_key(
@@ -514,7 +601,8 @@ static bool
 grab_handle_modifiers(struct keyboard *keyboard,
                       const struct keyboard_modifier_state *state)
 {
-	if (!input_method || !input_method->grab) {
+	if (!input_method_trusted() || !input_method->grab || !input_method->active ||
+	    !focused_input || !focused_input->enabled || session_lock_active()) {
 		return false;
 	}
 	zwp_input_method_keyboard_grab_v2_send_modifiers(
@@ -532,11 +620,8 @@ destroy_grab(struct wl_resource *resource)
 	if (!input_method || input_method->grab != resource) {
 		return;
 	}
+	suspend_grab();
 	input_method->grab = NULL;
-	if (grab_handler_linked) {
-		wl_list_remove(&grab_handler.link);
-		grab_handler_linked = false;
-	}
 }
 
 static const struct zwp_input_method_keyboard_grab_v2_interface grab_impl = {
@@ -551,10 +636,14 @@ input_method_grab_keyboard(struct wl_client *client,
 	struct keyboard *keyboard = swc.seat ? swc.seat->keyboard : NULL;
 	struct wl_resource *grab;
 
-	if (!im || !keyboard) {
+	if (!im || !keyboard || im != input_method) {
 		return;
 	}
 
+	if (im->grab) {
+		suspend_grab();
+		wl_resource_set_user_data(im->grab, NULL);
+	}
 	grab = wl_resource_create(client,
 	                          &zwp_input_method_keyboard_grab_v2_interface,
 	                          wl_resource_get_version(resource), id);
@@ -571,14 +660,41 @@ input_method_grab_keyboard(struct wl_client *client,
 	    grab, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, keyboard->xkb.keymap.fd,
 	    keyboard->xkb.keymap.size);
 
-	if (!grab_handler_linked) {
-		/* Sit directly in front of the client handler: compositor bindings
-		 * are ahead of us and keep working, applications behind us stop
-		 * seeing keys while the input method is composing. */
-		wl_list_insert(keyboard->client_handler.link.prev,
-		               &grab_handler.link);
+	install_grab();
+}
+
+static void
+install_grab(void)
+{
+	if (!input_method_trusted() || !input_method->grab || !input_method->active ||
+		    !focused_input || !focused_input->enabled || session_lock_active() || grab_handler_linked) return;
+	struct keyboard *keyboard = swc.seat ? swc.seat->keyboard : NULL;
+	if (!keyboard) return;
+	wl_list_insert(keyboard->client_handler.link.prev, &grab_handler.link);
 		grab_handler_linked = true;
 	}
+
+/* Release handler ownership too: held key releases must not reach a revoked
+	* input method, nor turn into an unpaired release in the newly focused client. */
+static void
+suspend_grab(void)
+{
+	struct keyboard *keyboard = swc.seat ? swc.seat->keyboard : NULL;
+	struct key *key;
+	if (keyboard) wl_array_for_each(key, &keyboard->keys)
+		if (key->handler == &grab_handler) key->handler = NULL;
+	if (grab_handler_linked) {
+		wl_list_remove(&grab_handler.link);
+		grab_handler_linked = false;
+	}
+}
+
+void
+text_input_suspend(void)
+{
+	input_method_deactivate();
+	suspend_grab();
+	update_popups();
 }
 
 /* --------------------------------------------------- input popups */
@@ -592,6 +708,9 @@ destroy_popup(struct wl_resource *resource)
 		return;
 	}
 	wl_list_remove(&popup->surface_destroy_listener.link);
+	wl_list_remove(&popup->surface_commit_listener.link);
+	wl_list_remove(&popup->anchor_handler.link);
+	wl_list_remove(&popup->anchor_destroy.link);
 	wl_list_remove(&popup->link);
 	if (popup->view) {
 		compositor_view_destroy(popup->view);
@@ -642,10 +761,15 @@ input_method_get_popup_surface(struct wl_client *client,
 	if (!surface_set_role(surface, popup->resource)) {
 		wl_resource_destroy(popup->resource);
 		free(popup);
+		wl_resource_post_error(resource, ZWP_INPUT_METHOD_V2_ERROR_ROLE, "surface already has another role");
 		return;
 	}
+	wl_list_init(&popup->anchor_handler.link);
+	wl_list_init(&popup->anchor_destroy.link);
 	popup->surface = surface;
 	popup->view = compositor_create_view(surface);
+	popup->surface_commit_listener.notify = popup_committed;
+	wl_signal_add(&surface->signal.commit, &popup->surface_commit_listener);
 	popup->surface_destroy_listener.notify = handle_popup_surface_destroy;
 	wl_resource_add_destroy_listener(surface->resource,
 	                                 &popup->surface_destroy_listener);
@@ -720,7 +844,8 @@ input_method_do_commit(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	if (ti && ti->enabled) {
+	if (input_method_trusted() && im->active && serial == im->serial &&
+	    ti && ti->enabled && !session_lock_active()) {
 		/*
 		 * Order matters and is fixed by the protocol: remove the text being
 		 * replaced, put the committed text in its place, then describe what
@@ -769,6 +894,8 @@ destroy_input_method(struct wl_resource *resource)
 		return;
 	}
 
+	suspend_grab();
+	if (im->grab) wl_resource_set_user_data(im->grab, NULL);
 	wl_list_for_each_safe(popup, tmp, &im->popups, link)
 	    wl_resource_destroy(popup->resource);
 	if (grab_handler_linked) {
@@ -797,8 +924,12 @@ get_input_method(struct wl_client *client, struct wl_resource *manager,
 		return;
 	}
 
-	if (input_method) {
-		/* One input method per seat. A second is told so rather than
+	pid_t pid;
+	wl_client_get_credentials(client, &pid, NULL, NULL);
+	if (input_method || !swc.manager->authorize_input_method ||
+	    !swc.manager->authorize_input_method(pid)) {
+		/* Only a compositor-authorized foreground service may access input.
+		 * One input method per seat. A second is told so rather than
 		 * silently sharing the keyboard with the first. */
 		wl_resource_set_implementation(resource, &input_method_impl, NULL,
 		                               NULL);
@@ -813,6 +944,7 @@ get_input_method(struct wl_client *client, struct wl_resource *manager,
 		return;
 	}
 	im->resource = resource;
+	im->pid = pid;
 	wl_list_init(&im->popups);
 	input_method = im;
 	wl_resource_set_implementation(resource, &input_method_impl, im,

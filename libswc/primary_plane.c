@@ -50,12 +50,13 @@ update(struct view *view)
 	return true;
 }
 
-static void
+static int
 send_frame(void *data)
 {
 	struct primary_plane *plane = data;
 
 	view_frame(&plane->view, get_time());
+	return 0;
 }
 
 #ifdef ENABLE_DRM
@@ -64,13 +65,15 @@ present(struct primary_plane *plane, uint32_t fb)
 {
 	int ret;
 
+	plane->frame_presented = false;
 	if (plane->need_modeset) {
 		ret = drmModeSetCrtc(swc.drm->fd, plane->crtc, fb, 0, 0,
 		                     plane->connectors.data, plane->connectors.size / 4,
 		                     &plane->mode.info);
 
 		if (ret == 0) {
-			wl_event_loop_add_idle(swc.event_loop, &send_frame, plane);
+			plane->frame_presented = true;
+			wl_event_source_timer_update(plane->frame_timer, 1);
 			plane->need_modeset = false;
 		} else {
 			ERROR("Could not set CRTC to next framebuffer: %s\n",
@@ -104,13 +107,20 @@ fence_finish(struct primary_plane *plane)
 	}
 }
 
+static bool fence_signalled(int fd, int timeout);
+
 static int
 handle_render_fence(int fd, uint32_t mask, void *data)
 {
 	struct primary_plane *plane = data;
 
-	(void)fd;
-	(void)mask;
+	if (!fence_signalled(fd, 0)) {
+		if (!(mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP))) return 0;
+		fence_finish(plane);
+		plane->frame_presented = false;
+		wl_event_source_timer_update(plane->frame_timer, 1);
+		return 0;
+	}
 	fence_finish(plane);
 
 	/*
@@ -120,7 +130,7 @@ handle_render_fence(int fd, uint32_t mask, void *data)
 	 * the output; the next repaint puts the content up.
 	 */
 	if (present(plane, plane->fence_fb) < 0) {
-		wl_event_loop_add_idle(swc.event_loop, &send_frame, plane);
+		wl_event_source_timer_update(plane->frame_timer, 1);
 	}
 
 	return 0;
@@ -136,7 +146,7 @@ fence_signalled(int fd, int timeout)
 		ret = poll(&pollfd, 1, timeout);
 	} while (ret < 0 && errno == EINTR);
 
-	return ret != 0;
+	return ret > 0 && (pollfd.revents & POLLIN) && !(pollfd.revents & POLLERR);
 }
 #endif
 
@@ -159,19 +169,15 @@ attach(struct view *view, struct wld_buffer *buffer)
 	 */
 	fence = wld_export_fence(swc.backend->renderer);
 	if (fence >= 0 && !fence_signalled(fence, 0)) {
-		if (!plane->need_modeset) {
 			fence_finish(plane);
-			plane->fence_source =
-			    wl_event_loop_add_fd(swc.event_loop, fence, WL_EVENT_READABLE,
-			                         &handle_render_fence, plane);
+		plane->fence_source = wl_event_loop_add_fd(swc.event_loop, fence,
+		    WL_EVENT_READABLE, &handle_render_fence, plane);
 			if (plane->fence_source) {
-				plane->fence_fd = fence;
-				plane->fence_fb = fb;
+			plane->fence_fd = fence; plane->fence_fb = fb;
 				return 0;
 			}
-		}
-		/* A modeset is rare and synchronous anyway, so it just waits. */
-		fence_signalled(fence, 1000);
+		close(fence);
+		return -ENOMEM;
 	}
 	if (fence >= 0) {
 		close(fence);
@@ -182,7 +188,8 @@ attach(struct view *view, struct wld_buffer *buffer)
 	if (!fb_present(buffer, view->geometry.x, view->geometry.y)) {
 		return -1;
 	}
-	wl_event_loop_add_idle(swc.event_loop, &send_frame, plane);
+	plane->frame_presented = true;
+	wl_event_source_timer_update(plane->frame_timer, 1);
 	return 0;
 #endif
 }
@@ -212,6 +219,7 @@ handle_page_flip(struct drm_handler *handler, uint32_t time)
 		return;
 	}
 	flip->pending = false;
+	flip->plane->frame_presented = true;
 	view_frame(&flip->plane->view, time);
 }
 #endif
@@ -287,6 +295,17 @@ primary_plane_initialize(struct primary_plane *plane, struct mode *mode)
 	plane->view.geometry.height = mode->height;
 	plane->mode = *mode;
 #endif
+	plane->frame_timer = wl_event_loop_add_timer(swc.event_loop, send_frame, plane);
+	if (!plane->frame_timer) {
+		view_finalize(&plane->view);
+#ifdef ENABLE_DRM
+		wl_array_release(&plane->connectors);
+		free(plane->flip);
+		drmModeFreeCrtc(plane->original_crtc_state);
+#endif
+		return false;
+	}
+	plane->frame_presented = false;
 	plane->swc_listener.notify = &handle_swc_event;
 	wl_signal_add(&swc.event_signal, &plane->swc_listener);
 
@@ -323,6 +342,10 @@ primary_plane_disable(struct primary_plane *plane)
 void
 primary_plane_finalize(struct primary_plane *plane)
 {
+	if (plane->frame_timer) {
+		wl_event_source_remove(plane->frame_timer);
+		plane->frame_timer = NULL;
+	}
 	wl_list_remove(&plane->swc_listener.link);
 #ifdef ENABLE_DRM
 	fence_finish(plane);

@@ -26,6 +26,7 @@
 #include "compositor.h"
 #include "cursor_shape.h"
 #include "data_device_manager.h"
+#include "drm_syncobj.h"
 #ifdef ENABLE_DRM
 #include "drm.h"
 #else
@@ -88,6 +89,44 @@ struct swc swc = {
     .xserver = &swc_xserver,
 #endif
 };
+
+static bool library_initialized;
+
+static void
+reset_runtime(void)
+{
+	swc.cursor_shape_manager = NULL;
+	swc.data_device_manager = NULL;
+	swc.foreign_toplevel_manager = NULL;
+	swc.idle_inhibit_manager = NULL;
+	swc.idle_notifier = NULL;
+	swc.kde_decoration_manager = NULL;
+	swc.layer_shell = NULL;
+	swc.panel_manager = NULL;
+	swc.pointer_constraints = NULL;
+	swc.primary_selection_device_manager = NULL;
+	swc.relative_pointer_manager = NULL;
+	swc.screencopy_manager = NULL;
+	swc.session_lock_manager = NULL;
+	swc.shell = NULL;
+	swc.snap_manager = NULL;
+	swc.select_manager = NULL;
+	swc.subcompositor = NULL;
+	swc.text_input_manager = NULL;
+	swc.input_method_manager = NULL;
+	swc.xdg_activation = NULL;
+	swc.xdg_decoration_manager = NULL;
+	swc.xdg_output_manager = NULL;
+	swc.xdg_shell = NULL;
+	swc.workspace_manager = NULL;
+	swc.seat = NULL;
+	swc.shm = NULL;
+	swc.backend = NULL;
+	swc.active = false;
+	swc.display = NULL;
+	swc.event_loop = NULL;
+	swc.manager = NULL;
+}
 
 static void
 setup_compositor(void)
@@ -184,6 +223,8 @@ EXPORT bool
 swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
                const struct swc_manager *manager)
 {
+	if (library_initialized || !display || !manager) return false;
+	reset_runtime();
 	swc.display = display;
 	swc.event_loop =
 	    event_loop ? event_loop : wl_display_get_event_loop(display);
@@ -387,6 +428,7 @@ swc_initialize(struct wl_display *display, struct wl_event_loop *event_loop,
 	}
 
 	setup_compositor();
+	library_initialized = true;
 
 	return true;
 
@@ -394,6 +436,7 @@ error30:
 	text_input_finish();
 	wl_global_destroy(swc.text_input_manager);
 error29:
+	session_lock_finish();
 	wl_global_destroy(swc.session_lock_manager);
 error28:
 	wl_global_destroy(swc.cursor_shape_manager);
@@ -428,6 +471,7 @@ error17:
 		wl_global_destroy(swc.select_manager);
 	}
 #ifdef ENABLE_XWAYLAND
+	xserver_finalize();
 error16:
 #endif
 	wl_global_destroy(swc.snap_manager);
@@ -467,12 +511,17 @@ error2:
 error1:
 	launch_finalize();
 error0:
+	reset_runtime();
 	return false;
 }
 
 EXPORT void
 swc_finalize(void)
 {
+	if (!library_initialized) return;
+	library_initialized = false;
+	/* Resources carry listeners into seats, views and renderer state. */
+	wl_display_destroy_clients(swc.display);
 	input_mode_cancel();
 	swc_overview_end();
 #ifdef ENABLE_XWAYLAND
@@ -503,20 +552,24 @@ swc_finalize(void)
 	wl_global_destroy(swc.select_manager);
 	wl_global_destroy(swc.panel_manager);
 	wl_global_destroy(swc.layer_shell);
+	wl_global_destroy(swc.kde_decoration_manager);
 	wl_global_destroy(swc.xdg_decoration_manager);
 	wl_global_destroy(swc.xdg_shell);
 	wl_global_destroy(swc.shell);
 	seat_destroy(swc.seat);
 	swc.seat = NULL;
 	wl_global_destroy(swc.data_device_manager);
+	wl_global_destroy(swc.subcompositor);
 	compositor_finalize();
 	screens_finalize();
 	bindings_finalize();
 	shm_destroy(swc.shm);
+	drm_syncobj_manager_finish();
 #ifdef ENABLE_DRM
 	drm_finalize();
 #else
 	fb_finalize();
 #endif
 	launch_finalize();
+	reset_runtime();
 }

@@ -39,9 +39,12 @@
 /* One property write has to fit in one request. Anything larger would need
  * INCR on the way out, which is not implemented; such a request is refused
  * rather than silently truncated. */
-#define MAX_PROPERTY_SIZE (256 * 1024)
+#define MAX_PROPERTY_SIZE (256 * 1024 - 128)
 /* A peer that never finishes must not grow the buffer without end. */
 #define MAX_TRANSFER_SIZE (16 * 1024 * 1024)
+#define MAX_BUFFERED_DATA (32 * 1024 * 1024)
+#define MAX_TRANSFERS 32
+#define TRANSFER_TIMEOUT_MS 30000
 
 enum {
 	ATOM_CLIPBOARD,
@@ -51,6 +54,7 @@ enum {
 	ATOM_UTF8_STRING,
 	ATOM_TEXT,
 	ATOM_WL_SELECTION,
+	ATOM_WL_TARGETS,
 	ATOM_TEXT_PLAIN_UTF8,
 	ATOM_TEXT_PLAIN,
 	ATOM_LAST,
@@ -64,6 +68,7 @@ static const char *const atom_names[ATOM_LAST] = {
 	[ATOM_UTF8_STRING] = "UTF8_STRING",
 	[ATOM_TEXT] = "TEXT",
 	[ATOM_WL_SELECTION] = "_SWC_SELECTION",
+	[ATOM_WL_TARGETS] = "_SWC_TARGETS",
 	[ATOM_TEXT_PLAIN_UTF8] = "text/plain;charset=utf-8",
 	[ATOM_TEXT_PLAIN] = "text/plain",
 };
@@ -73,6 +78,9 @@ struct incoming {
 	struct wl_list link;
 	char *mime_type;
 	int fd;
+	xcb_window_t requestor;
+	xcb_atom_t target;
+	xcb_timestamp_t time;
 	/* Data collected from the X side, and how much has reached the fd. */
 	char *data;
 	size_t size, sent;
@@ -80,6 +88,7 @@ struct incoming {
 	bool converting;
 	bool reading_incr;
 	struct wl_event_source *writable;
+	struct wl_event_source *timer;
 };
 
 /* An X client asked to receive the Wayland selection. */
@@ -92,6 +101,7 @@ struct outgoing {
 	char *data;
 	size_t size;
 	struct wl_event_source *readable;
+	struct wl_event_source *timer;
 };
 
 static struct {
@@ -111,10 +121,41 @@ static struct {
 
 	/* The most recent timestamp seen, for selection ownership. */
 	xcb_timestamp_t timestamp;
+	xcb_timestamp_t targets_time;
+	xcb_window_t targets_window;
+	struct wl_event_source *targets_timer;
+	bool targets_pending;
+	unsigned incoming_count, outgoing_count;
+	size_t buffered_bytes;
+	size_t property_limit;
 	bool initialized;
 } xs;
 
 static void start_next_incoming(void);
+static void clear_outgoing(void);
+
+static void
+clear_targets(void)
+{
+	xs.targets_pending = false;
+	if (xs.targets_timer) {
+		wl_event_source_remove(xs.targets_timer);
+		xs.targets_timer = NULL;
+	}
+	if (xs.targets_window) {
+		xcb_destroy_window(xs.connection, xs.targets_window);
+		xs.targets_window = XCB_WINDOW_NONE;
+	}
+}
+
+static int
+targets_timeout(void *user)
+{
+	(void)user;
+	clear_targets();
+	xcb_flush(xs.connection);
+	return 0;
+}
 
 /* ------------------------------------------------------------- helpers */
 
@@ -195,6 +236,14 @@ static void
 incoming_destroy(struct incoming *transfer)
 {
 	wl_list_remove(&transfer->link);
+	--xs.incoming_count;
+	xs.buffered_bytes -= transfer->size;
+	if (transfer->timer)
+		wl_event_source_remove(transfer->timer);
+	if (transfer->requestor) {
+		xcb_destroy_window(xs.connection, transfer->requestor);
+		xcb_flush(xs.connection);
+	}
 	if (transfer->writable) {
 		wl_event_source_remove(transfer->writable);
 	}
@@ -206,13 +255,33 @@ incoming_destroy(struct incoming *transfer)
 	free(transfer);
 }
 
+static void
+clear_incoming(void)
+{
+	struct incoming *transfer, *tmp;
+	wl_list_for_each_safe(transfer, tmp, &xs.incoming, link)
+		incoming_destroy(transfer);
+}
+
+static int
+incoming_timeout(void *user)
+{
+	incoming_destroy(user);
+	start_next_incoming();
+	return 0;
+}
+
 static int
 handle_writable(int fd, uint32_t mask, void *user)
 {
 	struct incoming *transfer = user;
 	ssize_t written;
 
-	(void)mask;
+	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
+		incoming_destroy(transfer);
+		start_next_incoming();
+		return 0;
+	}
 	while (transfer->sent < transfer->size) {
 		written = write(fd, transfer->data + transfer->sent,
 		                transfer->size - transfer->sent);
@@ -225,6 +294,8 @@ handle_writable(int fd, uint32_t mask, void *user)
 			}
 			break; /* the reader is gone */
 		}
+		if (!written)
+			break;
 		transfer->sent += (size_t)written;
 	}
 
@@ -263,7 +334,8 @@ incoming_append(struct incoming *transfer, const void *data, size_t size)
 	if (size == 0) {
 		return true;
 	}
-	if (transfer->size + size > MAX_TRANSFER_SIZE) {
+	if (size > MAX_TRANSFER_SIZE - transfer->size ||
+	    size > MAX_BUFFERED_DATA - xs.buffered_bytes) {
 		return false;
 	}
 	grown = realloc(transfer->data, transfer->size + size);
@@ -273,6 +345,7 @@ incoming_append(struct incoming *transfer, const void *data, size_t size)
 	memcpy(grown + transfer->size, data, size);
 	transfer->data = grown;
 	transfer->size += size;
+	xs.buffered_bytes += size;
 
 	return true;
 }
@@ -290,7 +363,7 @@ start_next_incoming(void)
 		    wl_container_of(xs.incoming.next, transfer, link);
 		xcb_atom_t target;
 
-		if (transfer->converting || transfer->reading_incr) {
+		if (transfer->converting || transfer->reading_incr || transfer->writable) {
 			return; /* the head is already under way */
 		}
 		target = atom_for_mime_type(transfer->mime_type);
@@ -300,9 +373,18 @@ start_next_incoming(void)
 			continue;
 		}
 		transfer->converting = true;
-		xcb_convert_selection(xs.connection, xs.window,
+		transfer->target = target;
+		transfer->time = xs.timestamp;
+		/* A separate requestor isolates late replies and INCR chunks after
+		 * cancellation from the next transfer, without allocating atoms. */
+		transfer->requestor = xcb_generate_id(xs.connection);
+		uint32_t events = XCB_EVENT_MASK_PROPERTY_CHANGE;
+		xcb_create_window(xs.connection, 0, transfer->requestor, xs.window,
+		                  0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+		                  XCB_COPY_FROM_PARENT, XCB_CW_EVENT_MASK, &events);
+		xcb_convert_selection(xs.connection, transfer->requestor,
 		                      xs.atoms[ATOM_CLIPBOARD], target,
-		                      xs.atoms[ATOM_WL_SELECTION], xs.timestamp);
+		                      xs.atoms[ATOM_WL_SELECTION], transfer->time);
 		xcb_flush(xs.connection);
 		return;
 	}
@@ -316,7 +398,8 @@ source_send(void *user, const char *mime_type, int fd)
 	bool idle;
 
 	(void)user;
-	if (!xs.initialized || !xs.source) {
+	if (!xs.initialized || !xs.source ||
+	    xs.incoming_count + xs.outgoing_count >= MAX_TRANSFERS) {
 		close(fd);
 		return;
 	}
@@ -332,12 +415,26 @@ source_send(void *user, const char *mime_type, int fd)
 		return;
 	}
 	/* The pipe must never stall the compositor. */
-	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	int flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		free(transfer->mime_type);
+		free(transfer);
+		close(fd);
+		return;
+	}
 	transfer->fd = fd;
 
 	idle = wl_list_empty(&xs.incoming);
 	wl_list_insert(xs.incoming.prev, &transfer->link);
-	/* One conversion at a time: they all land on the same property. */
+	++xs.incoming_count;
+	transfer->timer = wl_event_loop_add_timer(swc.event_loop, incoming_timeout,
+	                                         transfer);
+	if (!transfer->timer ||
+	    wl_event_source_timer_update(transfer->timer, TRANSFER_TIMEOUT_MS) < 0) {
+		incoming_destroy(transfer);
+		return;
+	}
+	/* Bound both queue length and the lifetime of queued/in-flight receives. */
 	if (idle) {
 		start_next_incoming();
 	}
@@ -355,6 +452,7 @@ source_cancelled(void *user)
 	 */
 	if (xs.source == source) {
 		xs.source = NULL;
+		clear_incoming();
 	}
 	data_destroy_internal(source);
 }
@@ -376,14 +474,14 @@ publish_targets(void)
 
 	reply = xcb_get_property_reply(
 	    xs.connection,
-	    xcb_get_property(xs.connection, 1, xs.window,
-	                     xs.atoms[ATOM_WL_SELECTION], XCB_GET_PROPERTY_TYPE_ANY,
+	    xcb_get_property(xs.connection, 1, xs.targets_window,
+	                     xs.atoms[ATOM_WL_TARGETS], XCB_GET_PROPERTY_TYPE_ANY,
 	                     0, 4096),
 	    NULL);
 	if (!reply) {
 		return;
 	}
-	if (reply->type != XCB_ATOM_ATOM) {
+	if (reply->type != XCB_ATOM_ATOM || reply->format != 32 || reply->bytes_after) {
 		free(reply);
 		return;
 	}
@@ -430,26 +528,46 @@ handle_selection_notify(xcb_selection_notify_event_t *event)
 	struct incoming *transfer;
 	xcb_get_property_reply_t *reply;
 
-	if (event->property != xs.atoms[ATOM_WL_SELECTION]) {
-		return; /* refused, or not ours */
-	}
-	if (event->target == xs.atoms[ATOM_TARGETS]) {
-		publish_targets();
+	if (event->selection != xs.atoms[ATOM_CLIPBOARD])
+		return;
+	if (event->requestor == xs.targets_window && event->target == xs.atoms[ATOM_TARGETS]) {
+		if (!xs.targets_pending || event->time != xs.targets_time ||
+		    (event->property != XCB_ATOM_NONE &&
+		     event->property != xs.atoms[ATOM_WL_TARGETS]))
+			return;
+		if (event->property != XCB_ATOM_NONE)
+			publish_targets();
+		clear_targets();
 		return;
 	}
 	if (wl_list_empty(&xs.incoming)) {
 		return;
 	}
 	transfer = wl_container_of(xs.incoming.next, transfer, link);
+	if (!transfer->converting || event->requestor != transfer->requestor ||
+	    event->target != transfer->target || event->time != transfer->time)
+		return;
+	if (event->property == XCB_ATOM_NONE) {
+		/* Refusal is a completed conversion, not a permanently busy head. */
+		incoming_destroy(transfer);
+		start_next_incoming();
+		return;
+	}
+	if (event->property != xs.atoms[ATOM_WL_SELECTION])
+		return;
 	transfer->converting = false;
 
 	reply = xcb_get_property_reply(
 	    xs.connection,
-	    xcb_get_property(xs.connection, 1, xs.window,
+	    xcb_get_property(xs.connection, 1, transfer->requestor,
 	                     xs.atoms[ATOM_WL_SELECTION], XCB_GET_PROPERTY_TYPE_ANY,
 	                     0, MAX_TRANSFER_SIZE / 4),
 	    NULL);
-	if (!reply) {
+	if (!reply || reply->bytes_after ||
+	    (reply->type == xs.atoms[ATOM_INCR]
+	         ? reply->format != 32 || xcb_get_property_value_length(reply) != 4
+	         : reply->format != 8)) {
+		free(reply);
 		incoming_destroy(transfer);
 		start_next_incoming();
 		return;
@@ -478,7 +596,7 @@ handle_selection_notify(xcb_selection_notify_event_t *event)
 
 /* A chunk of an INCR transfer arrived. */
 static void
-handle_incr_chunk(void)
+handle_incr_chunk(xcb_window_t requestor)
 {
 	struct incoming *transfer;
 	xcb_get_property_reply_t *reply;
@@ -488,16 +606,17 @@ handle_incr_chunk(void)
 		return;
 	}
 	transfer = wl_container_of(xs.incoming.next, transfer, link);
-	if (!transfer->reading_incr) {
+	if (!transfer->reading_incr || transfer->requestor != requestor) {
 		return;
 	}
 	reply = xcb_get_property_reply(
 	    xs.connection,
-	    xcb_get_property(xs.connection, 1, xs.window,
+	    xcb_get_property(xs.connection, 1, transfer->requestor,
 	                     xs.atoms[ATOM_WL_SELECTION], XCB_GET_PROPERTY_TYPE_ANY,
 	                     0, MAX_TRANSFER_SIZE / 4),
 	    NULL);
-	if (!reply) {
+	if (!reply || reply->bytes_after || reply->format != 8) {
+		free(reply);
 		incoming_destroy(transfer);
 		start_next_incoming();
 		return;
@@ -544,6 +663,10 @@ static void
 outgoing_destroy(struct outgoing *transfer)
 {
 	wl_list_remove(&transfer->link);
+	--xs.outgoing_count;
+	xs.buffered_bytes -= transfer->size;
+	if (transfer->timer)
+		wl_event_source_remove(transfer->timer);
 	if (transfer->readable) {
 		wl_event_source_remove(transfer->readable);
 	}
@@ -557,7 +680,7 @@ outgoing_destroy(struct outgoing *transfer)
 static void
 outgoing_finish(struct outgoing *transfer, bool ok)
 {
-	if (ok && transfer->size <= MAX_PROPERTY_SIZE) {
+	if (ok && transfer->size <= xs.property_limit) {
 		xcb_change_property(xs.connection, XCB_PROP_MODE_REPLACE,
 		                    transfer->requestor, transfer->property,
 		                    transfer->target, 8, transfer->size,
@@ -575,6 +698,21 @@ outgoing_finish(struct outgoing *transfer, bool ok)
 	outgoing_destroy(transfer);
 }
 
+static void
+clear_outgoing(void)
+{
+	struct outgoing *transfer, *tmp;
+	wl_list_for_each_safe(transfer, tmp, &xs.outgoing, link)
+		outgoing_finish(transfer, false);
+}
+
+static int
+outgoing_timeout(void *user)
+{
+	outgoing_finish(user, false);
+	return 0;
+}
+
 static int
 handle_readable(int fd, uint32_t mask, void *user)
 {
@@ -582,7 +720,10 @@ handle_readable(int fd, uint32_t mask, void *user)
 	char buffer[4096];
 	ssize_t got;
 
-	(void)mask;
+	if (mask & WL_EVENT_ERROR) {
+		outgoing_finish(transfer, false);
+		return 0;
+	}
 	for (;;) {
 		got = read(fd, buffer, sizeof(buffer));
 		if (got < 0) {
@@ -599,7 +740,8 @@ handle_readable(int fd, uint32_t mask, void *user)
 			outgoing_finish(transfer, true); /* the source is done */
 			return 0;
 		}
-		if (transfer->size + (size_t)got > MAX_TRANSFER_SIZE) {
+		if ((size_t)got > xs.property_limit - transfer->size ||
+		    (size_t)got > MAX_BUFFERED_DATA - xs.buffered_bytes) {
 			outgoing_finish(transfer, false);
 			return 0;
 		}
@@ -611,6 +753,7 @@ handle_readable(int fd, uint32_t mask, void *user)
 		memcpy(grown + transfer->size, buffer, (size_t)got);
 		transfer->data = grown;
 		transfer->size += (size_t)got;
+		xs.buffered_bytes += (size_t)got;
 	}
 }
 
@@ -621,9 +764,15 @@ answer_targets(xcb_selection_request_event_t *request, struct data *selection)
 	xcb_atom_t *atoms;
 	unsigned count = 0;
 	char **mime_type;
+	size_t types = mime_types ? mime_types->size / sizeof(char *) : 0;
+	if (xs.property_limit / sizeof(*atoms) < 2 ||
+	    types > xs.property_limit / sizeof(*atoms) - 2) {
+		send_selection_notify(request->requestor, request->selection,
+		                      request->target, XCB_ATOM_NONE, request->time);
+		return;
+	}
 
-	atoms = calloc(2 + (mime_types ? mime_types->size / sizeof(char *) : 0),
-	               sizeof(*atoms));
+	atoms = calloc(2 + types, sizeof(*atoms));
 	if (!atoms) {
 		send_selection_notify(request->requestor, request->selection,
 		                      request->target, XCB_ATOM_NONE, request->time);
@@ -661,7 +810,8 @@ handle_selection_request(xcb_selection_request_event_t *request)
 		return;
 	}
 	/* An owner must answer even when it cannot: silence hangs the client. */
-	if (!xs.owning || !selection || selection == xs.source) {
+	if (!xs.owning || !selection || selection == xs.source ||
+	    xs.incoming_count + xs.outgoing_count >= MAX_TRANSFERS) {
 		send_selection_notify(request->requestor, request->selection,
 		                      request->target, XCB_ATOM_NONE, request->time);
 		return;
@@ -685,12 +835,35 @@ handle_selection_request(xcb_selection_request_event_t *request)
 	}
 
 	mime_type = mime_type_for_atom(request->target);
+	/* wl_data_source.send must only request a MIME type the source offered. */
+	if (mime_type) {
+		struct wl_array *types = data_mime_types(selection);
+		char **type;
+		bool offered = false;
+		if (types) wl_array_for_each(type, types)
+			offered |= strcmp(*type, mime_type) == 0;
+		if (!offered) {
+			free(mime_type);
+			mime_type = NULL;
+		}
+	}
 	if (!mime_type) {
 		send_selection_notify(request->requestor, request->selection,
 		                      request->target, XCB_ATOM_NONE, request->time);
 		return;
 	}
-	if (pipe2(pipes, O_CLOEXEC | O_NONBLOCK) < 0) {
+	if (pipe2(pipes, O_CLOEXEC) < 0) {
+		free(mime_type);
+		send_selection_notify(request->requestor, request->selection,
+		                      request->target, XCB_ATOM_NONE, request->time);
+		return;
+	}
+	/* Only our read end is nonblocking; the Wayland source receives the
+	 * ordinary blocking write descriptor required by the data protocol. */
+	int flags = fcntl(pipes[0], F_GETFL);
+	if (flags < 0 || fcntl(pipes[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+		close(pipes[0]);
+		close(pipes[1]);
 		free(mime_type);
 		send_selection_notify(request->requestor, request->selection,
 		                      request->target, XCB_ATOM_NONE, request->time);
@@ -711,17 +884,23 @@ handle_selection_request(xcb_selection_request_event_t *request)
 	transfer->time = request->time;
 	transfer->fd = pipes[0];
 	wl_list_insert(&xs.outgoing, &transfer->link);
-
-	/* The source writes into the pipe; we answer X once it closes. */
-	data_send(selection, mime_type, pipes[1]);
-	free(mime_type);
+	++xs.outgoing_count;
 
 	transfer->readable = wl_event_loop_add_fd(
 	    swc.event_loop, transfer->fd, WL_EVENT_READABLE, handle_readable,
 	    transfer);
-	if (!transfer->readable) {
+	transfer->timer = wl_event_loop_add_timer(swc.event_loop, outgoing_timeout,
+	                                         transfer);
+	if (!transfer->readable || !transfer->timer ||
+	    wl_event_source_timer_update(transfer->timer, TRANSFER_TIMEOUT_MS) < 0) {
 		outgoing_finish(transfer, false);
+		close(pipes[1]);
+		free(mime_type);
+		return;
 	}
+	/* The source writes into the pipe; we answer X once it closes. */
+	data_send(selection, mime_type, pipes[1]);
+	free(mime_type);
 }
 
 /* --------------------------------------------------------------- events */
@@ -737,17 +916,32 @@ handle_xfixes_selection_notify(xcb_xfixes_selection_notify_event_t *event)
 	if (event->owner == xs.window) {
 		return; /* our own claim, made for a Wayland source */
 	}
+	xs.owning = false;
+	clear_targets();
+	clear_incoming();
+	clear_outgoing();
+	if (xs.source)
+		data_device_set_internal_selection(selection_device(), NULL);
 	if (event->owner == XCB_WINDOW_NONE) {
-		/* The X owner went away. If the selection was the one we published
-		 * for it, there is nothing to offer any more. */
-		if (xs.source) {
-			data_device_set_internal_selection(selection_device(), NULL);
-		}
 		return;
 	}
 	/* Ask what it has before claiming anything on the Wayland side. */
-	xcb_convert_selection(xs.connection, xs.window, xs.atoms[ATOM_CLIPBOARD],
-	                      xs.atoms[ATOM_TARGETS], xs.atoms[ATOM_WL_SELECTION],
+	xs.targets_pending = true;
+	xs.targets_time = event->timestamp;
+	xs.targets_timer = wl_event_loop_add_timer(swc.event_loop, targets_timeout,
+	                                          NULL);
+	if (!xs.targets_timer ||
+	    wl_event_source_timer_update(xs.targets_timer, TRANSFER_TIMEOUT_MS) < 0) {
+		clear_targets();
+		return;
+	}
+	xs.targets_window = xcb_generate_id(xs.connection);
+	uint32_t events = XCB_EVENT_MASK_PROPERTY_CHANGE;
+	xcb_create_window(xs.connection, 0, xs.targets_window, xs.window,
+	                  0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
+	                  XCB_COPY_FROM_PARENT, XCB_CW_EVENT_MASK, &events);
+	xcb_convert_selection(xs.connection, xs.targets_window, xs.atoms[ATOM_CLIPBOARD],
+	                      xs.atoms[ATOM_TARGETS], xs.atoms[ATOM_WL_TARGETS],
 	                      event->timestamp);
 	xcb_flush(xs.connection);
 }
@@ -787,6 +981,7 @@ xselection_handle_event(xcb_generic_event_t *event)
 
 		if (clear->selection == xs.atoms[ATOM_CLIPBOARD]) {
 			xs.owning = false;
+			clear_outgoing();
 		}
 		return true;
 	}
@@ -796,10 +991,9 @@ xselection_handle_event(xcb_generic_event_t *event)
 
 		xs.timestamp = notify->time;
 		/* Only the pieces of an INCR transfer onto our own window. */
-		if (notify->window == xs.window &&
-		    notify->atom == xs.atoms[ATOM_WL_SELECTION] &&
+		if (notify->atom == xs.atoms[ATOM_WL_SELECTION] &&
 		    notify->state == XCB_PROPERTY_NEW_VALUE) {
-			handle_incr_chunk();
+			handle_incr_chunk(notify->window);
 			return true;
 		}
 		return false; /* the window manager wants the rest */
@@ -823,6 +1017,9 @@ xselection_wayland_selection_changed(void)
 	if (selection && selection == xs.source) {
 		return;
 	}
+	clear_targets();
+	clear_incoming();
+	clear_outgoing();
 	if (!selection) {
 		if (xs.owning) {
 			xcb_set_selection_owner(xs.connection, XCB_WINDOW_NONE,
@@ -850,6 +1047,18 @@ xselection_initialize(xcb_connection_t *connection, xcb_window_t window)
 	xs.connection = connection;
 	xs.window = window;
 	xs.timestamp = XCB_CURRENT_TIME;
+	xs.source = NULL;
+	xs.owning = false;
+	xs.targets_pending = false;
+	xs.targets_window = XCB_WINDOW_NONE;
+	xs.targets_timer = NULL;
+	xs.incoming_count = xs.outgoing_count = 0;
+	xs.buffered_bytes = 0;
+	uint64_t request_bytes = (uint64_t)xcb_get_maximum_request_length(connection) * 4;
+	if (request_bytes <= 128)
+		return false;
+	xs.property_limit = request_bytes - 128 < MAX_PROPERTY_SIZE
+	    ? (size_t)(request_bytes - 128) : MAX_PROPERTY_SIZE;
 	wl_list_init(&xs.incoming);
 	wl_list_init(&xs.outgoing);
 
@@ -906,6 +1115,8 @@ xselection_finalize(void)
 	if (!xs.initialized) {
 		return;
 	}
+	xs.initialized = false;
+	clear_targets();
 	wl_list_for_each_safe(incoming, incoming_tmp, &xs.incoming, link)
 	    incoming_destroy(incoming);
 	wl_list_for_each_safe(outgoing, outgoing_tmp, &xs.outgoing, link)

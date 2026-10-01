@@ -24,6 +24,7 @@
 #include "subsurface.h"
 #include "compositor.h"
 #include "surface.h"
+#include <limits.h>
 #include "util.h"
 #include "view.h"
 
@@ -62,11 +63,10 @@ subsurface_update_position(struct subsurface *subsurface)
 		return;
 	}
 
-	view_move(&view->base,
-	          parent_view->base.geometry.x + subsurface->x -
-	              parent_view->buffer_offset_x,
-	          parent_view->base.geometry.y + subsurface->y -
-	              parent_view->buffer_offset_y);
+	int64_t x = (int64_t)parent_view->base.geometry.x + subsurface->x - parent_view->buffer_offset_x;
+	int64_t y = (int64_t)parent_view->base.geometry.y + subsurface->y - parent_view->buffer_offset_y;
+	view_move(&view->base, (int32_t)MAX(INT32_MIN, MIN(x, INT32_MAX)),
+		    (int32_t)MAX(INT32_MIN, MIN(y, INT32_MAX)));
 }
 
 static void
@@ -243,6 +243,7 @@ handle_parent_destroy(struct wl_listener *listener, void *data)
 
 	list_remove_if_linked(&subsurface->pending_link);
 	list_remove_if_linked(&subsurface->current_link);
+	list_remove_if_linked(&subsurface->cached_link);
 
 	subsurface->parent = NULL;
 }
@@ -353,8 +354,9 @@ take_order_dirty(struct surface *parent)
 
 	wl_list_for_each(child, &parent->subsurfaces, link)
 	{
-		dirty |= child->order_dirty;
-		child->order_dirty = false;
+		if (parent->applying_cached) {
+			dirty |= child->cached_order_dirty; child->cached_order_dirty = false;
+		} else { dirty |= child->order_dirty; child->order_dirty = false; }
 	}
 
 	return dirty;
@@ -367,15 +369,34 @@ apply_pending_positions(struct surface *parent)
 
 	wl_list_for_each(child, &parent->subsurfaces, link)
 	{
-		if (!child->pending_position) {
+		if (!(parent->applying_cached ? child->cached_position : child->pending_position)) {
 			continue;
 		}
 
-		child->pending_position = false;
-		child->x = child->pending_x;
-		child->y = child->pending_y;
+		if (parent->applying_cached) {
+			child->cached_position = false; child->x = child->cached_x; child->y = child->cached_y;
+		} else { child->pending_position = false; child->x = child->pending_x; child->y = child->pending_y; }
 		subsurface_update_position(child);
 	}
+}
+
+void
+subsurface_cache_parent_commit(struct surface *parent)
+{
+	struct subsurface *child;
+	wl_list_for_each(child, &parent->subsurfaces, link) {
+		list_remove_if_linked(&child->cached_link);
+		child->cached_order_dirty |= child->order_dirty;
+		child->order_dirty = false;
+		if (child->pending_position) {
+			child->cached_x = child->pending_x; child->cached_y = child->pending_y;
+			child->cached_position = true; child->pending_position = false;
+		}
+	}
+	wl_list_for_each(child, &parent->pending.state.subsurfaces_below, pending_link)
+		wl_list_insert(parent->cached.state.subsurfaces_below.prev, &child->cached_link);
+	wl_list_for_each(child, &parent->pending.state.subsurfaces_above, pending_link)
+		wl_list_insert(parent->cached.state.subsurfaces_above.prev, &child->cached_link);
 }
 
 void
@@ -400,15 +421,17 @@ subsurface_parent_commit(struct surface *parent)
 	wl_list_init(&parent->state.subsurfaces_below);
 	wl_list_init(&parent->state.subsurfaces_above);
 
-	wl_list_for_each(child, &parent->pending.state.subsurfaces_below,
-	                 pending_link)
-	    wl_list_insert(parent->state.subsurfaces_below.prev,
-	                   &child->current_link);
-
-	wl_list_for_each(child, &parent->pending.state.subsurfaces_above,
-	                 pending_link)
-	    wl_list_insert(parent->state.subsurfaces_above.prev,
-	                   &child->current_link);
+	if (parent->applying_cached) {
+		wl_list_for_each(child, &parent->cached.state.subsurfaces_below, cached_link)
+			wl_list_insert(parent->state.subsurfaces_below.prev, &child->current_link);
+		wl_list_for_each(child, &parent->cached.state.subsurfaces_above, cached_link)
+			wl_list_insert(parent->state.subsurfaces_above.prev, &child->current_link);
+	} else {
+		wl_list_for_each(child, &parent->pending.state.subsurfaces_below, pending_link)
+			wl_list_insert(parent->state.subsurfaces_below.prev, &child->current_link);
+		wl_list_for_each(child, &parent->pending.state.subsurfaces_above, pending_link)
+			wl_list_insert(parent->state.subsurfaces_above.prev, &child->current_link);
+	}
 
 	parent_view = parent->view ? compositor_view(parent->view) : NULL;
 	if (parent_view) {
@@ -506,6 +529,7 @@ subsurface_destroy(struct wl_resource *resource)
 
 	list_remove_if_linked(&subsurface->pending_link);
 	list_remove_if_linked(&subsurface->current_link);
+	list_remove_if_linked(&subsurface->cached_link);
 
 	if (subsurface->surface && subsurface->surface->view) {
 		struct compositor_view *view =
@@ -561,6 +585,11 @@ subsurface_new(struct wl_client *client, uint32_t version, uint32_t id,
 	wl_list_init(&subsurface->link);
 	wl_list_init(&subsurface->pending_link);
 	wl_list_init(&subsurface->current_link);
+	wl_list_init(&subsurface->cached_link);
+	subsurface->cached_position = false;
+	subsurface->cached_order_dirty = false;
+
+	if (!surface_set_role(surface, subsurface->resource)) goto error2;
 
 	if (!surface->view) {
 		compositor_create_view(surface);

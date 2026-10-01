@@ -657,6 +657,8 @@ frame_copy(struct screencopy_frame *frame, struct wl_resource *buffer_resource,
 		copied = target.dmabuf ? copy_dmabuf(frame, target.dmabuf, &region, &fence) :
 		                         copy_shm(frame, &target.shm, &region, &path);
 	pixman_region32_fini(&region);
+	if (copied && !target.dmabuf)
+		copied = shm_buffer_write(buffer_resource);
 	if (!copied) {
 		/* Whatever the buffer holds now, it is not a frame. */
 		if (fence >= 0) close(fence);

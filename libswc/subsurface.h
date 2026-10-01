@@ -44,6 +44,9 @@ struct subsurface {
 	struct wl_list link;
 	struct wl_list pending_link;
 	struct wl_list current_link;
+	struct wl_list cached_link;
+	int32_t cached_x, cached_y;
+	bool cached_position, cached_order_dirty;
 	int32_t x, y;
 	int32_t pending_x, pending_y;
 	bool pending_position;
@@ -62,6 +65,8 @@ void
 subsurface_update_visibility(struct subsurface *subsurface);
 void
 subsurface_set_parent_view(struct subsurface *subsurface, struct view *parent);
+void
+subsurface_cache_parent_commit(struct surface *parent);
 void
 subsurface_parent_commit(struct surface *parent);
 

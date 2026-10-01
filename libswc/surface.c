@@ -31,6 +31,7 @@
 #include "internal.h"
 #include "output.h"
 #include "region.h"
+#include "shm.h"
 #include "screen.h"
 #include "subsurface.h"
 #include "util.h"
@@ -38,8 +39,11 @@
 #include "wayland_buffer.h"
 
 #include <poll.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <wld/wld.h>
 
@@ -66,7 +70,12 @@ handle_release_fence(int fd, uint32_t mask, void *data)
 	struct pending_release *release = data;
 
 	(void)fd;
-	(void)mask;
+	if (!(mask & WL_EVENT_READABLE)) {
+		if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) pending_release_free(release);
+		return 0;
+	}
+	struct pollfd pollfd = { .fd = fd, .events = POLLIN };
+	if (poll(&pollfd, 1, 0) <= 0 || !(pollfd.revents & POLLIN) || (pollfd.revents & POLLERR)) return 0;
 	wl_buffer_send_release(release->resource);
 	pending_release_free(release);
 	return 0;
@@ -109,22 +118,25 @@ release_buffer(struct wl_resource *resource)
 
 	pollfd.fd = fd;
 	pollfd.events = POLLIN;
-	if (poll(&pollfd, 1, 0) == 0 && (release = malloc(sizeof(*release)))) {
-		release->source = wl_event_loop_add_fd(
-		    swc.event_loop, fd, WL_EVENT_READABLE, &handle_release_fence, release);
+	int ready;
+	do { ready = poll(&pollfd, 1, 0); } while (ready < 0 && errno == EINTR);
+	if (ready > 0 && (pollfd.revents & POLLIN) && !(pollfd.revents & POLLERR)) {
+		close(fd); wl_buffer_send_release(resource); return;
+	}
+	release = malloc(sizeof(*release));
+	if (release) {
+		release->source = wl_event_loop_add_fd(swc.event_loop, fd, WL_EVENT_READABLE,
+		    handle_release_fence, release);
 		if (release->source) {
-			release->resource = resource;
-			release->fd = fd;
-			release->destroy_listener.notify = &handle_release_destroy;
-			wl_resource_add_destroy_listener(resource,
-			                                 &release->destroy_listener);
+			release->resource = resource; release->fd = fd;
+			release->destroy_listener.notify = handle_release_destroy;
+			wl_resource_add_destroy_listener(resource, &release->destroy_listener);
 			return;
 		}
 		free(release);
 	}
-
 	close(fd);
-	wl_buffer_send_release(resource);
+	wl_resource_post_no_memory(resource);
 }
 
 /**
@@ -136,7 +148,9 @@ handle_buffer_destroy(struct wl_listener *listener, void *data)
 	struct surface_state *state;
 
 	state = wl_container_of(listener, state, buffer_destroy_listener);
-	state->buffer = NULL;
+	(void)data;
+	wl_list_remove(&state->buffer_destroy_listener.link);
+	wl_list_init(&state->buffer_destroy_listener.link);
 	state->buffer_resource = NULL;
 }
 
@@ -157,6 +171,9 @@ state_initialize(struct surface_state *state)
 	/*layer-shell rejects surfaces with a pre-existing buffer */
 	state->buffer_resource = NULL;
 	state->buffer_destroy_listener.notify = &handle_buffer_destroy;
+	wl_list_init(&state->buffer_destroy_listener.link);
+	state->buffer_scale = 1;
+	state->buffer_transform = WL_OUTPUT_TRANSFORM_NORMAL;
 
 	pixman_region32_init(&state->damage);
 	pixman_region32_init(&state->opaque);
@@ -172,9 +189,8 @@ state_finalize(struct surface_state *state)
 {
 	struct wl_resource *resource, *tmp;
 
-	if (state->buffer) {
-		wl_list_remove(&state->buffer_destroy_listener.link);
-	}
+	if (state->buffer_resource) wl_list_remove(&state->buffer_destroy_listener.link);
+	if (state->buffer) wld_buffer_unreference(state->buffer);
 
 	pixman_region32_fini(&state->damage);
 	pixman_region32_fini(&state->opaque);
@@ -190,21 +206,52 @@ state_finalize(struct surface_state *state)
  * to manage the destroy listeners we have for the new and old buffer.
  */
 static void
-state_set_buffer(struct surface_state *state, struct wl_resource *resource)
+state_assign_buffer(struct surface_state *state, struct wld_buffer *buffer,
+                    struct wl_resource *resource)
 {
-	struct wld_buffer *buffer = resource ? wayland_buffer_get(resource) : NULL;
-
-	if (state->buffer) {
-		wl_list_remove(&state->buffer_destroy_listener.link);
-	}
-
-	if (buffer) {
-		wl_resource_add_destroy_listener(resource,
-		                                 &state->buffer_destroy_listener);
-	}
-
+	if (buffer) wld_buffer_reference(buffer);
+	if (state->buffer_resource) wl_list_remove(&state->buffer_destroy_listener.link);
+	if (state->buffer) wld_buffer_unreference(state->buffer);
+	wl_list_init(&state->buffer_destroy_listener.link);
 	state->buffer = buffer;
 	state->buffer_resource = resource;
+	if (resource) wl_resource_add_destroy_listener(resource, &state->buffer_destroy_listener);
+}
+
+static void
+state_set_buffer(struct surface_state *state, struct wl_resource *resource)
+{
+	state_assign_buffer(state, resource ? wayland_buffer_get(resource) : NULL, resource);
+	}
+
+/* A commit, rather than a subsequent request, takes ownership of cached state. */
+static void
+cache_pending(struct surface *surface)
+{
+	struct surface_pending *p = &surface->pending, *c = &surface->cached;
+	if (p->commit & SURFACE_COMMIT_ATTACH) {
+		if (c->state.buffer_resource && c->state.buffer != p->state.buffer)
+			release_buffer(c->state.buffer_resource);
+		state_assign_buffer(&c->state, p->state.buffer, p->state.buffer_resource);
+		state_set_buffer(&p->state, NULL);
+		c->x = p->x; c->y = p->y;
+	}
+	if (p->commit & SURFACE_COMMIT_DAMAGE)
+		pixman_region32_union(&c->state.damage, &c->state.damage, &p->state.damage);
+	if (p->commit & SURFACE_COMMIT_OPAQUE) pixman_region32_copy(&c->state.opaque, &p->state.opaque);
+	if (p->commit & SURFACE_COMMIT_INPUT) pixman_region32_copy(&c->state.input, &p->state.input);
+	if (p->commit & SURFACE_COMMIT_GEOMETRY) c->window_geometry = p->window_geometry;
+	if (p->commit & SURFACE_COMMIT_SCALE) c->state.buffer_scale = p->state.buffer_scale;
+	if (p->commit & SURFACE_COMMIT_TRANSFORM) c->state.buffer_transform = p->state.buffer_transform;
+	if (!wl_list_empty(&p->state.frame_callbacks)) {
+		wl_list_insert_list(c->state.frame_callbacks.prev, &p->state.frame_callbacks);
+		wl_list_init(&p->state.frame_callbacks);
+	}
+	c->commit |= p->commit;
+	drm_syncobj_surface_cache_commit(surface);
+	subsurface_cache_parent_commit(surface);
+	p->commit = 0;
+	pixman_region32_clear(&p->state.damage);
 }
 
 static void
@@ -277,6 +324,7 @@ damage(struct wl_client *client, struct wl_resource *resource, int32_t x,
        int32_t y, int32_t width, int32_t height)
 {
 	struct surface *surface = wl_resource_get_user_data(resource);
+	if (width <= 0 || height <= 0) return;
 
 	surface->pending.commit |= SURFACE_COMMIT_DAMAGE;
 	pixman_region32_union_rect(&surface->pending.state.damage,
@@ -343,10 +391,81 @@ trim_region(pixman_region32_t *region, struct wld_buffer *buffer)
 	                               buffer ? buffer->height : 0);
 }
 
+/* Rasterize the inverse client transform into logical surface coordinates.
+	* The usual scale=1/normal path keeps the original GPU buffer unchanged. */
+static struct wld_buffer *
+logical_buffer(struct surface *surface, struct wld_buffer *source, int32_t scale,
+               int32_t transform)
+{
+	if (!source) return NULL;
+	if (scale == 1 && transform == WL_OUTPUT_TRANSFORM_NORMAL) {
+		wld_buffer_reference(source);
+		return source;
+	}
+	uint32_t rotated_width = (transform & 1) ? source->height : source->width;
+	uint32_t rotated_height = (transform & 1) ? source->width : source->height;
+	if (rotated_width % scale || rotated_height % scale) {
+		wl_resource_post_error(surface->resource, WL_SURFACE_ERROR_INVALID_SIZE,
+		    "buffer size is not divisible by its scale");
+		return NULL;
+	}
+	uint32_t width = rotated_width / scale, height = rotated_height / scale;
+	if (!width || !height || source->width > UINT32_MAX / 4 ||
+		    source->height > SIZE_MAX / ((size_t)source->width * 4)) return NULL;
+	struct wld_buffer *out = wld_create_buffer(swc.shm->context, width, height,
+		    source->format, WLD_FLAG_MAP);
+	if (!out || !wld_map(out)) {
+		if (out) wld_buffer_unreference(out);
+		wl_resource_post_no_memory(surface->resource);
+		return NULL;
+	}
+	bool mapped = wld_map(source), ok = mapped;
+	void *pixels = mapped ? source->map : malloc((size_t)source->width * source->height * 4);
+	uint32_t pitch = mapped ? source->pitch : source->width * 4;
+	if (!mapped && pixels && swc.backend && swc.backend->context && swc.backend->renderer) {
+		struct wld_renderer *renderer = swc.backend->renderer;
+		struct wld_buffer *scratch = wld_create_buffer(swc.backend->context,
+		    source->width, source->height, WLD_FORMAT_ARGB8888, 0);
+		if (scratch && wld_set_target_buffer(renderer, scratch)) {
+			wld_copy_rectangle(renderer, source, 0, 0, 0, 0, source->width, source->height);
+			ok = wld_read_pixels(renderer, 0, 0, source->width, source->height, pitch, pixels);
+			wld_flush(renderer);
+		}
+		if (scratch) wld_buffer_unreference(scratch);
+	}
+	if (ok) {
+		for (uint32_t y = 0; y < height; ++y) {
+			uint32_t *row = (uint32_t *)((char *)out->map + (size_t)y * out->pitch);
+			for (uint32_t x = 0; x < width; ++x) {
+				uint32_t tx = x * scale + scale / 2, ty = y * scale + scale / 2;
+				uint32_t sx, sy;
+				if (transform & 4) tx = rotated_width - 1 - tx;
+				switch (transform & 3) {
+				case 1: sx = ty; sy = source->height - 1 - tx; break;
+				case 2: sx = source->width - 1 - tx; sy = source->height - 1 - ty; break;
+				case 3: sx = source->width - 1 - ty; sy = tx; break;
+				default: sx = tx; sy = ty; break;
+				}
+				row[x] = *(uint32_t *)((char *)pixels + (size_t)sy * pitch + (size_t)sx * 4);
+			}
+		}
+	}
+	if (mapped) wld_unmap(source); else free(pixels);
+	wld_unmap(out);
+	if (!ok) {
+		wld_buffer_unreference(out);
+		wl_resource_post_no_memory(surface->resource);
+		return NULL;
+	}
+	return out;
+}
+
 static void
-surface_apply_pending(struct surface *surface, bool flush_children)
+surface_apply_pending(struct surface *surface, bool flush_children, bool cached)
 {
 	struct wld_buffer *buffer;
+	struct surface_pending *pending = cached ? &surface->cached : &surface->pending;
+	surface->applying_cached = cached;
 	struct wl_resource *replaced = NULL;
 	bool attached, ready;
 
@@ -358,16 +477,18 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 		return;
 	}
 
+	if (!cached && !shm_buffer_read((pending->commit & SURFACE_COMMIT_ATTACH) ?
+	    pending->state.buffer_resource : surface->state.buffer_resource)) return;
+
 	/* Attach */
-	attached = surface->pending.commit & SURFACE_COMMIT_ATTACH;
+	attached = pending->commit & SURFACE_COMMIT_ATTACH;
 	if (attached) {
 		if (surface->state.buffer &&
-		    surface->state.buffer != surface->pending.state.buffer) {
+		    surface->state.buffer != pending->state.buffer) {
 			replaced = surface->state.buffer_resource;
 		}
 
-		state_set_buffer(&surface->state,
-		                 surface->pending.state.buffer_resource);
+		state_assign_buffer(&surface->state, pending->state.buffer, pending->state.buffer_resource);
 	}
 
 	/*
@@ -384,10 +505,10 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 	buffer = surface->state.buffer;
 	/* Destroying the wl_buffer object does not detach its committed contents.
 	 * The view still owns those pixels until an explicit replacement attach. */
-	if ((!attached || !ready) && surface->view)
+	if ((!ready || !drm_syncobj_surface_buffer_ready(surface)) && surface->view)
 		buffer = surface->view->buffer;
-	if (surface->pending.commit & SURFACE_COMMIT_GEOMETRY) {
-		const struct swc_rectangle *g = &surface->pending.window_geometry;
+	if (pending->commit & SURFACE_COMMIT_GEOMETRY) {
+		const struct swc_rectangle *g = &pending->window_geometry;
 		surface->has_window_geometry = true;
 		surface->window_x = g->x;
 		surface->window_y = g->y;
@@ -395,43 +516,64 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 		surface->window_height = g->height;
 	}
 
+	if (pending->commit & SURFACE_COMMIT_SCALE) surface->state.buffer_scale = pending->state.buffer_scale;
+	if (pending->commit & SURFACE_COMMIT_TRANSFORM) surface->state.buffer_transform = pending->state.buffer_transform;
+
 	/* Damage */
-	if (surface->pending.commit & SURFACE_COMMIT_DAMAGE) {
+	if (pending->commit & SURFACE_COMMIT_DAMAGE) {
 		pixman_region32_union(&surface->state.damage, &surface->state.damage,
-		                      &surface->pending.state.damage);
-		pixman_region32_clear(&surface->pending.state.damage);
+		                      &pending->state.damage);
+		pixman_region32_clear(&pending->state.damage);
 	}
 
 	/* Opaque */
-	if (surface->pending.commit & SURFACE_COMMIT_OPAQUE) {
+	if (pending->commit & SURFACE_COMMIT_OPAQUE) {
 		pixman_region32_copy(&surface->state.opaque,
-		                     &surface->pending.state.opaque);
+		                     &pending->state.opaque);
 	}
 
 	/* Input */
-	if (surface->pending.commit & SURFACE_COMMIT_INPUT) {
+	if (pending->commit & SURFACE_COMMIT_INPUT) {
 		pixman_region32_copy(&surface->state.input,
-		                     &surface->pending.state.input);
+		                     &pending->state.input);
 	}
 
 	/* Frame */
-	if (surface->pending.commit & SURFACE_COMMIT_FRAME) {
+	if (pending->commit & SURFACE_COMMIT_FRAME) {
 		wl_list_insert_list(&surface->state.frame_callbacks,
-		                    &surface->pending.state.frame_callbacks);
-		wl_list_init(&surface->pending.state.frame_callbacks);
+		                    &pending->state.frame_callbacks);
+		wl_list_init(&pending->state.frame_callbacks);
 	}
 
+	struct wld_buffer *logical = NULL;
+	bool refresh = ready && drm_syncobj_surface_buffer_ready(surface) &&
+		(pending->commit & (SURFACE_COMMIT_ATTACH | SURFACE_COMMIT_SCALE |
+				SURFACE_COMMIT_TRANSFORM | SURFACE_COMMIT_DAMAGE | SURFACE_COMMIT_DAMAGE_BUFFER));
+	if (refresh && buffer) {
+		logical = logical_buffer(surface, buffer, surface->state.buffer_scale,
+		    surface->state.buffer_transform);
+		if (!logical) return;
+		buffer = logical;
+	}
+	if (pending->commit & (SURFACE_COMMIT_ATTACH | SURFACE_COMMIT_SCALE |
+		    SURFACE_COMMIT_TRANSFORM | SURFACE_COMMIT_DAMAGE_BUFFER)) {
+		pixman_region32_union_rect(&surface->state.damage, &surface->state.damage, 0, 0,
+		    buffer ? buffer->width : 0, buffer ? buffer->height : 0);
+	}
+	if (!refresh && surface->view) buffer = surface->view->buffer;
 	trim_region(&surface->state.damage, buffer);
 	trim_region(&surface->state.opaque, buffer);
 
 	if (surface->view) {
-		if (surface->pending.commit & (SURFACE_COMMIT_ATTACH | SURFACE_COMMIT_GEOMETRY)) {
+		if (refresh || (pending->commit & SURFACE_COMMIT_GEOMETRY)) {
 			view_attach(surface->view, buffer);
 		}
 		view_update(surface->view);
 	}
 
-	surface->pending.commit = 0;
+	if (logical) wld_buffer_unreference(logical);
+	pending->commit = 0;
+	state_set_buffer(&pending->state, NULL);
 
 	if (surface->subsurface) {
 		surface->subsurface->pending = false;
@@ -452,44 +594,37 @@ surface_apply_pending(struct surface *surface, bool flush_children)
 				continue;
 			}
 			if (child->surface) {
-				surface_apply_pending(child->surface, true);
+				surface_apply_pending(child->surface, true, true);
 			}
 		}
 	}
+	surface->applying_cached = false;
 }
 
 static void
 commit(struct wl_client *client, struct wl_resource *resource)
 {
 	struct surface *surface = wl_resource_get_user_data(resource);
+	surface->applying_cached = false;
 
 	if (surface->subsurface &&
 	    subsurface_is_synchronized(surface->subsurface)) {
+		if (!drm_syncobj_surface_check_commit(surface) ||
+		    !shm_buffer_read((surface->pending.commit & SURFACE_COMMIT_ATTACH) ?
+		       surface->pending.state.buffer_resource :
+		       (surface->cached.state.buffer_resource ? surface->cached.state.buffer_resource : surface->state.buffer_resource))) return;
+		cache_pending(surface);
 		surface->subsurface->pending = true;
 		return;
 	}
 
-	surface_apply_pending(surface, true);
+	surface_apply_pending(surface, true, false);
 }
 
-/*
- * Buffer transforms and scales other than the defaults are not implemented:
- * the renderer only blits buffers one to one.
- *
- * wl_surface only defines invalid_transform for a value outside the
- * wl_output.transform enumeration and invalid_scale for a non-positive scale,
- * so posting a protocol error for a legal-but-unsupported value would kill a
- * conforming client. Chromium/Electron sends set_buffer_scale for a forced
- * device scale factor and set_buffer_transform for a rotated output, so that
- * error was fatal to those clients. Accept the request and ignore it instead;
- * the surface is composited unscaled and unrotated.
- */
 static void
 set_buffer_transform(struct wl_client *client, struct wl_resource *surface,
                      int32_t transform)
 {
-	static bool warned;
-
 	if (transform < WL_OUTPUT_TRANSFORM_NORMAL ||
 	    transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
 		wl_resource_post_error(surface, WL_SURFACE_ERROR_INVALID_TRANSFORM,
@@ -499,19 +634,15 @@ set_buffer_transform(struct wl_client *client, struct wl_resource *surface,
 		return;
 	}
 
-	if (transform != WL_OUTPUT_TRANSFORM_NORMAL && !warned) {
-		warned = true;
-		WARNING("Ignoring unsupported buffer transform %" PRId32 "\n",
-		        transform);
-	}
+	struct surface *s = wl_resource_get_user_data(surface);
+	s->pending.state.buffer_transform = transform;
+	s->pending.commit |= SURFACE_COMMIT_TRANSFORM;
 }
 
 static void
 set_buffer_scale(struct wl_client *client, struct wl_resource *surface,
                  int32_t scale)
 {
-	static bool warned;
-
 	if (scale <= 0) {
 		wl_resource_post_error(surface, WL_SURFACE_ERROR_INVALID_SCALE,
 		                       "buffer scale %" PRId32 " is not positive",
@@ -519,17 +650,19 @@ set_buffer_scale(struct wl_client *client, struct wl_resource *surface,
 		return;
 	}
 
-	if (scale != 1 && !warned) {
-		warned = true;
-		WARNING("Ignoring unsupported buffer scale %" PRId32 "\n", scale);
-	}
+	struct surface *s = wl_resource_get_user_data(surface);
+	s->pending.state.buffer_scale = scale;
+	s->pending.commit |= SURFACE_COMMIT_SCALE;
 }
 
 static void
 damage_buffer(struct wl_client *client, struct wl_resource *surface, int32_t x,
               int32_t y, int32_t w, int32_t h)
 {
-	damage(client, surface, x, y, w, h);
+	(void)client; (void)x; (void)y;
+	if (w <= 0 || h <= 0) return;
+	struct surface *s = wl_resource_get_user_data(surface);
+	s->pending.commit |= SURFACE_COMMIT_DAMAGE_BUFFER;
 }
 
 static const struct wl_surface_interface surface_impl = {
@@ -558,6 +691,7 @@ surface_destroy(struct wl_resource *resource)
 		pointer_set_focus(swc.seat->pointer, NULL);
 	state_finalize(&surface->state);
 	state_finalize(&surface->pending.state);
+	state_finalize(&surface->cached.state);
 
 	if (surface->view) {
 		wl_list_remove(&surface->view_handler.link);
@@ -608,11 +742,14 @@ surface_new(struct wl_client *client, uint32_t version, uint32_t id)
 
 	/* Initialize the surface. */
 	surface->pending.commit = 0;
+	surface->cached.commit = 0;
+	surface->applying_cached = false;
 	wl_signal_init(&surface->signal.commit);
 	wl_signal_init(&surface->signal.destroy);
 	surface->view = NULL;
 	surface->view_handler.impl = &view_handler_impl;
 	surface->role = NULL;
+	surface->role_name = NULL;
 	surface->role_destroy_listener.notify = handle_role_destroy;
 	surface->subsurface = NULL;
 	wl_list_init(&surface->subsurfaces);
@@ -625,6 +762,7 @@ surface_new(struct wl_client *client, uint32_t version, uint32_t id)
 
 	state_initialize(&surface->state);
 	state_initialize(&surface->pending.state);
+	state_initialize(&surface->cached.state);
 
 	return surface;
 
@@ -657,7 +795,12 @@ surface_set_view(struct surface *surface, struct view *view)
 
 	if (view) {
 		wl_list_insert(&view->handlers, &surface->view_handler.link);
-		view_attach(view, surface->state.buffer);
+		if (drm_syncobj_surface_buffer_ready(surface)) {
+			struct wld_buffer *logical = logical_buffer(surface, surface->state.buffer,
+			    surface->state.buffer_scale, surface->state.buffer_transform);
+			view_attach(view, logical);
+			if (logical) wld_buffer_unreference(logical);
+		}
 		view_update(view);
 	}
 }
@@ -665,10 +808,13 @@ surface_set_view(struct surface *surface, struct view *view)
 bool
 surface_set_role(struct surface *surface, struct wl_resource *role)
 {
-	if (surface->role) {
+	if (surface->role == role) return true;
+	const char *name = wl_resource_get_class(role);
+	if (surface->role || (surface->role_name && strcmp(surface->role_name, name) != 0)) {
 		return false;
 	}
 
+	surface->role_name = name;
 	surface->role = role;
 	wl_resource_add_destroy_listener(role, &surface->role_destroy_listener);
 	return true;
@@ -677,7 +823,7 @@ surface_set_role(struct surface *surface, struct wl_resource *role)
 bool
 surface_has_buffer(struct surface *surface)
 {
-	return surface->state.buffer_resource ||
+	return surface->state.buffer || surface->cached.state.buffer ||
 	       ((surface->pending.commit & SURFACE_COMMIT_ATTACH) &&
 	        surface->pending.state.buffer_resource);
 }
@@ -685,15 +831,19 @@ surface_has_buffer(struct surface *surface)
 void
 surface_commit_pending(struct surface *surface)
 {
-	surface_apply_pending(surface, true);
+	surface_apply_pending(surface, true, true);
 }
 
 void
-surface_show_buffer(struct surface *surface, struct wld_buffer *buffer)
+surface_show_buffer(struct surface *surface, struct wld_buffer *buffer, int32_t scale, int32_t transform)
 {
 	if (!surface->view) {
 		return;
 	}
+
+	struct wld_buffer *logical = logical_buffer(surface, buffer, scale, transform);
+	if (buffer && !logical) return;
+	buffer = logical;
 
 	/* Whatever the commit damaged was drawn from the old buffer. */
 	if (buffer) {
@@ -703,4 +853,8 @@ surface_show_buffer(struct surface *surface, struct wld_buffer *buffer)
 	}
 	view_attach(surface->view, buffer);
 	view_update(surface->view);
+	if (logical) wld_buffer_unreference(logical);
+	if (surface->subsurface) subsurface_update_visibility(surface->subsurface);
+	/* Roles must map a first frame deferred until its acquire fence signalled. */
+	wl_signal_emit(&surface->signal.commit, surface);
 }

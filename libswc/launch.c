@@ -27,7 +27,9 @@
 #include "launch/protocol.h"
 #include "util.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <wayland-server.h>
@@ -36,7 +38,24 @@ static struct {
 	int socket;
 	struct wl_event_source *source;
 	uint32_t next_serial;
-} launch;
+} launch = {.socket = -1};
+
+static void
+disconnect_launcher(void)
+{
+	if (launch.source) {
+		wl_event_source_remove(launch.source);
+		launch.source = NULL;
+	}
+	if (launch.socket >= 0) {
+		close(launch.socket);
+		launch.socket = -1;
+	}
+	/* Device access and VT ownership cannot survive the helper. Stop the
+	 * session rather than dispatching EOF as an event or spinning on it. */
+	swc_deactivate();
+	wl_display_terminate(swc.display);
+}
 
 static bool
 handle_event(struct swc_launch_event *event)
@@ -63,10 +82,18 @@ handle_data(int fd, uint32_t mask, void *data)
 	    {.iov_base = &event, .iov_len = sizeof(event)},
 	};
 
-	if (receive_fd(fd, NULL, iov, 1) != -1) {
-		handle_event(&event);
+	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
+		disconnect_launcher();
+		return 0;
 	}
-	return 1;
+	ssize_t size = receive_fd(fd, NULL, iov, 1);
+	if (size == (ssize_t)sizeof(event)) {
+		if (!handle_event(&event))
+			disconnect_launcher();
+	} else if (size >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+		disconnect_launcher();
+	}
+	return 0;
 }
 
 bool
@@ -78,19 +105,26 @@ launch_initialize(void)
 		return false;
 	}
 
-	launch.socket = strtol(socket_string, &end, 10);
-	if (*end != '\0') {
+	errno = 0;
+	long socket_number = strtol(socket_string, &end, 10);
+	if (errno || end == socket_string || *end || socket_number < 0 ||
+	    socket_number > INT_MAX) {
 		return false;
 	}
+	launch.socket = (int)socket_number;
 
 	unsetenv(SWC_LAUNCH_SOCKET_ENV);
 	if (fcntl(launch.socket, F_SETFD, FD_CLOEXEC) < 0) {
+		close(launch.socket);
+		launch.socket = -1;
 		return false;
 	}
 
 	launch.source = wl_event_loop_add_fd(swc.event_loop, launch.socket,
 	                                     WL_EVENT_READABLE, &handle_data, NULL);
 	if (!launch.source) {
+		close(launch.socket);
+		launch.socket = -1;
 		return false;
 	}
 
@@ -100,8 +134,14 @@ launch_initialize(void)
 void
 launch_finalize(void)
 {
-	wl_event_source_remove(launch.source);
-	close(launch.socket);
+	if (launch.source) {
+		wl_event_source_remove(launch.source);
+		launch.source = NULL;
+	}
+	if (launch.socket >= 0) {
+		close(launch.socket);
+		launch.socket = -1;
+	}
 }
 
 static bool
@@ -118,19 +158,40 @@ send_request(struct swc_launch_request *request, const void *data, size_t size,
 
 	request->serial = ++launch.next_serial;
 
-	if (send_fd(launch.socket, out_fd, request_iov, 1 + (size > 0)) == -1) {
+	if (in_fd)
+		*in_fd = -1;
+	if (launch.socket < 0)
+		return false;
+	if (send_fd(launch.socket, out_fd, request_iov, 1 + (size > 0)) !=
+	    (ssize_t)(sizeof(*request) + size)) {
+		disconnect_launcher();
 		return false;
 	}
 
-	while (receive_fd(launch.socket, in_fd, response_iov, 1) != -1) {
+	for (;;) {
+		int received = -1;
+		ssize_t count = receive_fd(launch.socket, &received, response_iov, 1);
+		if (count != (ssize_t)sizeof(*event)) {
+			if (received >= 0)
+				close(received);
+			disconnect_launcher();
+			return false;
+		}
 		if (event->type == SWC_LAUNCH_EVENT_RESPONSE &&
 		    event->serial == request->serial) {
+			if (event->success && in_fd)
+				*in_fd = received;
+			else if (received >= 0)
+				close(received);
 			return true;
 		}
-		handle_event(event);
+		if (received >= 0)
+			close(received);
+		if (!handle_event(event)) {
+			disconnect_launcher();
+			return false;
+		}
 	}
-
-	return false;
 }
 
 int

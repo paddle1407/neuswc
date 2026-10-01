@@ -29,6 +29,7 @@
 #include "pointer.h"
 #include "screen.h"
 #include "seat.h"
+#include "text_input.h"
 #include "surface.h"
 #include "util.h"
 #include "view.h"
@@ -80,6 +81,7 @@ static struct {
 	bool locked;
 	bool sent_locked;
 	bool views_hidden;
+	uint64_t generation;
 
 	struct wl_list surfaces;
 
@@ -141,20 +143,6 @@ save_focus(void)
 
 /* ------------------------------------------------------------- helpers */
 
-static struct lock_surface *
-surface_for_screen(struct screen *screen)
-{
-	struct lock_surface *surface;
-
-	wl_list_for_each(surface, &lock.surfaces, link)
-	{
-		if (surface->screen == screen && surface->mapped) {
-			return surface;
-		}
-	}
-	return NULL;
-}
-
 /* Give the keyboard to any mapped lock surface, preferring the one the
  * pointer is over so that typing goes where the user is looking. */
 static void
@@ -192,18 +180,15 @@ focus_a_lock_surface(void)
 	}
 }
 
-/* Every connected output has a mapped lock surface. */
+/* Every connected output has presented black or lock pixels in this generation. */
 static bool
 all_screens_covered(void)
 {
 	struct screen *screen;
 
-	if (wl_list_empty(&swc.screens)) {
-		return false;
-	}
 	wl_list_for_each(screen, &swc.screens, link)
 	{
-		if (!surface_for_screen(screen)) {
+		if (screen->lock_presented_generation != lock.generation) {
 			return false;
 		}
 	}
@@ -226,6 +211,8 @@ begin_lock(void)
 	input_mode_cancel();
 	swc_overview_end();
 	lock.locked = true;
+	if (!++lock.generation) ++lock.generation;
+	text_input_suspend();
 	lock.sent_locked = false;
 
 	save_focus();
@@ -238,6 +225,7 @@ begin_lock(void)
 		lock.views_hidden = true;
 	}
 	compositor_damage_all();
+	maybe_send_locked(); /* With no outputs there are no presentation obligations. */
 }
 
 static void
@@ -411,6 +399,7 @@ handle_lock_screen_destroy(struct wl_listener *listener, void *data)
 		surface->mapped = false;
 		compositor_view_hide(surface->view);
 	}
+	maybe_send_locked();
 }
 
 /* --------------------------------------------------------------- lock */
@@ -613,6 +602,8 @@ session_lock_manager_create(struct wl_display *display)
 {
 	struct wl_global *global;
 
+	lock.sent_locked = false;
+	lock.views_hidden = false;
 	wl_list_init(&lock.surfaces);
 	wl_list_init(&lock.saved_focus_destroy.link);
 	global = wl_global_create(display, &ext_session_lock_manager_v1_interface,
@@ -640,4 +631,18 @@ session_lock_finish(void)
 		lock.resource = NULL;
 	}
 	initialized = false;
+}
+
+uint64_t
+session_lock_generation(void)
+{
+	return session_lock_active() ? lock.generation : 0;
+}
+
+void
+session_lock_frame_presented(struct screen *screen, uint64_t generation)
+{
+	if (!session_lock_active() || !generation || generation != lock.generation) return;
+	screen->lock_presented_generation = generation;
+	maybe_send_locked();
 }

@@ -86,7 +86,8 @@ static const enum swc_cursor_kind shape_to_kind[] = {
  * a client binding the manager does not fail, but swc has no tablet input, so
  * nothing can ever reach their set_shape. */
 struct cursor_shape_device {
-	bool is_pointer;
+	struct wl_resource *pointer;
+	struct wl_listener pointer_destroy;
 };
 
 static void
@@ -95,8 +96,6 @@ device_set_shape(struct wl_client *client, struct wl_resource *resource,
 {
 	struct cursor_shape_device *device = wl_resource_get_user_data(resource);
 
-	(void)client;
-	(void)serial;
 
 	if (shape == 0 || shape >= ARRAY_LENGTH(shape_to_kind)) {
 		wl_resource_post_error(resource,
@@ -105,7 +104,8 @@ device_set_shape(struct wl_client *client, struct wl_resource *resource,
 		return;
 	}
 
-	if (!device || !device->is_pointer || !swc.seat) {
+	if (!device || !device->pointer || !swc.seat ||
+	    !pointer_cursor_serial_valid(device->pointer, client, serial)) {
 		return;
 	}
 
@@ -115,7 +115,9 @@ device_set_shape(struct wl_client *client, struct wl_resource *resource,
 static void
 destroy_device(struct wl_resource *resource)
 {
-	free(wl_resource_get_user_data(resource));
+	struct cursor_shape_device *device = wl_resource_get_user_data(resource);
+	wl_list_remove(&device->pointer_destroy.link);
+	free(device);
 }
 
 static const struct wp_cursor_shape_device_v1_interface device_impl = {
@@ -124,8 +126,18 @@ static const struct wp_cursor_shape_device_v1_interface device_impl = {
 };
 
 static void
+pointer_destroyed(struct wl_listener *listener, void *data)
+{
+	struct cursor_shape_device *device = wl_container_of(listener, device, pointer_destroy);
+	(void)data;
+	device->pointer = NULL;
+	wl_list_remove(&device->pointer_destroy.link);
+	wl_list_init(&device->pointer_destroy.link);
+}
+
+static void
 create_device(struct wl_client *client, struct wl_resource *manager,
-              uint32_t id, bool is_pointer)
+              uint32_t id, struct wl_resource *pointer)
 {
 	struct cursor_shape_device *device;
 	struct wl_resource *resource;
@@ -135,7 +147,9 @@ create_device(struct wl_client *client, struct wl_resource *manager,
 		wl_client_post_no_memory(client);
 		return;
 	}
-	device->is_pointer = is_pointer;
+	device->pointer = pointer;
+	wl_list_init(&device->pointer_destroy.link);
+	device->pointer_destroy.notify = pointer_destroyed;
 
 	resource = wl_resource_create(client, &wp_cursor_shape_device_v1_interface,
 	                              wl_resource_get_version(manager), id);
@@ -144,6 +158,7 @@ create_device(struct wl_client *client, struct wl_resource *manager,
 		wl_client_post_no_memory(client);
 		return;
 	}
+	if (pointer) wl_resource_add_destroy_listener(pointer, &device->pointer_destroy);
 	wl_resource_set_implementation(resource, &device_impl, device,
 	                               destroy_device);
 }
@@ -152,8 +167,7 @@ static void
 get_pointer(struct wl_client *client, struct wl_resource *manager, uint32_t id,
             struct wl_resource *pointer)
 {
-	(void)pointer;
-	create_device(client, manager, id, true);
+	create_device(client, manager, id, pointer);
 }
 
 static void
@@ -161,7 +175,7 @@ get_tablet_tool_v2(struct wl_client *client, struct wl_resource *manager,
                    uint32_t id, struct wl_resource *tablet_tool)
 {
 	(void)tablet_tool;
-	create_device(client, manager, id, false);
+	create_device(client, manager, id, NULL);
 }
 
 static const struct wp_cursor_shape_manager_v1_interface manager_impl = {

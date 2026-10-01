@@ -421,6 +421,7 @@ hotplug_finalize(void)
 bool
 drm_initialize(void)
 {
+	memset(&drm, 0, sizeof(drm));
 	uint64_t val;
 	char primary[PATH_MAX];
 
@@ -510,7 +511,10 @@ error3:
 error2:
 	wld_destroy_context(swc.drm->context);
 error1:
+	free(drm.path);
+	drm.path = NULL;
 	close(swc.drm->fd);
+	swc.drm->fd = -1;
 error0:
 	return false;
 }
@@ -518,6 +522,7 @@ error0:
 void
 drm_finalize(void)
 {
+	drm_syncobj_manager_finish();
 #ifdef ENABLE_LIBUDEV
 	hotplug_finalize();
 #endif
@@ -538,6 +543,12 @@ drm_finalize(void)
 	wld_destroy_context(swc.drm->context);
 	free(drm.path);
 	close(swc.drm->fd);
+	swc.drm->fd = -1;
+	swc.drm->context = NULL;
+	swc.drm->renderer = NULL;
+	swc.drm->backend.context = NULL;
+	swc.drm->backend.renderer = NULL;
+	memset(&drm, 0, sizeof(drm));
 }
 
 /*
@@ -916,43 +927,32 @@ drm_get_framebuffer(struct wld_buffer *buffer)
 		return object.u32;
 	}
 
-	if (!wld_export(buffer, WLD_DRM_OBJECT_HANDLE, &object)) {
-		ERROR("Could not get buffer handle\n");
-		return 0;
+	struct wld_drm_layout fallback = { .num_planes = 1 };
+	const struct wld_drm_layout *layout;
+	if (wld_export(buffer, WLD_DRM_OBJECT_LAYOUT, &object)) {
+		layout = object.ptr;
+	} else {
+		if (!wld_export(buffer, WLD_DRM_OBJECT_HANDLE, &object)) return 0;
+		fallback.handles[0] = object.u32;
+		fallback.pitches[0] = buffer->pitch;
+		fallback.modifiers[0] = DRM_FORMAT_MOD_INVALID;
+		if (wld_export(buffer, WLD_DRM_OBJECT_MODIFIER, &object))
+			fallback.modifiers[0] = object.u64;
+		layout = &fallback;
 	}
-
-	if (!(framebuffer = malloc(sizeof(*framebuffer)))) {
-		return 0;
-	}
-
-	{
-		union wld_object mod_object;
-		uint32_t handle = object.u32;
-		uint64_t modifier = DRM_FORMAT_MOD_INVALID;
-
-		if (wld_export(buffer, WLD_DRM_OBJECT_MODIFIER, &mod_object)) {
-			modifier = mod_object.u64;
-		}
-
-		/*
-		 * A tiled buffer must be declared with its modifier. Without
-		 * DRM_MODE_FB_MODIFIERS the kernel treats it as linear and rejects
-		 * it, which is what happens to every buffer the GBM backend
-		 * allocates on hardware that tiles them.
-		 */
-		if (modifier != DRM_FORMAT_MOD_INVALID &&
-		    modifier != DRM_FORMAT_MOD_LINEAR) {
-			ret = drmModeAddFB2WithModifiers(
-			    swc.drm->fd, buffer->width, buffer->height, buffer->format,
-			    (uint32_t[4]){handle}, (uint32_t[4]){buffer->pitch},
-			    (uint32_t[4]){0}, (uint64_t[4]){modifier}, &framebuffer->id,
-			    DRM_MODE_FB_MODIFIERS);
+	if (!layout || !layout->num_planes || layout->num_planes > 4) return 0;
+	if (!(framebuffer = malloc(sizeof(*framebuffer)))) return 0;
+	bool explicit_modifier = false;
+	for (unsigned i = 0; i < layout->num_planes; ++i)
+		explicit_modifier |= layout->modifiers[i] != DRM_FORMAT_MOD_INVALID &&
+		    layout->modifiers[i] != DRM_FORMAT_MOD_LINEAR;
+	if (explicit_modifier) {
+		ret = drmModeAddFB2WithModifiers(swc.drm->fd, buffer->width, buffer->height,
+			buffer->format, layout->handles, layout->pitches, layout->offsets,
+			layout->modifiers, &framebuffer->id, DRM_MODE_FB_MODIFIERS);
 		} else {
-			ret = drmModeAddFB2(swc.drm->fd, buffer->width, buffer->height,
-			                    buffer->format, (uint32_t[4]){handle},
-			                    (uint32_t[4]){buffer->pitch},
-			                    (uint32_t[4]){0}, &framebuffer->id, 0);
-		}
+		ret = drmModeAddFB2(swc.drm->fd, buffer->width, buffer->height, buffer->format,
+			layout->handles, layout->pitches, layout->offsets, &framebuffer->id, 0);
 	}
 	if (ret < 0) {
 		ERROR("Could not add framebuffer: %s\n", strerror(errno));

@@ -25,6 +25,7 @@
 #define SWC_SESSION_LOCK_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <wayland-server.h>
 
 struct wl_global *
@@ -39,5 +40,9 @@ session_lock_finish(void);
  */
 bool
 session_lock_active(void);
+
+struct screen;
+uint64_t session_lock_generation(void);
+void session_lock_frame_presented(struct screen *screen, uint64_t generation);
 
 #endif

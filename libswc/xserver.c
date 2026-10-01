@@ -106,7 +106,10 @@ open_display(void)
 	goto begin;
 
 retry2:
-	close(xserver.abstract_fd);
+	if (xserver.abstract_fd >= 0) {
+		close(xserver.abstract_fd);
+		xserver.abstract_fd = -1;
+	}
 retry1:
 	unlink(lock_name);
 retry0:
@@ -276,6 +279,7 @@ bool
 xserver_initialize(void)
 {
 	int wl[2], wm[2];
+	xserver.finalizing = false;
 	xserver.initializing = true;
 
 	/* Open an X display */
@@ -324,9 +328,8 @@ xserver_initialize(void)
 		/* Unset the FD_CLOEXEC flag on the FDs that will get passed to
 		 * Xwayland. */
 		for (index = 0; index < ARRAY_LENGTH(fds); ++index) {
-#if defined(__FreeBSD__)
-		  if (fds[index]==-1) continue;
-#endif
+			if (fds[index] < 0)
+				continue;
 			if (fcntl(fds[index], F_SETFD, 0) != 0) {
 				ERROR("fcntl() failed: %s\n", strerror(errno));
 				goto fail;

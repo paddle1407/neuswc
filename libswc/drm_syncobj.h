@@ -24,6 +24,7 @@ struct wl_resource;
  * implicitly as soon as they see the global.
  */
 struct wl_global *drm_syncobj_manager_create(struct wl_display *display);
+void drm_syncobj_manager_finish(void);
 
 /**
  * Validates the explicit-synchronization state staged for this commit.
@@ -32,6 +33,7 @@ struct wl_global *drm_syncobj_manager_create(struct wl_display *display);
  * not be applied.
  */
 bool drm_syncobj_surface_check_commit(struct surface *surface);
+void drm_syncobj_surface_cache_commit(struct surface *surface);
 
 /**
  * Applies that state: signals the release point of the buffer this commit
@@ -50,11 +52,11 @@ bool drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
                                       struct wl_resource **replaced);
 
 /**
- * Puts up the newest buffer still waiting for its acquire point, after a
- * bounded wait, for callers about to show the surface's committed buffer
- * anyway.
+	* Puts up the newest queued buffer only when its acquire fence is ready.
+	* Callers must also check surface_buffer_ready before attaching current state.
  */
 void drm_syncobj_surface_settle(struct surface *surface);
+bool drm_syncobj_surface_buffer_ready(struct surface *surface);
 
 /** Signals any outstanding release point, when a surface is going away. */
 void drm_syncobj_surface_finish(struct surface *surface);
@@ -68,11 +70,22 @@ drm_syncobj_manager_create(struct wl_display *display)
 	return NULL;
 }
 
+static inline void
+drm_syncobj_manager_finish(void)
+{
+}
+
 static inline bool
 drm_syncobj_surface_check_commit(struct surface *surface)
 {
 	(void)surface;
 	return true;
+}
+
+static inline void
+drm_syncobj_surface_cache_commit(struct surface *surface)
+{
+	(void)surface;
 }
 
 static inline bool
@@ -82,6 +95,13 @@ drm_syncobj_surface_apply_commit(struct surface *surface, bool attached,
 	(void)surface;
 	(void)attached;
 	(void)replaced;
+	return true;
+}
+
+static inline bool
+drm_syncobj_surface_buffer_ready(struct surface *surface)
+{
+	(void)surface;
 	return true;
 }
 

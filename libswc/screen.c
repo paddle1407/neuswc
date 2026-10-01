@@ -165,6 +165,7 @@ screen_new(struct output *output)
 		goto error0;
 	}
 	screen->wallpaper = NULL;
+	screen->lock_presented_generation = 0;
 
 	screen->global = wl_global_create(
 	    swc.display, &swc_screen_interface, 1, screen, &bind_screen);
