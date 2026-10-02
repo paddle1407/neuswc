@@ -68,10 +68,11 @@ foreach proto, proto_src : protos
 	libswc_src += proto_src
 endforeach
 
+math = cc.find_library('m')
 libswc_lib = library(
 	'swc',
 	libswc_src,
-	dependencies: requires + requires_private,
+	dependencies: requires + requires_private + [math],
 	install: true,
 	include_directories: include_directories('..'),
 )
@@ -79,13 +80,14 @@ libswc_lib = library(
 # Allows other meson projects to use libswc
 libswc = declare_dependency(
 	link_with: libswc_lib,
-	dependencies: requires + requires_private,
+	dependencies: requires + requires_private + [math],
 )
 
 pkg.generate(
   libswc_lib,
   name: 'swc',
   description: 'A library for making a simple Wayland compositor',
+  libraries_private: math,
   requires: requires,
   requires_private: requires_private,
 )
