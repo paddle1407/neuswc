@@ -19,6 +19,8 @@ struct output {
 	uint32_t physical_width, physical_height;
 
 	struct wl_array modes;
+	/* The mode the screen is driven at: the monitor's preferred one, unless
+	 * output management chose another. */
 	struct mode *preferred_mode;
 
 	pixman_region32_t current_damage, previous_damage;

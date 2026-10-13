@@ -64,7 +64,8 @@ EXPORT bool
 swc_screen_set_initial_position(struct swc_screen *base, int32_t x, int32_t y)
 {
 	struct screen *screen = INTERNAL(base);
-	if (!screen || !screen->configuring || x < -32768 || y < -32768 ||
+	if (!screen || !screen->configuring || screen->position_fixed ||
+	    x < -32768 || y < -32768 ||
 	    (int64_t)x + base->geometry.width > 32768 ||
 	    (int64_t)y + base->geometry.height > 32768)
 		return false;
@@ -149,7 +150,8 @@ bind_screen(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 
 struct screen *
 #ifdef ENABLE_DRM
-screen_new(uint32_t crtc, struct output *output, struct plane *cursor_plane)
+screen_new(uint32_t crtc, struct output *output, struct plane *cursor_plane,
+           const int32_t *position)
 #else
 screen_new(struct output *output)
 #endif
@@ -212,8 +214,16 @@ screen_new(struct output *output)
 	view_move(&screen->planes.primary.view, x, 0);
 	screen->base.geometry = screen->planes.primary.view.geometry;
 	screen->base.usable_geometry = screen->base.geometry;
+	screen->position_fixed = false;
 
 	screen->configuring = true;
+#ifdef ENABLE_DRM
+	if (position) {
+		screen->position_fixed =
+		    swc_screen_set_initial_position(&screen->base, position[0],
+		                                    position[1]);
+	}
+#endif
 	swc.manager->new_screen(&screen->base);
 	screen->configuring = false;
 

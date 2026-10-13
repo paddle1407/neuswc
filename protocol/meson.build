@@ -10,6 +10,7 @@ foreach proto : [
   'wlr-layer-shell-unstable-v1.xml',
   'wlr-foreign-toplevel-management-unstable-v1.xml',
   'wlr-screencopy-unstable-v1.xml',
+  'wlr-output-management-unstable-v1.xml',
   'wayland-drm.xml',
   wl.find_protocol('xdg-shell', state: 'stable'),
   wl.find_protocol('linux-dmabuf', state: 'unstable', version: 1),

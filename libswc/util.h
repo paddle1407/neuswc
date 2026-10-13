@@ -49,6 +49,9 @@
 	} while (false)
 
 #define WARNING(format, ...) MESSAGE("WARNING", format, ##__VA_ARGS__)
+/* Rare events worth finding in a release build's log, such as a monitor
+ * being plugged in. Not for anything that happens per frame. */
+#define NOTICE(format, ...) MESSAGE("INFO", format, ##__VA_ARGS__)
 #define ERROR(format, ...) MESSAGE("ERROR", format, ##__VA_ARGS__)
 
 #if ENABLE_DEBUG

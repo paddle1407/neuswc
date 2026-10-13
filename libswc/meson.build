@@ -58,7 +58,7 @@ libswc_src = files(
 
   xwayland.found() ? ['xserver.c', 'xwm.c', 'xselection.c'] : [],  
 
-  video_backend == 'drm' ? ['dmabuf.c', 'drm.c', 'drm_syncobj.c', 'plane.c'] : [],
+  video_backend == 'drm' ? ['dmabuf.c', 'drm.c', 'drm_syncobj.c', 'output_management.c', 'plane.c'] : [],
   framebuffer_backend == 'fbdev' ? ['fb.c', 'fb_fbdev.c'] : [],
   framebuffer_backend == 'wsdisplay' ? ['fb.c', 'fb_wsdisplay.c'] : [],
 )

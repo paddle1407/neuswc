@@ -29,6 +29,7 @@
 #include "internal.h"
 #include "launch.h"
 #include "output.h"
+#include "output_management.h"
 #include "plane.h"
 #include "screen.h"
 #include "util.h"
@@ -64,6 +65,7 @@ static struct {
 	struct wl_global *global;
 	struct wl_global *dmabuf;
 	struct wl_global *syncobj;
+	struct wl_global *output_manager;
 	struct wl_event_source *event_source;
 
 	/* Connector hotplug, reported by the kernel as a uevent on the card. */
@@ -73,8 +75,79 @@ static struct {
 	struct wl_event_source *monitor_source;
 	dev_t devnum;
 #endif
+	/* "card1": connector uevents come from "card1-HDMI-A-1" and the like. */
+	char card[32];
 	struct wl_event_source *rescan_source;
+	/* A connector can report connected before it can be lit: no modes until
+	 * its EDID has been read, or no CRTC free yet. Such a rescan is tried
+	 * again a few times rather than waiting for a uevent that need not come. */
+	struct wl_event_source *retry_timer;
+	unsigned retries;
+	struct wl_listener swc_listener;
+	/* What output management asked of each connector; see struct request. */
+	struct wl_list requests;
 } drm;
+
+/*
+ * Output management's settings for one connector, kept until the monitor is
+ * unplugged so that they survive the screen being recreated. A connector
+ * without one is configured automatically: enabled, preferred mode, placed
+ * by the window manager.
+ */
+struct request {
+	uint32_t connector;
+	bool disabled;
+	bool has_mode;
+	drmModeModeInfo mode;
+	bool has_position;
+	int32_t x, y;
+	struct wl_list link;
+};
+
+static struct request *
+find_request(uint32_t connector)
+{
+	struct request *request;
+
+	wl_list_for_each(request, &drm.requests, link)
+	{
+		if (request->connector == connector) {
+			return request;
+		}
+	}
+	return NULL;
+}
+
+static bool
+connector_disabled(uint32_t connector)
+{
+	struct request *request = find_request(connector);
+
+	return request && request->disabled;
+}
+
+static void
+drop_request(uint32_t connector)
+{
+	struct request *request = find_request(connector);
+
+	if (request) {
+		wl_list_remove(&request->link);
+		free(request);
+	}
+}
+
+static void
+drop_requests(void)
+{
+	struct request *request, *tmp;
+
+	wl_list_for_each_safe(request, tmp, &drm.requests, link)
+	{
+		wl_list_remove(&request->link);
+		free(request);
+	}
+}
 
 static void
 authenticate(struct wl_client *client, struct wl_resource *resource,
@@ -334,27 +407,79 @@ bind_drm(struct wl_client *client, void *data, uint32_t version, uint32_t id)
 	wl_drm_send_format(resource, WL_DRM_FORMAT_ARGB8888);
 }
 
-#ifdef ENABLE_LIBUDEV
 static void
 rescan_connectors(void *data);
+
+/* Coalesced: a burst of uevents arrives for one plug; probe once, after it. */
+static void
+queue_rescan(void)
+{
+	if (!drm.rescan_source) {
+		drm.rescan_source =
+		    wl_event_loop_add_idle(swc.event_loop, &rescan_connectors, NULL);
+	}
+}
+
+static int
+handle_retry(void *data)
+{
+	(void)data;
+	queue_rescan();
+	return 0;
+}
+
+static void
+handle_swc_event(struct wl_listener *listener, void *data)
+{
+	struct event *event = data;
+
+	(void)listener;
+	/* Monitors plugged or unplugged while switched away were never seen:
+	 * the rescans of that time could not touch the display. */
+	if (event->type == SWC_EVENT_ACTIVATED) {
+		drm.retries = 0;
+		queue_rescan();
+	}
+}
+
+#ifdef ENABLE_LIBUDEV
+/*
+ * The card itself announces connector changes (HOTPLUG=1), but kernels also
+ * send change events from the connector devices under it, which have no
+ * device number of their own. Either one is a reason to look again.
+ */
+static bool
+uevent_is_ours(struct udev_device *device)
+{
+	const char *sysname = udev_device_get_sysname(device);
+	size_t len = strlen(drm.card);
+
+	if (drm.devnum && udev_device_get_devnum(device) == drm.devnum) {
+		return true;
+	}
+	return len && sysname && strncmp(sysname, drm.card, len) == 0 &&
+	       (sysname[len] == '\0' || sysname[len] == '-');
+}
 
 static int
 handle_uevent(int fd, uint32_t mask, void *data)
 {
 	struct udev_device *device;
-	const char *hotplug;
-	bool ours;
+	const char *action, *hotplug, *connector;
+	bool rescan;
 
 	while ((device = udev_monitor_receive_device(drm.monitor))) {
+		action = udev_device_get_action(device);
 		hotplug = udev_device_get_property_value(device, "HOTPLUG");
-		ours = udev_device_get_devnum(device) == drm.devnum;
+		connector = udev_device_get_property_value(device, "CONNECTOR");
+		rescan = uevent_is_ours(device) &&
+		         ((hotplug && strcmp(hotplug, "1") == 0) || connector ||
+		          (action && strcmp(action, "change") == 0));
 		udev_device_unref(device);
 
-		/* A burst of these arrives for one plug; probe once, after it. */
-		if (ours && hotplug && strcmp(hotplug, "1") == 0 &&
-		    !drm.rescan_source) {
-			drm.rescan_source = wl_event_loop_add_idle(
-			    swc.event_loop, &rescan_connectors, NULL);
+		if (rescan) {
+			drm.retries = 0;
+			queue_rescan();
 		}
 	}
 
@@ -390,6 +515,8 @@ hotplug_initialize(void)
 		goto error2;
 	}
 
+	NOTICE("Watching %s for monitors being plugged in or out\n",
+	       drm.card[0] ? drm.card : "the DRM device");
 	return;
 
 error2:
@@ -416,19 +543,35 @@ hotplug_finalize(void)
 		udev_unref(drm.udev);
 	}
 }
+#else
+static void
+hotplug_initialize(void)
+{
+	WARNING("Built without libudev: monitors plugged in later are only "
+	        "found by output management or a VT switch\n");
+}
+
+static void
+hotplug_finalize(void)
+{
+}
 #endif
 
 bool
 drm_initialize(void)
 {
 	memset(&drm, 0, sizeof(drm));
+	wl_list_init(&drm.requests);
 	uint64_t val;
 	char primary[PATH_MAX];
+	const char *card;
 
 	if (!find_primary_drm_device(primary, sizeof(primary))) {
 		ERROR("Could not find DRM device\n");
 		goto error0;
 	}
+	card = strrchr(primary, '/');
+	snprintf(drm.card, sizeof(drm.card), "%.31s", card ? card + 1 : primary);
 
 	swc.drm->fd = launch_open_device(primary, O_RDWR | O_CLOEXEC);
 	if (swc.drm->fd == -1) {
@@ -498,9 +641,18 @@ drm_initialize(void)
 		drm.syncobj = drm_syncobj_manager_create(swc.display);
 	}
 
-#ifdef ENABLE_LIBUDEV
+	drm.swc_listener.notify = &handle_swc_event;
+	wl_signal_add(&swc.event_signal, &drm.swc_listener);
+	drm.retry_timer =
+	    wl_event_loop_add_timer(swc.event_loop, &handle_retry, NULL);
 	hotplug_initialize();
-#endif
+
+	/* Lets wlr-randr and the like list, enable, disable and place monitors;
+	 * an extra, like hotplug. */
+	drm.output_manager = output_management_create(swc.display);
+	if (!drm.output_manager) {
+		WARNING("Could not create wlr_output_manager global\n");
+	}
 
 	return true;
 
@@ -523,12 +675,19 @@ void
 drm_finalize(void)
 {
 	drm_syncobj_manager_finish();
-#ifdef ENABLE_LIBUDEV
+	if (drm.output_manager) {
+		output_management_finish();
+		wl_global_destroy(drm.output_manager);
+	}
 	hotplug_finalize();
-#endif
+	wl_list_remove(&drm.swc_listener.link);
+	if (drm.retry_timer) {
+		wl_event_source_remove(drm.retry_timer);
+	}
 	if (drm.rescan_source) {
 		wl_event_source_remove(drm.rescan_source);
 	}
+	drop_requests();
 	if (drm.syncobj) {
 		wl_global_destroy(drm.syncobj);
 	}
@@ -599,6 +758,27 @@ destroy_planes(struct wl_list *planes)
 		plane_destroy(plane);
 }
 
+void
+drm_connector_name(const drmModeConnector *connector, char *name, size_t size)
+{
+	const char *type = drmModeGetConnectorTypeName(connector->connector_type);
+
+	snprintf(name, size, "%s-%" PRIu32, type ? type : "UNKNOWN",
+	         connector->connector_type_id);
+}
+
+bool
+drm_mode_info_equal(const drmModeModeInfo *a, const drmModeModeInfo *b)
+{
+	return a->clock == b->clock && a->hdisplay == b->hdisplay &&
+	       a->hsync_start == b->hsync_start && a->hsync_end == b->hsync_end &&
+	       a->htotal == b->htotal && a->hskew == b->hskew &&
+	       a->vdisplay == b->vdisplay && a->vsync_start == b->vsync_start &&
+	       a->vsync_end == b->vsync_end && a->vtotal == b->vtotal &&
+	       a->vscan == b->vscan && a->vrefresh == b->vrefresh &&
+	       a->flags == b->flags;
+}
+
 /* Leaves it to the caller to put the screen in the list: startup and hotplug
  * put them at different ends. */
 static struct screen *
@@ -608,15 +788,20 @@ create_screen(drmModeRes *resources, drmModeConnector *connector,
 	struct plane *plane, *cursor_plane;
 	struct output *output;
 	struct screen *screen;
+	struct request *request;
+	struct mode *mode;
+	int32_t position[2];
 	uint32_t taken_crtcs = 0;
 	int crtc_index;
+	char name[32];
+
+	drm_connector_name(connector, name, sizeof(name));
 
 	wl_list_for_each(screen, screens, link)
 		taken_crtcs |= UINT32_C(1) << screen->id;
 
 	if (!find_available_crtc(resources, connector, taken_crtcs, &crtc_index)) {
-		WARNING("Could not find CRTC for connector %" PRIu32 "\n",
-		        connector->connector_id);
+		WARNING("Could not find a free CRTC for %s\n", name);
 		return NULL;
 	}
 
@@ -635,6 +820,10 @@ create_screen(drmModeRes *resources, drmModeConnector *connector,
 	}
 
 	if (!(output = output_new(connector))) {
+		/* Usually a monitor whose EDID has not been read yet: the rescan
+		 * is retried. */
+		WARNING("Could not create output for %s (%d modes)\n", name,
+		        connector->count_modes);
 		/* The cursor plane was taken out of the list for this
 		 * connector, so nothing else will free it. */
 		if (cursor_plane) {
@@ -643,8 +832,25 @@ create_screen(drmModeRes *resources, drmModeConnector *connector,
 		return NULL;
 	}
 
+	/* Output management's choices, where they still apply. */
+	request = find_request(connector->connector_id);
+	if (request && request->has_mode) {
+		wl_array_for_each(mode, &output->modes)
+		{
+			if (drm_mode_info_equal(&mode->info, &request->mode)) {
+				output->preferred_mode = mode;
+				break;
+			}
+		}
+	}
+	if (request && request->has_position) {
+		position[0] = request->x;
+		position[1] = request->y;
+	}
+
 	output->screen = screen =
-	    screen_new(resources->crtcs[crtc_index], output, cursor_plane);
+	    screen_new(resources->crtcs[crtc_index], output, cursor_plane,
+	               request && request->has_position ? position : NULL);
 	if (!screen) {
 		ERROR("Could not create screen for CRTC %d\n", crtc_index);
 		output_destroy(output);
@@ -698,9 +904,7 @@ drm_create_screens(struct wl_list *screens)
 	return true;
 }
 
-/* Hotplug {{{ */
-
-#ifdef ENABLE_LIBUDEV
+/* Hotplug and output management {{{ */
 
 static uint32_t
 screen_connector(struct screen *screen)
@@ -727,8 +931,8 @@ find_connector(drmModeConnector **connectors, int count, uint32_t id)
 	return NULL;
 }
 
-static struct screen *
-find_screen(uint32_t connector)
+struct screen *
+drm_screen_for_connector(uint32_t connector)
 {
 	struct screen *screen;
 
@@ -741,7 +945,15 @@ find_screen(uint32_t connector)
 	return NULL;
 }
 
-/* A screen for every connected connector that lacks one. */
+/* Connected, and not turned off through output management. */
+static bool
+connector_wanted(const drmModeConnector *connector)
+{
+	return connector && connector->connection == DRM_MODE_CONNECTED &&
+	       !connector_disabled(connector->connector_id);
+}
+
+/* A screen for every wanted connector that lacks one. */
 static bool
 add_screens(drmModeRes *resources, drmModeConnector **connectors)
 {
@@ -755,16 +967,16 @@ add_screens(drmModeRes *resources, drmModeConnector **connectors)
 		return false;
 	}
 	for (i = 0; i < resources->count_connectors; ++i) {
-		if (!connectors[i] ||
-		    connectors[i]->connection != DRM_MODE_CONNECTED) {
+		if (!connector_wanted(connectors[i])) {
 			continue;
 		}
-		if ((screen = find_screen(connectors[i]->connector_id))) {
+		if ((screen = drm_screen_for_connector(connectors[i]->connector_id))) {
 			output = wl_container_of(screen->outputs.next, output, link);
 			/* The last screen, kept through an unplug, is back. The CRTC
 			 * is still programmed for it, but set the mode again rather
 			 * than trust a flip to a monitor that was just replugged. */
 			if (output->disconnected) {
+				NOTICE("Monitor %s reconnected\n", output->name);
 				output->disconnected = false;
 				screen->planes.primary.need_modeset = true;
 				changed = true;
@@ -776,7 +988,10 @@ add_screens(drmModeRes *resources, drmModeConnector **connectors)
 			/* At the end: the first screen is the fallback for a lot of
 			 * things, and a monitor being plugged in should not move it. */
 			wl_list_insert(swc.screens.prev, &screen->link);
-			DEBUG("Screen %s connected\n", swc_screen_get_name(&screen->base));
+			NOTICE("Monitor %s connected: %ux%u at %d,%d\n",
+			       swc_screen_get_name(&screen->base),
+			       screen->base.geometry.width, screen->base.geometry.height,
+			       screen->base.geometry.x, screen->base.geometry.y);
 			screen_added(screen);
 			changed = true;
 		}
@@ -786,11 +1001,20 @@ add_screens(drmModeRes *resources, drmModeConnector **connectors)
 	return changed;
 }
 
+static void
+remove_screen(struct screen *screen)
+{
+	NOTICE("Monitor %s removed\n", swc_screen_get_name(&screen->base));
+	/* Off before its buffers are freed with it. */
+	primary_plane_disable(&screen->planes.primary);
+	screen_destroy(screen);
+}
+
 /*
- * Tear down the screens whose connector is gone. The last screen is kept even
- * then: everything from the window manager's layout to absolute pointer motion
- * assumes there is one, and it has somewhere to put the windows when a
- * monitor comes back.
+ * Tear down the screens whose connector is gone or turned off. The last
+ * screen is kept even then: everything from the window manager's layout to
+ * absolute pointer motion assumes there is one, and it has somewhere to put
+ * the windows when a monitor comes back.
  */
 static bool
 remove_screens(drmModeConnector **connectors, int count)
@@ -803,7 +1027,7 @@ remove_screens(drmModeConnector **connectors, int count)
 	wl_list_for_each_safe(screen, tmp, &swc.screens, link)
 	{
 		connector = find_connector(connectors, count, screen_connector(screen));
-		if (connector && connector->connection == DRM_MODE_CONNECTED) {
+		if (connector_wanted(connector)) {
 			continue;
 		}
 		if (swc.screens.next->next == &swc.screens) {
@@ -812,43 +1036,110 @@ remove_screens(drmModeConnector **connectors, int count)
 				WARNING("Last screen was unplugged; keeping it until "
 				        "another is connected\n");
 				output->disconnected = true;
+				changed = true;
 			}
 			continue;
 		}
-		DEBUG("Screen %s disconnected\n", swc_screen_get_name(&screen->base));
-		/* Off before its buffers are freed with it. */
-		primary_plane_disable(&screen->planes.primary);
-		screen_destroy(screen);
+		remove_screen(screen);
 		changed = true;
 	}
 
 	return changed;
 }
 
+/* Each connector, as of now. probe asks the monitors again, which takes a
+ * while (EDID is read over DDC); without it the kernel's last answer is
+ * given. */
+static drmModeConnector **
+get_connectors(drmModeRes *resources, bool probe)
+{
+	drmModeConnector **connectors;
+	int i;
+
+	connectors = calloc(resources->count_connectors, sizeof(*connectors));
+	if (!connectors) {
+		return NULL;
+	}
+	for (i = 0; i < resources->count_connectors; ++i)
+		connectors[i] =
+		    probe ? drmModeGetConnector(swc.drm->fd, resources->connectors[i])
+		          : drmModeGetConnectorCurrent(swc.drm->fd,
+		                                       resources->connectors[i]);
+	return connectors;
+}
+
 static void
-rescan_connectors(void *data)
+free_connectors(drmModeConnector **connectors, int count)
+{
+	int i;
+
+	for (i = 0; i < count; ++i)
+		drmModeFreeConnector(connectors[i]);
+	free(connectors);
+}
+
+static void
+screens_changed(void)
+{
+	screens_update_pointer_region();
+	compositor_damage_all();
+}
+
+/* Try again later for a connector that is wanted but has no screen. */
+static void
+schedule_retry(drmModeRes *resources, drmModeConnector **connectors)
+{
+	enum { MAX_RETRIES = 5 };
+	char name[32];
+	int i;
+
+	for (i = 0; i < resources->count_connectors; ++i) {
+		if (!connector_wanted(connectors[i]) ||
+		    drm_screen_for_connector(connectors[i]->connector_id)) {
+			continue;
+		}
+		drm_connector_name(connectors[i], name, sizeof(name));
+		if (drm.retries >= MAX_RETRIES || !drm.retry_timer) {
+			WARNING("Monitor %s is connected but could not be lit; giving "
+			        "up until it is plugged in again\n", name);
+			return;
+		}
+		++drm.retries;
+		NOTICE("Monitor %s is connected but not ready; trying again\n",
+		       name);
+		wl_event_source_timer_update(drm.retry_timer, 500 * drm.retries);
+		return;
+	}
+	drm.retries = 0;
+}
+
+static void
+rescan(bool probe)
 {
 	drmModeRes *resources;
 	drmModeConnector **connectors;
+	struct request *request, *tmp;
 	bool changed;
-	int i;
-
-	(void)data;
-	drm.rescan_source = NULL;
 
 	if (!(resources = drmModeGetResources(swc.drm->fd))) {
 		ERROR("Could not get DRM resources: %s\n", strerror(errno));
 		return;
 	}
-	connectors = calloc(resources->count_connectors, sizeof(*connectors));
-	if (!connectors) {
+	/* Probed once, here: every question below is about this snapshot. */
+	if (!(connectors = get_connectors(resources, probe))) {
 		drmModeFreeResources(resources);
 		return;
 	}
-	/* Probed once, here: every question below is about this snapshot. */
-	for (i = 0; i < resources->count_connectors; ++i)
-		connectors[i] = drmModeGetConnector(swc.drm->fd,
-		                                    resources->connectors[i]);
+
+	/* A monitor plugged in again starts afresh. */
+	wl_list_for_each_safe(request, tmp, &drm.requests, link)
+	{
+		drmModeConnector *connector = find_connector(
+		    connectors, resources->count_connectors, request->connector);
+		if (!connector || connector->connection != DRM_MODE_CONNECTED) {
+			drop_request(request->connector);
+		}
+	}
 
 	/*
 	 * New screens first, so the window manager always has a screen to move
@@ -863,16 +1154,245 @@ rescan_connectors(void *data)
 	}
 
 	if (changed) {
-		screens_update_pointer_region();
-		compositor_damage_all();
+		screens_changed();
 	}
+	schedule_retry(resources, connectors);
+	output_management_update();
 
-	for (i = 0; i < resources->count_connectors; ++i)
-		drmModeFreeConnector(connectors[i]);
-	free(connectors);
+	free_connectors(connectors, resources->count_connectors);
 	drmModeFreeResources(resources);
 }
-#endif
+
+static void
+rescan_connectors(void *data)
+{
+	(void)data;
+	drm.rescan_source = NULL;
+
+	/* While switched away the display is not ours to set up; activation
+	 * queues another rescan. */
+	if (!swc.active) {
+		return;
+	}
+	rescan(true);
+}
+
+void
+drm_rescan(void)
+{
+	if (swc.active) {
+		rescan(true);
+	}
+}
+
+static bool
+connector_has_mode(const drmModeConnector *connector,
+                   const drmModeModeInfo *mode)
+{
+	int i;
+
+	for (i = 0; i < connector->count_modes; ++i) {
+		if (drm_mode_info_equal(&connector->modes[i], mode)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static const struct drm_head_config *
+find_head_config(const struct drm_head_config *heads, size_t count,
+                 uint32_t connector)
+{
+	size_t i;
+
+	for (i = 0; i < count; ++i) {
+		if (heads[i].connector == connector) {
+			return &heads[i];
+		}
+	}
+	return NULL;
+}
+
+/* Whether a screen would have to be built again for this configuration. */
+static bool
+screen_differs(struct screen *screen, const struct drm_head_config *head)
+{
+	if (!head->enabled) {
+		return true;
+	}
+	if (head->mode &&
+	    !drm_mode_info_equal(&screen->planes.primary.mode.info, head->mode)) {
+		return true;
+	}
+	return head->has_position && (screen->base.geometry.x != head->x ||
+	                              screen->base.geometry.y != head->y);
+}
+
+static bool
+check_heads(drmModeRes *resources, drmModeConnector **connectors,
+            const struct drm_head_config *heads, size_t count)
+{
+	const struct drm_head_config *head;
+	drmModeConnector *connector;
+	unsigned enabled = 0;
+	size_t i;
+	int j;
+
+	for (i = 0; i < count; ++i) {
+		head = &heads[i];
+		connector = find_connector(connectors, resources->count_connectors,
+		                           head->connector);
+		if (!connector || connector->connection != DRM_MODE_CONNECTED) {
+			WARNING("Output configuration names a monitor that is not "
+			        "connected\n");
+			return false;
+		}
+		if (!head->enabled) {
+			continue;
+		}
+		if (head->mode && !connector_has_mode(connector, head->mode)) {
+			WARNING("Output configuration asks for a mode the monitor "
+			        "does not have\n");
+			return false;
+		}
+		/* Roughly the bounds screen_new keeps to; it checks the rest. */
+		if (head->has_position &&
+		    (head->x < -32768 || head->y < -32768 || head->x > 32767 ||
+		     head->y > 32767)) {
+			WARNING("Output configuration places a monitor out of range\n");
+			return false;
+		}
+	}
+
+	/* Every connected monitor the configuration leaves alone stays as it
+	 * is, lit or not. */
+	for (j = 0; j < resources->count_connectors; ++j) {
+		if (!connectors[j] || connectors[j]->connection != DRM_MODE_CONNECTED) {
+			continue;
+		}
+		head = find_head_config(heads, count, connectors[j]->connector_id);
+		if (head ? head->enabled
+		         : drm_screen_for_connector(connectors[j]->connector_id) !=
+		               NULL) {
+			++enabled;
+		}
+	}
+	if (enabled == 0) {
+		WARNING("Output configuration would turn every monitor off\n");
+		return false;
+	}
+	if (enabled > (unsigned)resources->count_crtcs) {
+		WARNING("Output configuration lights more monitors than the GPU "
+		        "has CRTCs\n");
+		return false;
+	}
+	return true;
+}
+
+static void
+record_requests(const struct drm_head_config *heads, size_t count)
+{
+	const struct drm_head_config *head;
+	struct request *request;
+	size_t i;
+
+	for (i = 0; i < count; ++i) {
+		head = &heads[i];
+		if (!(request = find_request(head->connector))) {
+			if (!(request = calloc(1, sizeof(*request)))) {
+				continue;
+			}
+			request->connector = head->connector;
+			wl_list_insert(&drm.requests, &request->link);
+		}
+		request->disabled = !head->enabled;
+		if (!head->enabled) {
+			continue;
+		}
+		if (head->mode) {
+			request->has_mode = true;
+			request->mode = *head->mode;
+		}
+		if (head->has_position) {
+			request->has_position = true;
+			request->x = head->x;
+			request->y = head->y;
+		}
+	}
+}
+
+bool
+drm_configure_heads(const struct drm_head_config *heads, size_t count,
+                    bool test)
+{
+	drmModeRes *resources;
+	drmModeConnector **connectors;
+	struct screen *screen, *tmp;
+	struct screen *rebuild[SWC_MAX_SCREENS];
+	const struct drm_head_config *head;
+	size_t num_rebuild = 0, i;
+	bool ok;
+
+	if (!swc.active) {
+		return false;
+	}
+	if (!(resources = drmModeGetResources(swc.drm->fd))) {
+		ERROR("Could not get DRM resources: %s\n", strerror(errno));
+		return false;
+	}
+	if (!(connectors = get_connectors(resources, false))) {
+		drmModeFreeResources(resources);
+		return false;
+	}
+
+	ok = check_heads(resources, connectors, heads, count);
+	if (!ok || test) {
+		goto done;
+	}
+
+	/* Decided before anything changes: which screens have to go. A new mode
+	 * or position means building the screen again, as for a replug. */
+	wl_list_for_each(screen, &swc.screens, link)
+	{
+		head = find_head_config(heads, count, screen_connector(screen));
+		if (head && screen_differs(screen, head) &&
+		    num_rebuild < ARRAY_LENGTH(rebuild)) {
+			rebuild[num_rebuild++] = screen;
+		}
+	}
+	record_requests(heads, count);
+
+	/* Monitors being turned on first, so the windows of those going off
+	 * have somewhere to go; then the rest built again as asked. */
+	add_screens(resources, connectors);
+	wl_list_for_each_safe(screen, tmp, &swc.screens, link)
+	{
+		for (i = 0; i < num_rebuild; ++i) {
+			if (rebuild[i] == screen) {
+				remove_screen(screen);
+				break;
+			}
+		}
+	}
+	add_screens(resources, connectors);
+
+	/* Nothing could be lit as asked. Anything is better than no screen. */
+	if (wl_list_empty(&swc.screens)) {
+		ERROR("Output configuration left no screen; going back to the "
+		      "automatic one\n");
+		drop_requests();
+		add_screens(resources, connectors);
+		ok = false;
+	}
+
+	screens_changed();
+	output_management_update();
+
+done:
+	free_connectors(connectors, resources->count_connectors);
+	drmModeFreeResources(resources);
+	return ok;
+}
 
 /* }}} */
 

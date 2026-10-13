@@ -58,6 +58,9 @@ struct screen {
 	const struct swc_screen_handler *handler;
 	void *handler_data;
 	bool configuring;
+	/* Placed by output management: swc_screen_set_initial_position leaves
+	 * it where it is. */
+	bool position_fixed;
 	uint64_t lock_presented_generation;
 	struct wallpaper_output *wallpaper;
 
@@ -89,8 +92,11 @@ void
 screens_finalize(void);
 
 #ifdef ENABLE_DRM
+/* position, if given, is where output management put this monitor, and the
+ * window manager's new_screen is not allowed to move it. */
 struct screen *
-screen_new(uint32_t crtc, struct output *output, struct plane *cursor_plane);
+screen_new(uint32_t crtc, struct output *output, struct plane *cursor_plane,
+           const int32_t *position);
 #else
 struct screen *
 screen_new(struct output *output);
